@@ -23,6 +23,8 @@
 Theme **dark earthy** — bg `#141412` · surfaces `#1E1D1B` · accent vert menthe `#4CAF82` · texte crème `#E8E5DF`.
 Vert `#4CAF82` / rouge `#E05C4B` pour les variations de cours.
 
+**Navbar** — frosted glass `rgba(14,14,12,0.45)` + `blur(22px)` · hauteur 66px · logo chien SVG (tracé crème, rotation anti-horaire 60s) dans container menthe · `NavBrand` + `BackButton` réutilisables sur toutes les pages · avatar OAuth rond (Google/Discord) · pill "Mes news" accent.
+
 ## Lancer le projet
 
 ```bash
@@ -67,6 +69,7 @@ stock_app/
 │   │   ├── profile/
 │   │   │   └── page.tsx          ← Préférences + compte
 │   │   ├── components/
+│   │   │   ├── Navbar.tsx        ← Navbar (home) + NavBrand + BackButton + HEADER_STYLE/INNER exports
 │   │   │   ├── AuthModal.tsx     ← email/password + Google + Discord
 │   │   │   ├── ArticleDrawer.tsx
 │   │   │   ├── VideoModal.tsx
@@ -93,10 +96,12 @@ stock_app/
 | Auth email/password | ✅ | |
 | Auth Google OAuth | ✅ | Configuré dans Supabase |
 | Auth Discord OAuth | ✅ | Configuré dans Supabase |
-| Page stock — prix + stats | ✅ | fast_info + t.info (name, PE) |
+| Page stock — prix + stats | ✅ | fast_info + t.info (name, PE, website) |
+| Page stock — header | ✅ | Logo Logo.dev en haut à droite · toggle EUR/USD dans header · étoile pin près du prix · lien website |
 | Page stock — chart Chart.js | ✅ | |
 | Chart — sélecteur de période | ✅ | 24H / 1W / 1M / 6M / 1Y / 5Y (ALL supprimé, 5Y = interval 1wk) |
-| Toggle USD ↔ EUR | ✅ | Prix, 52W High/Low, tooltip, axes Y |
+| Chart — % adaptatif | ✅ | 24H = change_pct yfinance · autres périodes = (last-first)/first calculé depuis chart data |
+| Toggle USD ↔ EUR | ✅ | Dans header page stock · Prix, 52W High/Low, tooltip, axes Y |
 | Préférence devise | ✅ | localStorage (non-connecté) · Supabase (connecté) |
 | Page profile | ✅ | Devise + compte + sign out |
 | News — fetch + drawer + vidéo | ✅ | |
@@ -108,8 +113,8 @@ stock_app/
 | Cascade LLM FreeTheAI→Groq | ✅ | gpt-4.1 → gpt-5.4-mini → Groq. Notif Telegram si checkin Discord manquant |
 | EOD digest — backend | ✅ | gen 18h00 (Finnhub → fallback Yahoo cache) · email 18h30 · 2 jobs APScheduler séparés |
 | EOD digest — email | ✅ | Resend — clé configurée, sandbox `onboarding@resend.dev` (passer à domaine custom en prod) |
-| EOD digest — onglet "Mes news" | ✅ | Page /my-news : 2 tabs Daily (daily_digest) + Weekly (article_week_summaries) · logo Logo.dev |
-| Préférences notif (email on/off + par ticker) | ✅ | Dans /profile : toggle global + chips par action |
+| EOD digest — onglet "Mes news" | ✅ | Page /my-news : 2 tabs Daily (daily_digest) + Weekly (article_week_summaries) · logo Logo.dev · source + date articles |
+| Préférences notif (email on/off + par ticker) | ✅ | Dans /profile : toggle Daily + toggle Weekly (badge Premium, actif pour tous) + chips par action · `notify_weekly` en DB |
 | Batch DB filler (717 tickers) | 🔄 | Scrape US+EU+Asia terminé (717 tickers). Enrich US en cours (FreeTheAI). Phase enrich populate aussi `website` pour Logo.dev. Progress dans `batch_progress.json`. Notifs Telegram tous les 25 tickers |
 | Loading animation — DogLoader | ✅ | Sleeping dog SVG, 2 comètes sens inverse, rotation 3D lente. Actif sur newsLoading + periodLoading (page stock) + EventDrawer |
 | DB articles — rotation & purge | ✅ | 5W max, monthly calendaire 1er du mois, yearly purge monthlies |
@@ -175,7 +180,54 @@ TELEGRAM_CHAT_ID=...          # notifs check-in manquant
 | Feature | Priorité | Notes |
 |---|---|---|
 | Descriptions intelligentes des tickers | 🔜 | Voir détail ci-dessous |
-| AI Overview toggle FR/EN | 🔜 | Préférence dans /profile, stockée en Supabase |
+| **Migration EN-first + traduction FR** | 🔜 | Voir détail ci-dessous — gros chantier |
+| AI Overview toggle FR/EN | 🔜 | Dépend de la migration EN-first |
+
+### Migration EN-first + traduction FR
+
+**Décision :** passer tous les prompts LLM de FR à EN. Stocker les résumés en EN comme source de vérité. Traduire vers FR via API dédiée.
+
+**Cascade traduction EN→FR :**
+```
+1. DeepL API          ← primaire (deepl.com, ~$7/mois, 1M chars)
+2. FreeTheAI          ← backup si DeepL down/quota
+3. Groq               ← fallback final
+```
+Var d'env à ajouter : `DEEPL_API_KEY=...`
+
+**Champs DB à doubler (migration Supabase) :**
+```
+stock_news_cache :
+  ai_summary        → ai_summary_en  (source of truth)
+  ai_summary_fr     (traduit)
+  ai_summary_24h    → ai_summary_24h_en
+  ai_summary_24h_fr
+  ai_sentiment      → inchangé (BULLISH/BEARISH/NEUTRAL = langue-agnostique)
+
+daily_digest :
+  summary           → summary_en
+  summary_fr
+
+article_week_summaries :
+  ai_summary        → ai_summary_en
+  ai_summary_fr
+
+article_month_summaries / article_year_summaries : idem
+```
+
+**Fichiers à modifier :**
+- Tous les prompts dans `llm_service.py`, `news_service.py`, `digest_service.py`, `period_articles_service.py` → passer en EN
+- Ajouter `translation_service.py` → gère la cascade traduction
+- `batch_fill_db.py` phase enrich → génère EN + traduit FR
+- Frontend : toggle FR/EN dans `/profile` (`lang` dans `user_preferences`), résumés affichés selon préférence
+
+**Ordre d'implémentation :**
+1. Choisir DeepL vs DeepSeek → ajouter clé `.env`
+2. Créer `translation_service.py` avec cascade
+3. Migrer les colonnes DB (ALTER TABLE + migration des données existantes)
+4. Réécrire tous les prompts en EN
+5. Mettre à jour tous les services pour stocker `_en` + appeler traduction → `_fr`
+6. Frontend : toggle lang dans `/profile` + affichage conditionnel
 
 ### Descriptions intelligentes des tickers (post-beta)
 
@@ -197,7 +249,7 @@ Après la beta, processer toutes les descriptions yfinance (`t.info["longBusines
 
 ```
 stock_news_cache        — cache news IA Yahoo (ticker PK, news_raw, ai_summary, ai_summary_24h, ai_sentiment, ai_sentiment_24h, cached_at, website) — TTL 12h, ~4 jours
-user_preferences        — préférences (user_id PK, currency, notify_email, digest_tickers text[])
+user_preferences        — préférences (user_id PK, currency, notify_email, notify_weekly, digest_tickers text[])
 pinned_stocks           — watchlist (user_id, ticker, company_name, pinned_at) — unique(user_id, ticker)
 daily_digest            — digest EOD (ticker, date, articles, summary, sentiment) — purge auto 30J
 event_causes            — causes AI événements chart (ticker, date PK, articles, cause) — permanent
