@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Env files
+.env
+.env.local
+.env.*.local
+
+# Logs & runtime
+*.log
+*.json.tmp
+backend/scripts/batch_progress.json
+backend/scripts/batch_fill_db.log
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+.npm
+
+# TypeScript
+*.tsbuildinfo
+next-env.d.ts
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE / tools
+.vscode/
+.idea/
+.llmproject
+.claude/
+
+# Supabase local
+supabase/.branches/
+supabase/.temp/

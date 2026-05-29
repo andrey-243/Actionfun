@@ -1,0 +1,223 @@
+import httpx
+import os
+import logging
+from datetime import date, datetime, timezone
+from supabase import create_client
+
+logger = logging.getLogger(__name__)
+
+DIGEST_PROMPT = """Tu es un analyste financier. Voici les news du jour pour {ticker}.
+
+Articles :
+{articles_text}
+
+Rédige un résumé complet en 4-6 phrases :
+- Ce qui s'est passé aujourd'hui pour ce titre
+- Les éléments macro ou sectoriels pertinents
+- L'impact probable sur le cours à court terme
+- Le sentiment global : BULLISH, BEARISH ou NEUTRAL
+
+Format JSON strict :
+{{
+  "summary": "texte du résumé",
+  "sentiment": "BULLISH"
+}}"""
+
+
+def _get_supabase():
+    return create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
+
+
+def _fetch_today_news(ticker: str) -> list[dict]:
+    today = date.today()
+    r = httpx.get(
+        "https://finnhub.io/api/v1/company-news",
+        params={
+            "symbol": ticker,
+            "from": today.isoformat(),
+            "to": today.isoformat(),
+            "token": os.environ["FINNHUB_API_KEY"],
+        },
+        timeout=10,
+    )
+    r.raise_for_status()
+    raw = r.json()[:15]
+    return [
+        {
+            "headline": a["headline"],
+            "source": a["source"],
+            "url": a["url"],
+            "datetime": a["datetime"],
+        }
+        for a in raw
+        if a.get("headline")
+    ]
+
+
+def _groq_digest(ticker: str, articles: list[dict]) -> dict:
+    articles_text = "\n".join(f"- {a['headline']}" for a in articles[:12])
+    r = httpx.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers={"Authorization": f"Bearer {os.environ['GROQ_API_KEY']}"},
+        json={
+            "model": "meta-llama/llama-4-scout-17b-16e-instruct",
+            "messages": [{"role": "user", "content": DIGEST_PROMPT.format(
+                ticker=ticker, articles_text=articles_text
+            )}],
+            "response_format": {"type": "json_object"},
+            "temperature": 0.3,
+        },
+        timeout=30,
+    )
+    r.raise_for_status()
+    import json
+    return json.loads(r.json()["choices"][0]["message"]["content"])
+
+
+def _fetch_from_yahoo_cache(ticker: str, supa) -> dict | None:
+    """Fallback : utilise le summary 24h déjà généré dans stock_news_cache.
+    Si absent, déclenche un refresh actif via news_service."""
+    row = (
+        supa.table("stock_news_cache")
+        .select("ai_summary_24h, ai_sentiment_24h, news_raw")
+        .eq("ticker", ticker)
+        .maybe_single()
+        .execute()
+    )
+    if not row or not row.data or not row.data.get("ai_summary_24h"):
+        try:
+            from services.news_service import get_news
+            get_news(ticker)
+            row = (
+                supa.table("stock_news_cache")
+                .select("ai_summary_24h, ai_sentiment_24h, news_raw")
+                .eq("ticker", ticker)
+                .maybe_single()
+                .execute()
+            )
+        except Exception as e:
+            logger.warning(f"  news_service fallback failed for {ticker}: {e}")
+    if not row or not row.data or not row.data.get("ai_summary_24h"):
+        return None
+
+    cutoff = (datetime.now(timezone.utc).timestamp()) - 86400
+    articles = []
+    for a in (row.data.get("news_raw") or []):
+        try:
+            ts = datetime.fromisoformat(a["pub_date"].replace("Z", "+00:00")).timestamp()
+        except Exception:
+            continue
+        if ts >= cutoff:
+            articles.append({"headline": a.get("title", ""), "source": a.get("source", ""), "url": a.get("url", ""), "datetime": int(ts)})
+
+    return {
+        "summary": row.data["ai_summary_24h"],
+        "sentiment": row.data.get("ai_sentiment_24h") or "NEUTRAL",
+        "articles": articles[:12],
+        "source": "yahoo",
+    }
+
+
+def generate_digest_for_ticker(ticker: str) -> dict | None:
+    """Génère et stocke le digest du jour pour un ticker. Retourne None si pas de news."""
+    today = date.today().isoformat()
+    supa = _get_supabase()
+
+    # Déjà généré aujourd'hui ?
+    existing = supa.table("daily_digest").select("*").eq("ticker", ticker).eq("date", today).maybe_single().execute()
+    if existing and existing.data:
+        return existing.data
+
+    articles = _fetch_today_news(ticker)
+    if articles:
+        ai = _groq_digest(ticker, articles)
+        summary = ai.get("summary", "")
+        sentiment = ai.get("sentiment", "NEUTRAL")
+    else:
+        # Finnhub vide → fallback Yahoo cache
+        yahoo = _fetch_from_yahoo_cache(ticker, supa)
+        if not yahoo:
+            return None
+        articles = yahoo["articles"]
+        summary = yahoo["summary"]
+        sentiment = yahoo["sentiment"]
+
+    row = {
+        "ticker": ticker,
+        "date": today,
+        "articles": articles,
+        "summary": summary,
+        "sentiment": sentiment,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    supa.table("daily_digest").upsert(row).execute()
+    return row
+
+
+def run_eod_digest_generation():
+    """18h00 — génère les digests du jour pour tous les tickers pinnés."""
+    supa = _get_supabase()
+    pins = supa.table("pinned_stocks").select("ticker").execute()
+    tickers = list({r["ticker"] for r in (pins.data or [])})
+
+    logger.info(f"EOD digest generation — {len(tickers)} tickers à traiter")
+    for ticker in tickers:
+        try:
+            result = generate_digest_for_ticker(ticker)
+            if result:
+                logger.info(f"  ✓ {ticker}")
+            else:
+                logger.info(f"  — {ticker} (pas de news)")
+        except Exception as e:
+            logger.error(f"  ✗ {ticker} : {e}")
+
+
+def run_eod_digest_email():
+    """18h30 — envoie les emails avec les digests déjà générés."""
+    supa = _get_supabase()
+    today = date.today().isoformat()
+
+    rows = supa.table("daily_digest").select("*").eq("date", today).execute()
+    digests = rows.data or []
+
+    if not digests:
+        logger.info("EOD digest email — aucun digest disponible aujourd'hui")
+        return
+
+    logger.info(f"EOD digest email — {len(digests)} digests à envoyer")
+    _send_digest_emails(digests, supa)
+
+
+def _send_digest_emails(digests: list[dict], supa):
+    from services.email_service import send_digest_email
+
+    users = supa.table("user_preferences").select("user_id, digest_tickers").eq("notify_email", True).execute()
+    if not users.data:
+        return
+
+    for user_pref in users.data:
+        uid = user_pref["user_id"]
+        # digest_tickers=None → tous les tickers pinnés ; sinon filtre sur la sélection
+        allowed = set(user_pref["digest_tickers"]) if user_pref.get("digest_tickers") else None
+
+        pins = supa.table("pinned_stocks").select("ticker").eq("user_id", uid).execute()
+        user_tickers = {r["ticker"] for r in (pins.data or [])}
+
+        if allowed is not None:
+            user_tickers = user_tickers & allowed
+
+        user_digests = [d for d in digests if d["ticker"] in user_tickers]
+        if not user_digests:
+            continue
+
+        try:
+            r = httpx.get(
+                f"https://api.supabase.com/v1/projects/qxfbqzjkianxsuurgckd/auth/users/{uid}",
+                headers={"Authorization": f"Bearer {os.environ['SUPABASE_MANAGEMENT_TOKEN']}"},
+                timeout=10,
+            )
+            email = r.json().get("email")
+            if email:
+                send_digest_email(email, user_digests)
+        except Exception as e:
+            logger.error(f"Email failed for user {uid}: {e}")
