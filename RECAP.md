@@ -15,6 +15,7 @@
 | Email digest | Resend (3 000 emails/mois gratuit) — clé configurée, sandbox actif |
 | Logos | Logo.dev free (500k req/mois, attribution requise) — domaine depuis yfinance `t.info["website"]`, stocké dans `stock_news_cache.website` · `NEXT_PUBLIC_LOGODEV_TOKEN` dans `frontend/.env.local` |
 | Cron | APScheduler intégré dans FastAPI — digest gen 18h00 · email 18h30 · weekly lun 3h30 · monthly 1er 4h · yearly 1er jan 5h · yahoo 2h |
+| Git | github.com/andrey-243/Actionfun — repo privé |
 | Déploiement | local → Railway/Render (backend) · Vercel (frontend) · Supabase (DB) |
 
 ## DA
@@ -57,6 +58,7 @@ stock_app/
 │   ├── .env               ← toutes les clés (gitignored)
 │   ├── .venv/             ← venv unique pour ce projet
 │   └── requirements.txt
+├── .gitignore
 ├── frontend/
 │   ├── app/
 │   │   ├── page.tsx              ← Home : search + recent + watchlist
@@ -71,7 +73,7 @@ stock_app/
 │   │   │   ├── EventDrawer.tsx   ← drawer clic sur dot chart (cause IA + articles Finnhub)
 │   │   │   └── DogLoader.tsx     ← loading animation (sleeping dog SVG, 2 comètes, rotation 3D)
 │   │   ├── my-news/
-│   │   │   └── page.tsx          ← onglet digest EOD (en cours)
+│   │   │   └── page.tsx          ← onglet digest EOD
 │   │   └── lib/
 │   │       ├── supabase.ts           ← createClient() null-safe
 │   │       ├── useCurrencyPref.ts    ← localStorage + Supabase si connecté
