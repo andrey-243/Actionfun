@@ -19,7 +19,7 @@ interface Digest {
   date: string;
   summary: string;
   sentiment: string;
-  articles: DigestArticle[];
+  articles?: DigestArticle[];
   website?: string | null;
 }
 
@@ -128,7 +128,7 @@ function DigestCard({ digest }: { digest: Digest }) {
               rel="noopener noreferrer"
               style={{
                 display: "block", padding: "11px 18px", textDecoration: "none",
-                borderBottom: i < digest.articles.length - 1 ? "1px solid var(--color-border)" : "none",
+                borderBottom: i < (digest.articles ?? []).length - 1 ? "1px solid var(--color-border)" : "none",
               }}
               onMouseEnter={(e) => (e.currentTarget.style.background = "var(--color-surface-2)")}
               onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
