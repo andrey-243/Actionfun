@@ -7,6 +7,7 @@ import { useRouter } from "next/navigation";
 import { createClient } from "./lib/supabase";
 import type { User, RecentSearch, PinnedStock } from "./lib/supabase";
 import AuthModal from "./components/AuthModal";
+import Navbar from "./components/Navbar";
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
@@ -258,120 +259,7 @@ export default function HomePage() {
 
   return (
     <div style={{ minHeight: "100vh", background: "var(--color-bg)" }}>
-      {/* Topbar */}
-      <header
-        style={{
-          background: "var(--color-surface)",
-          borderBottom: "1px solid var(--color-border)",
-          position: "sticky",
-          top: 0,
-          zIndex: 10,
-        }}
-      >
-        <div
-          style={{
-            maxWidth: "720px",
-            margin: "0 auto",
-            padding: "0 20px",
-            height: "52px",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-          }}
-        >
-          <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-            <div
-              style={{
-                width: "26px",
-                height: "26px",
-                borderRadius: "5px",
-                background: "var(--color-accent)",
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                color: "#fff",
-                fontSize: "12px",
-                fontWeight: 800,
-                fontFamily: "var(--font-mono)",
-              }}
-            >
-              SV
-            </div>
-            <span style={{ fontWeight: 700, fontSize: "15px", color: "var(--color-text-primary)", letterSpacing: "-0.02em" }}>
-              StockVibe
-            </span>
-            <span
-              style={{
-                marginLeft: "4px",
-                padding: "2px 6px",
-                borderRadius: "3px",
-                fontSize: "10px",
-                fontWeight: 600,
-                background: "var(--color-accent-light)",
-                color: "var(--color-accent)",
-                fontFamily: "var(--font-mono)",
-                letterSpacing: "0.04em",
-              }}
-            >
-              BETA
-            </span>
-          </div>
-
-          {user ? (
-            <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
-              <button
-                onClick={() => router.push("/my-news")}
-                style={{
-                  fontSize: "12px", color: "var(--color-text-muted)", background: "none",
-                  border: "none", cursor: "pointer", padding: 0,
-                }}
-              >
-                Mes news
-              </button>
-              <button
-                onClick={() => router.push("/profile")}
-                style={{
-                  fontSize: "12px", color: "var(--color-text-secondary)", background: "none",
-                  border: "none", cursor: "pointer", padding: 0,
-                }}
-              >
-                {user.email?.split("@")[0]}
-              </button>
-              <button
-                onClick={handleSignOut}
-                style={{
-                  padding: "5px 12px",
-                  fontSize: "12px",
-                  fontWeight: 500,
-                  border: "1px solid var(--color-border)",
-                  borderRadius: "5px",
-                  background: "none",
-                  color: "var(--color-text-secondary)",
-                  cursor: "pointer",
-                }}
-              >
-                Sign out
-              </button>
-            </div>
-          ) : (
-            <button
-              onClick={() => setShowAuth(true)}
-              style={{
-                padding: "5px 14px",
-                fontSize: "12px",
-                fontWeight: 600,
-                borderRadius: "5px",
-                border: "none",
-                background: "var(--color-accent)",
-                color: "#fff",
-                cursor: "pointer",
-              }}
-            >
-              Sign in
-            </button>
-          )}
-        </div>
-      </header>
+      <Navbar user={user} onSignIn={() => setShowAuth(true)} onSignOut={handleSignOut} />
 
       {/* Main */}
       <main style={{ maxWidth: "720px", margin: "0 auto", padding: "32px 20px 64px" }}>

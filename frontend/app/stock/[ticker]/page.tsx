@@ -19,6 +19,7 @@ import ArticleDrawer from "../../components/ArticleDrawer";
 import VideoModal from "../../components/VideoModal";
 import EventDrawer from "../../components/EventDrawer";
 import DogLoader from "../../components/DogLoader";
+import { NavBrand, BackButton, HEADER_STYLE, HEADER_INNER } from "../../components/Navbar";
 import type { Article } from "../../components/ArticleDrawer";
 import { sourceStyle } from "../../components/ArticleDrawer";
 
@@ -58,6 +59,7 @@ interface StockData {
   week_52_high: number | null;
   week_52_low: number | null;
   chart: { date: string; close: number }[];
+  website?: string | null;
 }
 
 interface NewsData {
@@ -391,7 +393,16 @@ export default function StockPage() {
     setPinLoading(false);
   }
 
-  const isPositive = (stock?.change_pct ?? 0) >= 0;
+  const periodChangePct = useMemo(() => {
+    if (!stock?.chart?.length || stock.chart.length < 2) return stock?.change_pct ?? null;
+    const first = stock.chart[0].close;
+    const last = stock.chart[stock.chart.length - 1].close;
+    if (!first) return stock?.change_pct ?? null;
+    return Math.round(((last - first) / first) * 10000) / 100;
+  }, [stock?.chart, stock?.change_pct]);
+
+  const displayChangePct = chartPeriod === "1d" ? (stock?.change_pct ?? null) : periodChangePct;
+  const isPositive = (displayChangePct ?? 0) >= 0;
 
   const verticalLinesPlugin = useMemo(() => ({
     id: "verticalLines",
@@ -574,59 +585,36 @@ export default function StockPage() {
   return (
     <div style={{ minHeight: "100vh", background: "var(--color-bg)" }}>
       {/* Topbar */}
-      <header style={{
-        background: "var(--color-surface)",
-        borderBottom: "1px solid var(--color-border)",
-        position: "sticky", top: 0, zIndex: 10,
-      }}>
-        <div style={{
-          maxWidth: "720px", margin: "0 auto", padding: "0 20px",
-          height: "52px", display: "flex", alignItems: "center", gap: "12px",
-        }}>
-          <button
-            onClick={() => router.push("/")}
-            style={{
-              background: "none", border: "none", cursor: "pointer",
-              color: "var(--color-text-muted)", padding: "4px", display: "flex", alignItems: "center",
-            }}
-          >
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-              <path d="M19 12H5M12 19l-7-7 7-7" />
-            </svg>
-          </button>
-          <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-            <div style={{
-              width: "26px", height: "26px", borderRadius: "5px",
-              background: "var(--color-accent)", display: "flex", alignItems: "center", justifyContent: "center",
-              color: "#fff", fontSize: "12px", fontWeight: 800, fontFamily: "var(--font-mono)",
-            }}>
-              SV
-            </div>
-            <span style={{ fontWeight: 700, fontSize: "15px", color: "var(--color-text-primary)", letterSpacing: "-0.02em" }}>
-              StockVibe
-            </span>
+      <header style={HEADER_STYLE}>
+        <div style={{ ...HEADER_INNER, justifyContent: "space-between" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
+            <BackButton />
+            <NavBrand />
           </div>
-          <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: "12px" }}>
-            <span style={{ fontFamily: "var(--font-mono)", fontWeight: 700, fontSize: "14px", color: "var(--color-text-secondary)", letterSpacing: "0.04em" }}>
-              {ticker?.toUpperCase()}
-            </span>
-            {userId && (
-              <button
-                onClick={handlePin}
-                disabled={pinLoading}
-                title={isPinned ? "Retirer des favoris" : "Ajouter aux favoris"}
-                style={{
-                  background: "none", border: "none", cursor: "pointer", padding: "4px",
-                  color: isPinned ? "var(--color-accent)" : "var(--color-text-muted)",
-                  opacity: pinLoading ? 0.5 : 1,
-                  display: "flex", alignItems: "center",
-                }}
-              >
-                <svg width="18" height="18" viewBox="0 0 24 24" fill={isPinned ? "currentColor" : "none"} stroke="currentColor" strokeWidth="2">
-                  <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" />
-                </svg>
-              </button>
+          <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+            {stock?.website ? (
+              <img
+                src={`https://img.logo.dev/${stock.website}?token=${process.env.NEXT_PUBLIC_LOGODEV_TOKEN ?? ""}&size=40`}
+                alt={ticker ?? ""}
+                onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
+                style={{ width: "26px", height: "26px", borderRadius: "5px", objectFit: "contain", background: "#fff", flexShrink: 0 }}
+              />
+            ) : (
+              <span style={{ fontFamily: "var(--font-mono)", fontWeight: 700, fontSize: "13px", color: "var(--color-text-secondary)", letterSpacing: "0.04em" }}>
+                {ticker?.toUpperCase()}
+              </span>
             )}
+            <button
+              onClick={() => setCurrency(currency === "USD" ? "EUR" : "USD")}
+              style={{
+                padding: "3px 10px", borderRadius: "4px", fontSize: "11px", fontWeight: 700,
+                fontFamily: "var(--font-mono)", letterSpacing: "0.06em", cursor: "pointer",
+                border: "1px solid var(--color-border)",
+                background: "var(--color-surface-2)", color: "var(--color-text-secondary)",
+              }}
+            >
+              {currency === "USD" ? "→ EUR" : "→ USD"}
+            </button>
           </div>
         </div>
       </header>
@@ -645,14 +633,29 @@ export default function StockPage() {
         ) : stock && (
           <>
             <div style={{ marginBottom: "20px" }}>
-              <div style={{ display: "flex", alignItems: "baseline", gap: "12px", marginBottom: "4px" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "4px" }}>
                 <h1 style={{
                   fontSize: "24px", fontWeight: 800, fontFamily: "var(--font-mono)",
-                  color: "var(--color-text-primary)", letterSpacing: "0.02em",
+                  color: "var(--color-text-primary)", letterSpacing: "0.02em", margin: 0,
                 }}>
                   {stock.ticker}
                 </h1>
                 <span style={{ fontSize: "14px", color: "var(--color-text-secondary)" }}>{stock.name}</span>
+                {stock.website && (
+                  <a
+                    href={`https://${stock.website}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    title={stock.website}
+                    style={{ color: "var(--color-text-muted)", display: "flex", alignItems: "center", marginLeft: "2px" }}
+                  >
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+                      <polyline points="15 3 21 3 21 9" />
+                      <line x1="10" y1="14" x2="21" y2="3" />
+                    </svg>
+                  </a>
+                )}
               </div>
               <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
                 <span style={{
@@ -661,19 +664,25 @@ export default function StockPage() {
                 }}>
                   {displaySymbol}{fmt(convert(stock.current_price))}
                 </span>
-                <ChangeBadge value={stock.change_pct} />
-                <button
-                  onClick={() => setCurrency(currency === "USD" ? "EUR" : "USD")}
-                  style={{
-                    padding: "3px 10px", borderRadius: "4px", fontSize: "11px", fontWeight: 700,
-                    fontFamily: "var(--font-mono)", letterSpacing: "0.06em", cursor: "pointer",
-                    border: "1px solid var(--color-border)",
-                    background: "var(--color-surface-2)", color: "var(--color-text-secondary)",
-                    transition: "border-color 0.15s",
-                  }}
-                >
-                  {currency === "USD" ? "→ EUR" : "→ USD"}
-                </button>
+                <ChangeBadge value={displayChangePct} />
+                {/* Star moved here from header */}
+                {userId && (
+                  <button
+                    onClick={handlePin}
+                    disabled={pinLoading}
+                    title={isPinned ? "Retirer des favoris" : "Ajouter aux favoris"}
+                    style={{
+                      background: "none", border: "none", cursor: "pointer", padding: "4px",
+                      color: isPinned ? "var(--color-accent)" : "var(--color-text-muted)",
+                      opacity: pinLoading ? 0.5 : 1,
+                      display: "flex", alignItems: "center",
+                    }}
+                  >
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill={isPinned ? "currentColor" : "none"} stroke="currentColor" strokeWidth="2">
+                      <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" />
+                    </svg>
+                  </button>
+                )}
               </div>
             </div>
 

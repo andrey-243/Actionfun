@@ -4,6 +4,7 @@ import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { createClient } from "../lib/supabase";
 import { useCurrencyPref, type Currency } from "../lib/useCurrencyPref";
+import { NavBrand, BackButton, HEADER_STYLE, HEADER_INNER } from "../components/Navbar";
 import type { User } from "../lib/supabase";
 
 interface PinnedStock { ticker: string; company_name: string; }
@@ -33,6 +34,7 @@ export default function ProfilePage() {
   const [user, setUser] = useState<User | null>(null);
   const [pins, setPins] = useState<PinnedStock[]>([]);
   const [notifyEmail, setNotifyEmailState] = useState(true);
+  const [notifyWeekly, setNotifyWeeklyState] = useState(true);
   const [digestTickers, setDigestTickers] = useState<Set<string>>(new Set());
   const [saving, setSaving] = useState(false);
   const { currency, setCurrency } = useCurrencyPref();
@@ -50,9 +52,10 @@ export default function ProfilePage() {
       if (pinData) setPins(pinData);
 
       // Load preferences
-      const { data: prefs } = await supa.from("user_preferences").select("notify_email, digest_tickers").eq("user_id", u.id).single();
+      const { data: prefs } = await supa.from("user_preferences").select("notify_email, notify_weekly, digest_tickers").eq("user_id", u.id).single();
       if (prefs) {
         setNotifyEmailState(prefs.notify_email ?? true);
+        setNotifyWeeklyState(prefs.notify_weekly ?? true);
         setDigestTickers(new Set(prefs.digest_tickers ?? []));
       } else {
         // Default: all tickers selected
@@ -68,7 +71,7 @@ export default function ProfilePage() {
     }
   }, [pins]);
 
-  async function savePrefs(updates: { notify_email?: boolean; digest_tickers?: string[] }) {
+  async function savePrefs(updates: { notify_email?: boolean; notify_weekly?: boolean; digest_tickers?: string[] }) {
     const supa = createClient();
     if (!supa || !user) return;
     setSaving(true);
@@ -79,6 +82,11 @@ export default function ProfilePage() {
   async function handleNotifyEmail(val: boolean) {
     setNotifyEmailState(val);
     await savePrefs({ notify_email: val });
+  }
+
+  async function handleNotifyWeekly(val: boolean) {
+    setNotifyWeeklyState(val);
+    await savePrefs({ notify_weekly: val });
   }
 
   async function toggleDigestTicker(ticker: string) {
@@ -101,13 +109,13 @@ export default function ProfilePage() {
 
   return (
     <div style={{ minHeight: "100vh", background: "var(--color-bg)" }}>
-      <header style={{ background: "var(--color-surface)", borderBottom: "1px solid var(--color-border)", position: "sticky", top: 0, zIndex: 10 }}>
-        <div style={{ maxWidth: "720px", margin: "0 auto", padding: "0 20px", height: "52px", display: "flex", alignItems: "center", gap: "12px" }}>
-          <button onClick={() => router.push("/")} style={{ background: "none", border: "none", cursor: "pointer", color: "var(--color-text-muted)", padding: "4px", display: "flex", alignItems: "center" }}>
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M19 12H5M12 19l-7-7 7-7" /></svg>
-          </button>
-          <span style={{ fontWeight: 700, fontSize: "15px", color: "var(--color-text-primary)", letterSpacing: "-0.02em" }}>Profile</span>
-          {saving && <span style={{ marginLeft: "auto", fontSize: "11px", color: "var(--color-text-muted)" }}>Saving…</span>}
+      <header style={HEADER_STYLE}>
+        <div style={{ ...HEADER_INNER, justifyContent: "space-between" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
+            <BackButton />
+            <NavBrand />
+          </div>
+          {saving && <span style={{ fontSize: "11px", color: "var(--color-text-muted)" }}>Saving…</span>}
         </div>
       </header>
 
@@ -159,13 +167,29 @@ export default function ProfilePage() {
             <div style={{ fontSize: "11px", fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase", color: "var(--color-text-muted)", marginBottom: "10px" }}>Notifications</div>
             <div style={{ background: "var(--color-surface)", border: "1px solid var(--color-border)", borderRadius: "8px", overflow: "hidden" }}>
 
-              {/* Email toggle */}
-              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "14px 18px", borderBottom: pins.length > 0 ? "1px solid var(--color-border)" : "none" }}>
+              {/* Daily email toggle */}
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "14px 18px", borderBottom: "1px solid var(--color-border)" }}>
                 <div>
                   <div style={{ fontSize: "13px", fontWeight: 600, color: "var(--color-text-primary)" }}>Digest quotidien par email</div>
                   <div style={{ fontSize: "12px", color: "var(--color-text-muted)", marginTop: "2px" }}>Un seul email EOD avec toutes tes actions</div>
                 </div>
                 <Toggle value={notifyEmail} onChange={handleNotifyEmail} />
+              </div>
+
+              {/* Weekly email toggle */}
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "14px 18px", borderBottom: pins.length > 0 ? "1px solid var(--color-border)" : "none" }}>
+                <div>
+                  <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                    <span style={{ fontSize: "13px", fontWeight: 600, color: "var(--color-text-primary)" }}>Recap hebdomadaire par email</span>
+                    <span style={{
+                      padding: "1px 7px", borderRadius: "4px", fontSize: "9px", fontWeight: 700,
+                      fontFamily: "var(--font-mono)", letterSpacing: "0.06em", textTransform: "uppercase",
+                      background: "var(--color-accent-light)", color: "var(--color-accent)",
+                    }}>Premium</span>
+                  </div>
+                  <div style={{ fontSize: "12px", color: "var(--color-text-muted)", marginTop: "2px" }}>Résumé IA de la semaine chaque lundi</div>
+                </div>
+                <Toggle value={notifyWeekly} onChange={handleNotifyWeekly} />
               </div>
 
               {/* Per-ticker selection */}

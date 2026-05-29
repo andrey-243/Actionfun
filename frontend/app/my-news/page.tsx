@@ -4,6 +4,8 @@ import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { createClient } from "../lib/supabase";
 import type { User } from "../lib/supabase";
+import { sourceStyle } from "../components/ArticleDrawer";
+import { NavBrand, BackButton, HEADER_STYLE, HEADER_INNER } from "../components/Navbar";
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
@@ -27,7 +29,7 @@ interface WeeklyArticle {
   title: string;
   url: string;
   source?: string;
-  date?: string;
+  pub_date?: string;
 }
 
 interface Weekly {
@@ -70,8 +72,8 @@ function TickerLogo({ ticker, website }: { ticker?: string | null; website?: str
   }
   return (
     <img
-      src={src}
-      alt={ticker}
+      src={src ?? undefined}
+      alt={ticker ?? undefined}
       onError={() => setFailed(true)}
       style={{ width: "32px", height: "32px", borderRadius: "8px", flexShrink: 0, objectFit: "contain", background: "#fff" }}
     />
@@ -136,8 +138,15 @@ function DigestCard({ digest }: { digest: Digest }) {
               <div style={{ fontSize: "13px", color: "var(--color-text-primary)", fontWeight: 500, marginBottom: "3px" }}>
                 {a.headline}
               </div>
-              <div style={{ fontSize: "11px", color: "var(--color-text-muted)" }}>
-                {a.source} · {new Date(a.datetime * 1000).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" })}
+              <div style={{ display: "flex", alignItems: "center", gap: "6px", marginTop: "3px" }}>
+                {a.source && (() => { const s = sourceStyle(a.source); return (
+                  <span style={{ padding: "1px 6px", borderRadius: "3px", fontSize: "10px", fontWeight: 700, letterSpacing: "0.04em", background: s.bg, color: s.text }}>
+                    {a.source}
+                  </span>
+                ); })()}
+                <span style={{ fontSize: "11px", color: "var(--color-text-muted)" }}>
+                  {new Date(a.datetime * 1000).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" })}
+                </span>
               </div>
             </a>
           ))}
@@ -213,9 +222,18 @@ function WeeklyCard({ weekly }: { weekly: Weekly }) {
               <div style={{ fontSize: "13px", color: "var(--color-text-primary)", fontWeight: 500, marginBottom: "3px" }}>
                 {a.title}
               </div>
-              {(a.source || a.date) && (
-                <div style={{ fontSize: "11px", color: "var(--color-text-muted)" }}>
-                  {[a.source, a.date].filter(Boolean).join(" · ")}
+              {(a.source || a.pub_date) && (
+                <div style={{ display: "flex", alignItems: "center", gap: "6px", marginTop: "3px" }}>
+                  {a.source && (() => { const s = sourceStyle(a.source); return (
+                    <span style={{ padding: "1px 6px", borderRadius: "3px", fontSize: "10px", fontWeight: 700, letterSpacing: "0.04em", background: s.bg, color: s.text }}>
+                      {a.source}
+                    </span>
+                  ); })()}
+                  {a.pub_date && (
+                    <span style={{ fontSize: "11px", color: "var(--color-text-muted)" }}>
+                      {new Date(a.pub_date).toLocaleDateString("fr-FR", { day: "numeric", month: "short" })}
+                    </span>
+                  )}
                 </div>
               )}
             </a>
@@ -306,37 +324,23 @@ export default function MyNewsPage() {
 
   return (
     <div style={{ minHeight: "100vh", background: "var(--color-bg)" }}>
-      <header style={{
-        background: "var(--color-surface)", borderBottom: "1px solid var(--color-border)",
-        position: "sticky", top: 0, zIndex: 10,
-      }}>
-        <div style={{
-          maxWidth: "720px", margin: "0 auto", padding: "0 20px",
-          height: "52px", display: "flex", alignItems: "center", gap: "12px",
-        }}>
-          <button
-            onClick={() => router.push("/")}
-            style={{ background: "none", border: "none", cursor: "pointer", color: "var(--color-text-muted)", padding: "4px", display: "flex" }}
-          >
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-              <path d="M19 12H5M12 19l-7-7 7-7" />
-            </svg>
-          </button>
-          <span style={{ fontWeight: 700, fontSize: "15px", color: "var(--color-text-primary)", letterSpacing: "-0.02em" }}>
-            Mes News
-          </span>
-          <div style={{ display: "flex", gap: "4px", marginLeft: "8px" }}>
-            <button style={TAB_STYLE(tab === "daily")} onClick={() => handleTab("daily")}>Daily</button>
-            <button style={TAB_STYLE(tab === "weekly")} onClick={() => handleTab("weekly")}>Weekly</button>
+      <header style={HEADER_STYLE}>
+        <div style={{ ...HEADER_INNER, justifyContent: "space-between" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
+            <BackButton />
+            <NavBrand />
           </div>
-          {!loadingDaily && tab === "daily" && digests.length > 0 && (
-            <span style={{
-              marginLeft: "auto", fontSize: "11px", color: "var(--color-text-muted)",
-              fontFamily: "var(--font-mono)",
-            }}>
-              {new Date().toLocaleDateString("fr-FR", { weekday: "long", day: "numeric", month: "long" })}
-            </span>
-          )}
+          <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+            <div style={{ display: "flex", gap: "4px" }}>
+              <button style={TAB_STYLE(tab === "daily")} onClick={() => handleTab("daily")}>Daily</button>
+              <button style={TAB_STYLE(tab === "weekly")} onClick={() => handleTab("weekly")}>Weekly</button>
+            </div>
+            {!loadingDaily && tab === "daily" && digests.length > 0 && (
+              <span style={{ fontSize: "11px", color: "var(--color-text-muted)", fontFamily: "var(--font-mono)" }}>
+                {new Date().toLocaleDateString("fr-FR", { weekday: "long", day: "numeric", month: "long" })}
+              </span>
+            )}
+          </div>
         </div>
       </header>
 

@@ -2,7 +2,7 @@ import type { Metadata, Viewport } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "StockVibe",
+  title: "Actionfun",
   description: "Stock analysis — charts, news, Reddit sentiment",
 };
 
