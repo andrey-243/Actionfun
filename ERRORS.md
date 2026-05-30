@@ -159,3 +159,20 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON public.pinned_stocks TO anon;
 ```
 
 **Règle** : Toute nouvelle table nécessite `GRANT ... TO authenticated` en plus des RLS policies.
+
+---
+
+## 2026-05-30 · Batch EN enrich — FreeTheAI 429 systématique
+
+**Symptôme** : FreeTheAI retourne 429 sur chaque appel pendant le batch EN enrich, même avec `FREETHEAI_DELAY=17s`. Groq prend le relais mais la qualité est moindre.
+
+**Causes identifiées** :
+1. **Processus concurrents** — `litellm` (PID 797, configuré pour router vers FreeTheAI) et `free_api_llm/dashboard_server.py` (PID 4744) tournaient en parallèle et consommaient le quota RPM de la même clé API.
+2. **Modifications `llm_service.py` inutiles** — ajout de `_freetheai_available()` avec sleep MIN_INTERVAL, `_freetheai_last_call`, et `break` sur 429 (empêchait d'essayer le secondary model) — ces changements n'aidaient pas et introduisaient de la complexité.
+
+**Fix** :
+1. Killer les processus concurrents avant tout batch : `kill $(pgrep -f litellm) $(pgrep -f free_api_llm)`.
+2. Revenir au comportement original de `llm_service.py` : `continue` sur 429 (essaie le secondary), pas de MIN_INTERVAL custom.
+3. `FREETHEAI_DELAY=17s` dans le batch est suffisant pour respecter le RPM (10 RPM, 1 concurrent).
+
+**Règle** : Avant tout batch FreeTheAI, vérifier `ps aux | grep python` et killer tout processus concurrent utilisant la même clé API.

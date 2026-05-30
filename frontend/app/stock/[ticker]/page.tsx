@@ -19,6 +19,7 @@ import ArticleDrawer from "../../components/ArticleDrawer";
 import VideoModal from "../../components/VideoModal";
 import EventDrawer from "../../components/EventDrawer";
 import DogLoader from "../../components/DogLoader";
+import ColdStartBanner from "../../components/ColdStartBanner";
 import { NavBrand, BackButton, HEADER_STYLE, HEADER_INNER } from "../../components/Navbar";
 import type { Article } from "../../components/ArticleDrawer";
 import { sourceStyle } from "../../components/ArticleDrawer";
@@ -298,6 +299,8 @@ export default function StockPage() {
   const [periodArticles, setPeriodArticles] = useState<Article[]>([]);
   const [periodSummaries, setPeriodSummaries] = useState<{type: string; year_month?: string; year?: string; week_num?: number | null; label: string; ai_summary?: string | null; article_count?: number; top_articles?: Article[]; skewed?: boolean; skewed_range?: string}[]>([]);
   const [periodLoading, setPeriodLoading] = useState(false);
+
+  const [coldStartPhase, setColdStartPhase] = useState<string | null>(null);
 
   const { currency, setCurrency } = useCurrencyPref();
   const { rates } = useExchangeRate();
@@ -620,6 +623,25 @@ export default function StockPage() {
       </header>
 
       <main style={{ maxWidth: "720px", margin: "0 auto", padding: "24px 20px 80px" }}>
+
+        {/* Cold start banner — tickers rares hors top 250 */}
+        {ticker && (
+          <ColdStartBanner
+            ticker={ticker.toUpperCase()}
+            lang={typeof window !== "undefined" ? (navigator.language.startsWith("fr") ? "fr" : "en") : "fr"}
+            onPhaseComplete={(phase) => {
+              setColdStartPhase(phase);
+              // Recharger les articles quand une phase se termine
+              if (["1m", "6m", "1y"].includes(phase)) {
+                const apiPeriod = chartPeriod === "5y" ? "all" : chartPeriod;
+                fetch(`${API}/api/articles/${ticker.toUpperCase()}?period=${apiPeriod}`)
+                  .then((r) => r.json())
+                  .then((d) => { setPeriodArticles(d.articles ?? []); setPeriodSummaries(d.summaries ?? []); })
+                  .catch(() => {});
+              }
+            }}
+          />
+        )}
 
         {/* Stock header */}
         {stockLoading ? (

@@ -8,7 +8,7 @@ import os
 
 load_dotenv()
 
-from routers import stock, news, search, events, digest, articles
+from routers import stock, news, search, events, digest, articles, cold_start
 
 logger = logging.getLogger(__name__)
 
@@ -70,8 +70,22 @@ async def lifespan(app: FastAPI):
         minute=0,
         id="yahoo_accumulation",
     )
+    scheduler.add_job(
+        _run_cold_start_translate_fr,
+        trigger="cron",
+        hour=19,
+        minute=0,
+        id="cold_start_translate_fr",
+    )
+    scheduler.add_job(
+        _run_reenrich,
+        trigger="cron",
+        hour=22,
+        minute=30,
+        id="reenrich_groq_to_freetheai",
+    )
     scheduler.start()
-    logger.info("Crons démarrés — digest gen 18h + email 18h30, weekly lun 3h30, monthly 1er 4h, yearly 1er jan 5h, yahoo 2h")
+    logger.info("Crons démarrés — digest gen 18h + email 18h30, weekly lun 3h30, monthly 1er 4h, yearly 1er jan 5h, yahoo 2h, cold_start FR 19h, re-enrich 22h30")
     yield
     scheduler.shutdown()
 
@@ -124,6 +138,22 @@ def _run_yahoo_accumulation():
         logger.error(f"Yahoo accumulation failed: {e}")
 
 
+def _run_reenrich():
+    from services.reenrich_service import run_reenrich
+    try:
+        run_reenrich()
+    except Exception as e:
+        logger.error(f"Re-enrich failed: {e}")
+
+
+def _run_cold_start_translate_fr():
+    from services.cold_start_service import translate_pending_fr
+    try:
+        translate_pending_fr()
+    except Exception as e:
+        logger.error(f"Cold start translate_fr failed: {e}")
+
+
 def _purge_old_digests():
     from supabase import create_client
     from datetime import date, timedelta
@@ -152,6 +182,7 @@ app.include_router(search.router, prefix="/api")
 app.include_router(events.router, prefix="/api")
 app.include_router(digest.router, prefix="/api")
 app.include_router(articles.router, prefix="/api")
+app.include_router(cold_start.router, prefix="/api")
 
 
 @app.get("/health")

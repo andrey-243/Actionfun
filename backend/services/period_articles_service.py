@@ -270,7 +270,7 @@ def _dedup_by_headline(articles: list[dict]) -> list[dict]:
         if not key:
             continue
         if key not in seen:
-            seen[key] = {**a, "extra_sources": []}
+            seen[key] = {**a, "extra_sources": a.get("extra_sources", [])}
         else:
             existing = seen[key]
             is_proxy = "finnhub.io/api/news" in (existing.get("url") or "")
@@ -458,12 +458,27 @@ Articles :
 Rédige en français un résumé analytique de 4-6 phrases couvrant : les événements majeurs (résultats, annonces, deals), les chiffres clés, l'impact sur l'action et l'évolution du sentiment.
 Réponds UNIQUEMENT avec le texte du résumé en français, sans titre ni formatage."""
 
+WEEK_CONDENSE_PROMPT_EN = """You are a senior financial analyst. Here are articles about {ticker} for the week {label}.
+
+Articles:
+{articles_text}
+
+Write a 4-6 sentence analytical summary covering: major events (earnings, announcements, deals), key figures, impact on the stock and sentiment evolution.
+Reply ONLY with the summary text in English, no title or formatting."""
+
 MONTH_CONDENSE_PROMPT = """Tu es un analyste financier senior. Voici l'actualité sur {ticker} pour {label}.
 
 {weeks_text}
 
 Synthétise en français en 6-8 phrases : événements majeurs du mois, chiffres clés, contexte macro/sectoriel pertinent, catalyseurs et risques identifiés, évolution du sentiment investisseurs.
 Réponds UNIQUEMENT avec le texte du résumé en français, sans titre ni formatage."""
+
+MONTH_CONDENSE_PROMPT_EN = """You are a senior financial analyst. Here is the news about {ticker} for {label}.
+
+{weeks_text}
+
+Synthesize in 6-8 sentences in English: major monthly events, key figures, relevant macro/sector context, identified catalysts and risks, investor sentiment evolution.
+Reply ONLY with the summary text in English, no title or formatting."""
 
 YEAR_CONDENSE_PROMPT = """Tu es un analyste financier senior. Voici les résumés mensuels sur {ticker} pour l'année {year}.
 
@@ -472,15 +487,40 @@ YEAR_CONDENSE_PROMPT = """Tu es un analyste financier senior. Voici les résumé
 Synthétise l'année en français en 8-10 phrases : temps forts, tendances de fond, pivots stratégiques majeurs, performance relative, sentiment global et perspectives.
 Réponds UNIQUEMENT avec le texte du résumé en français, sans titre ni formatage."""
 
+YEAR_CONDENSE_PROMPT_EN = """You are a senior financial analyst. Here are the monthly summaries for {ticker} for the year {year}.
 
-def _llm_call(prompt: str, max_tokens: int = 400) -> str:
-    from services.llm_service import llm_text
-    return llm_text(
+{months_text}
+
+Synthesize the year in 8-10 sentences in English: highlights, underlying trends, major strategic pivots, relative performance, overall sentiment and outlook.
+Reply ONLY with the summary text in English, no title or formatting."""
+
+
+def _lang() -> str:
+    import os
+    return os.environ.get("LLM_LANG", "fr")
+
+
+def _pick(fr_prompt: str, en_prompt: str) -> str:
+    return en_prompt if _lang() == "en" else fr_prompt
+
+
+def _summary_col() -> str:
+    return "ai_summary_en" if _lang() == "en" else "ai_summary"
+
+
+def _llm_call(prompt: str, max_tokens: int = 400, allow_groq: bool = True) -> str:
+    from services.llm_service import llm_call
+    resp = llm_call(
         [{"role": "user", "content": prompt}],
         groq_model="llama-3.3-70b-versatile",
         max_tokens=max_tokens,
         timeout=45,
+        allow_groq=allow_groq,
     )
+    _llm_call._last_source = resp.get("_llm_source")
+    return resp["choices"][0]["message"]["content"].strip()
+
+_llm_call._last_source = None
 
 
 def run_weekly_condensation():
@@ -549,7 +589,7 @@ def run_weekly_condensation():
         try:
             label = _week_label(target_ym, target_wnum)
             articles_text = "\n".join(f"- {a['headline']}" for a in week_articles[:30])
-            summary = _llm_call(WEEK_CONDENSE_PROMPT.format(
+            summary = _llm_call(_pick(WEEK_CONDENSE_PROMPT, WEEK_CONDENSE_PROMPT_EN).format(
                 ticker=ticker,
                 label=label,
                 articles_text=articles_text,
@@ -559,9 +599,10 @@ def run_weekly_condensation():
                 "ticker":        ticker,
                 "year_month":    target_ym,
                 "week_num":      target_wnum,
-                "ai_summary":    summary,
+                _summary_col():  summary,
                 "top_articles":  top_articles,
                 "article_count": len(week_articles),
+                "llm_source":    _llm_call._last_source,
                 "condensed_at":  datetime.now(timezone.utc).isoformat(),
             }).execute()
             logger.info(f"  ✓ Weekly {ticker} {target_ym} W{target_wnum} ({len(week_articles)} articles)")
@@ -614,19 +655,21 @@ def run_monthly_condensation():
                 .order("week_num") \
                 .execute()
 
+            month_prompt = _pick(MONTH_CONDENSE_PROMPT, MONTH_CONDENSE_PROMPT_EN)
+            sc = _summary_col()
             if week_rows.data and len(week_rows.data) >= 3:
+                src_col = "ai_summary_en" if _lang() == "en" else "ai_summary"
                 weeks_text = "\n".join(
-                    f"W{r['week_num']}: {r['ai_summary']}"
+                    f"W{r['week_num']}: {r.get(src_col) or r.get('ai_summary', '')}"
                     for r in week_rows.data
                 )
                 article_count = sum(r["article_count"] for r in week_rows.data)
-                summary = _llm_call(MONTH_CONDENSE_PROMPT.format(
+                summary = _llm_call(month_prompt.format(
                     ticker=ticker,
                     label=_month_label(target_ym),
                     weeks_text=weeks_text,
                 ), max_tokens=500)
             else:
-                # Fallback : condenser depuis raw
                 row = supa.table("article_archive") \
                     .select("articles") \
                     .eq("ticker", ticker) \
@@ -638,7 +681,7 @@ def run_monthly_condensation():
                 raw = row.data["articles"]
                 article_count = len(raw)
                 articles_text = "\n".join(f"- {a['headline']}" for a in raw[:40])
-                summary = _llm_call(MONTH_CONDENSE_PROMPT.format(
+                summary = _llm_call(month_prompt.format(
                     ticker=ticker,
                     label=_month_label(target_ym),
                     weeks_text=articles_text,
@@ -647,8 +690,9 @@ def run_monthly_condensation():
             supa.table("article_month_summaries").upsert({
                 "ticker":        ticker,
                 "year_month":    target_ym,
-                "ai_summary":    summary,
+                sc:              summary,
                 "article_count": article_count,
+                "llm_source":    _llm_call._last_source,
                 "condensed_at":  datetime.now(timezone.utc).isoformat(),
             }).execute()
             logger.info(f"  ✓ Monthly {ticker} {target_ym} ({article_count} articles)")
@@ -692,11 +736,12 @@ def run_yearly_condensation():
             continue  # Pas assez de data pour une année complète
 
         try:
+            src_col = "ai_summary_en" if _lang() == "en" else "ai_summary"
             months_text = "\n".join(
-                f"{_month_label(r['year_month'])}: {r['ai_summary']}"
+                f"{_month_label(r['year_month'])}: {r.get(src_col) or r.get('ai_summary', '')}"
                 for r in month_rows.data
             )
-            summary = _llm_call(YEAR_CONDENSE_PROMPT.format(
+            summary = _llm_call(_pick(YEAR_CONDENSE_PROMPT, YEAR_CONDENSE_PROMPT_EN).format(
                 ticker=ticker,
                 year=target_year,
                 months_text=months_text,
@@ -705,7 +750,8 @@ def run_yearly_condensation():
             supa.table("article_year_summaries").upsert({
                 "ticker":       ticker,
                 "year":         target_year,
-                "ai_summary":   summary,
+                _summary_col(): summary,
+                "llm_source":   _llm_call._last_source,
                 "condensed_at": datetime.now(timezone.utc).isoformat(),
             }).execute()
             logger.info(f"  ✓ Yearly {ticker} {target_year}")
@@ -915,11 +961,12 @@ def run_monthly_calendaire(tickers: list[str] | None = None):
             continue
 
         try:
+            src_col = "ai_summary_en" if _lang() == "en" else "ai_summary"
             weeks_text = "\n".join(
-                f"S{r['week_num']}: {r['ai_summary']}" for r in week_rows.data
+                f"S{r['week_num']}: {r.get(src_col) or r.get('ai_summary', '')}" for r in week_rows.data
             )
             article_count = sum(r["article_count"] for r in week_rows.data)
-            summary = _llm_call(MONTH_CONDENSE_PROMPT.format(
+            summary = _llm_call(_pick(MONTH_CONDENSE_PROMPT, MONTH_CONDENSE_PROMPT_EN).format(
                 ticker=ticker,
                 label=_month_label(target_ym),
                 weeks_text=weeks_text,
@@ -928,7 +975,7 @@ def run_monthly_calendaire(tickers: list[str] | None = None):
             supa.table("article_month_summaries").upsert({
                 "ticker":        ticker,
                 "year_month":    target_ym,
-                "ai_summary":    summary,
+                _summary_col():  summary,
                 "article_count": article_count,
                 "condensed_at":  datetime.now(timezone.utc).isoformat(),
             }).execute()
@@ -963,15 +1010,17 @@ def get_monthly_ondemand(ticker: str) -> str | None:
     if not weeks:
         return None
 
+    src_col = "ai_summary_en" if _lang() == "en" else "ai_summary"
+    label = "the last 4 weeks" if _lang() == "en" else "ces 4 dernières semaines"
     weeks_text = "\n".join(
-        f"S{w['week_num']} {w['year_month']}: {w['ai_summary']}"
+        f"S{w['week_num']} {w['year_month']}: {w.get(src_col) or w.get('ai_summary', '')}"
         for w in reversed(weeks)
     )
 
     try:
-        return _llm_call(MONTH_CONDENSE_PROMPT.format(
+        return _llm_call(_pick(MONTH_CONDENSE_PROMPT, MONTH_CONDENSE_PROMPT_EN).format(
             ticker=ticker,
-            label="ces 4 dernières semaines",
+            label=label,
             weeks_text=weeks_text,
         ), max_tokens=500)
     except Exception as e:

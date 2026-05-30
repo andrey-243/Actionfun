@@ -26,6 +26,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
+os.environ["BATCH_MODE"] = "1"
+
 import httpx
 import yfinance as yf
 from supabase import create_client
@@ -85,7 +87,7 @@ def _notify_checkpoint(phase: str, i: int, total: int, region: str,
     _telegram(msg)
     logger.info(f"[NOTIF] {i}/{total} — {len(errors_batch)} erreurs")
 
-PROGRESS_FILE = Path(__file__).parent / "batch_progress.json"
+PROGRESS_FILE = Path(__file__).parent / "batch_progress.json"  # overridable via --progress-file
 FINNHUB_KEY = os.environ["FINNHUB_API_KEY"]
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
@@ -93,7 +95,8 @@ SUPABASE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 # Rate limits
 FINNHUB_DELAY = 1.1      # 60 req/min → 1s entre calls
 YAHOO_DELAY = 6.0        # 10 req/min safe
-FREETHEAI_DELAY = 17.0   # 1 concurrent, ~16s/call + marge
+FREETHEAI_DELAY = 17.0   # délai conservateur entre deux appels FreeTheAI
+FREETHEAI_MIN_INTERVAL = float(os.environ.get("FREETHEAI_MIN_INTERVAL", "16.5"))
 
 
 def _supa():
@@ -331,6 +334,7 @@ def phase_enrich(tickers: list[str], region: str = "all"):
             result = get_news(ticker)
             summary_ok = bool(result.get("summary") or result.get("summary_24h"))
             logger.info(f"  {'✓' if summary_ok else '⚠'} {ticker} — sentiment: {result.get('sentiment','?')}")
+            time.sleep(FREETHEAI_DELAY)
 
             # Populate website domain for Logo.dev
             try:
@@ -352,7 +356,6 @@ def phase_enrich(tickers: list[str], region: str = "all"):
             batch_errors.append(ticker)
 
         save_progress(progress)
-        time.sleep(FREETHEAI_DELAY)
 
         if i % NOTIFY_EVERY == 0:
             _notify_checkpoint("enrich", i, total, region, batch_errors, [], 0, start_time)
@@ -369,15 +372,101 @@ def phase_enrich(tickers: list[str], region: str = "all"):
     logger.info(f"ENRICH terminé: {len(progress['enriched'])} done, {total_failed} failed")
 
 
+# ─── Phase translate-fr ───────────────────────────────────────────────────────
+
+def phase_translate_fr(tickers: list[str], region: str = "all"):
+    """
+    Lit ai_summary_en depuis stock_news_cache et traduit vers ai_summary (FR).
+    Ne traite que les tickers qui ont ai_summary_en mais pas ai_summary.
+    """
+    from services.translation_service import translate_to_fr
+
+    supa = _supa()
+    progress = load_progress()
+    translated = set(progress.get("translated_fr", []))
+
+    # Charger les tickers qui ont EN mais pas FR
+    rows = supa.table("stock_news_cache") \
+        .select("ticker, ai_summary_en, ai_summary_24h_en, ai_summary") \
+        .in_("ticker", tickers) \
+        .not_.is_("ai_summary_en", "null") \
+        .execute()
+
+    todo = [
+        r for r in (rows.data or [])
+        if r["ticker"] not in translated and not r.get("ai_summary")
+    ]
+    total = len(todo)
+    logger.info(f"TRANSLATE-FR: {total} tickers à traduire ({len(translated)} déjà fait)")
+
+    if not todo:
+        logger.info("Rien à traduire.")
+        return
+
+    _telegram(f"🌐 *Batch TRANSLATE-FR démarré — {region}*\n{total} tickers à traduire")
+
+    start_time = time.time()
+    batch_errors = []
+
+    for i, row in enumerate(todo, 1):
+        ticker = row["ticker"]
+        logger.info(f"[{i}/{total}] {ticker} — traduction FR")
+        try:
+            summary_fr = translate_to_fr(row["ai_summary_en"])
+            summary_24h_fr = translate_to_fr(row.get("ai_summary_24h_en") or "") if row.get("ai_summary_24h_en") else ""
+
+            supa.table("stock_news_cache").update({
+                "ai_summary": summary_fr,
+                "ai_summary_24h": summary_24h_fr,
+            }).eq("ticker", ticker).execute()
+
+            logger.info(f"  ✓ {ticker}")
+            progress.setdefault("translated_fr", []).append(ticker)
+        except Exception as e:
+            logger.error(f"  ✗ {ticker}: {e}")
+            batch_errors.append(ticker)
+
+        save_progress(progress)
+        time.sleep(FREETHEAI_DELAY)
+
+        if i % NOTIFY_EVERY == 0:
+            _notify_checkpoint("translate-fr", i, total, region, batch_errors, [], 0, start_time)
+            batch_errors = []
+
+    elapsed = int(time.time() - start_time)
+    mins, secs = divmod(elapsed, 60)
+    _telegram(f"✅ *Batch TRANSLATE-FR terminé — {region}*\n{len(progress.get('translated_fr',[]))} tickers · ⏱ {mins}m{secs:02d}s")
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description="Batch DB filler pour StockVibe")
-    parser.add_argument("--phase", choices=["scrape", "enrich", "all"], default="scrape")
+    parser.add_argument("--phase", choices=["scrape", "enrich", "all", "translate-fr"], default="scrape")
     parser.add_argument("--region", choices=["US", "EU", "ASIA", "all"], default="all")
     parser.add_argument("--ticker", type=str, default=None, help="Ticker unique")
     parser.add_argument("--reset", action="store_true", help="Remet le progress à zéro")
+    parser.add_argument("--lang", choices=["fr", "en"], default=None,
+                        help="Langue de génération LLM (fr=default, en=EN-first)")
+    parser.add_argument("--translate-fr", action="store_true",
+                        help="Traduit EN→FR après génération (pour EU/ASIA qui n'ont pas encore de FR)")
+    parser.add_argument("--progress-file", type=str, default=None,
+                        help="Fichier de progress custom (défaut: batch_progress.json)")
     args = parser.parse_args()
+
+    # Override progress file si spécifié
+    if args.progress_file:
+        global PROGRESS_FILE
+        PROGRESS_FILE = Path(args.progress_file)
+
+    # Appliquer la langue via env var (lu par tous les services)
+    if args.lang:
+        os.environ["LLM_LANG"] = args.lang
+        logger.info(f"LLM_LANG={args.lang}")
+
+    if args.translate_fr:
+        os.environ["TRANSLATE_TO_FR"] = "true"
+        logger.info("TRANSLATE_TO_FR=true — traduction EN→FR activée")
 
     if args.reset:
         PROGRESS_FILE.unlink(missing_ok=True)
@@ -390,13 +479,16 @@ def main():
     else:
         tickers = get_by_region(args.region)
 
-    logger.info(f"Phase: {args.phase} | Région: {args.region} | {len(tickers)} tickers")
+    logger.info(f"Phase: {args.phase} | Région: {args.region} | Lang: {os.environ.get('LLM_LANG','fr')} | {len(tickers)} tickers")
 
     if args.phase in ("scrape", "all"):
         phase_scrape(tickers, region=args.region)
 
     if args.phase in ("enrich", "all"):
         phase_enrich(tickers, region=args.region)
+
+    if args.phase == "translate-fr":
+        phase_translate_fr(tickers, region=args.region)
 
 
 if __name__ == "__main__":

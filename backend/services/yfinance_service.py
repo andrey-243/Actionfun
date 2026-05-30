@@ -29,13 +29,19 @@ def get_stock_data(ticker: str, period: str = "6mo") -> dict:
     current = fi.last_price
     previous = fi.previous_close
 
+    name = ticker.upper()
+    pe_ratio = None
+    website = None
     try:
+        from urllib.parse import urlparse
         info = t.info
         name = info.get("longName") or info.get("shortName", ticker.upper())
         pe_ratio = info.get("trailingPE")
+        raw_url = info.get("website", "") or ""
+        if raw_url:
+            website = urlparse(raw_url).netloc.lstrip("www.") or None
     except Exception:
-        name = ticker.upper()
-        pe_ratio = None
+        pass
 
     return {
         "ticker": ticker.upper(),
@@ -50,6 +56,7 @@ def get_stock_data(ticker: str, period: str = "6mo") -> dict:
         "week_52_high": getattr(fi, "year_high", None),
         "week_52_low": getattr(fi, "year_low", None),
         "chart": chart_data,
+        "website": website,
     }
 
 

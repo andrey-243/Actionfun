@@ -1,5 +1,6 @@
 from fastapi import APIRouter, HTTPException, Query
 from services.digest_service import generate_digest_for_ticker
+from supabase import create_client
 import os
 
 router = APIRouter()
@@ -23,7 +24,6 @@ async def digest(ticker: str, date: str = Query(default=None)):
 @router.get("/weekly/{ticker}")
 async def weekly(ticker: str):
     try:
-        from supabase import create_client
         supa = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
         t = ticker.upper()
         row = (

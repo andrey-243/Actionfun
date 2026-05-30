@@ -15,6 +15,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dotenv import load_dotenv
 load_dotenv()
 
+os.environ["BATCH_MODE"] = "1"
+
 from services.period_articles_service import (
     _get_supabase, _week_num, _week_label, _month_label,
     _normalize_finnhub, _llm_call,

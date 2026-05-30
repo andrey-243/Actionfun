@@ -93,9 +93,12 @@ def get_event_news(ticker: str, date: str, change_pct: float = 0.0) -> dict:
         .maybe_single() \
         .execute()
 
+    lang = os.environ.get("LLM_LANG", "fr")
     cached = row.data if row else None
     if cached:
-        return {"date": date, "articles": cached["articles"], "cause": cached["cause"]}
+        cause = cached.get("cause_en" if lang == "en" else "cause")
+        if cause:
+            return {"date": date, "articles": cached["articles"], "cause": cause}
 
     # Fetch Finnhub T-3 → T+3
     dt = datetime.fromisoformat(date[:10])
@@ -126,18 +129,64 @@ def get_event_news(ticker: str, date: str, change_pct: float = 0.0) -> dict:
     benchmark_name, benchmark_ticker = _get_benchmark(ticker)
     price_context = _get_price_context(ticker, date, benchmark_ticker, benchmark_name)
 
-    cause = _groq_cause(ticker, date, change_pct, articles, price_context) if articles else None
+    from services.llm_service import llm_text as _llm_text
+    cause_result = None
+    llm_source = None
+    if articles:
+        try:
+            from services.llm_service import llm_call as _llm_call
+            # _groq_cause retourne du texte — on passe par llm_call pour avoir _llm_source
+            cause_result, llm_source = _groq_cause_with_source(ticker, date, change_pct, articles, price_context, lang)
+        except Exception:
+            cause_result = None
+
+    cause = cause_result
     result = {"date": date, "articles": articles, "cause": cause}
 
-    supa.table("event_causes").upsert({
+    cause_field = "cause_en" if lang == "en" else "cause"
+    upsert_data = {
         "ticker":    ticker,
         "date":      date,
         "articles":  articles,
-        "cause":     cause,
+        cause_field: cause,
+        "llm_source": llm_source,
         "cached_at": datetime.now(timezone.utc).isoformat(),
-    }).execute()
+    }
+    supa.table("event_causes").upsert(upsert_data).execute()
 
     return result
+
+
+def _groq_cause_with_source(ticker: str, date: str, change_pct: float, articles: list[dict], price_context: str, lang: str) -> tuple[str | None, str | None]:
+    """Retourne (cause_text, llm_source)."""
+    direction = "hausse" if change_pct >= 0 else "baisse"
+    sign = "+" if change_pct >= 0 else ""
+    headlines = "\n".join(f"- {a['headline']}" for a in articles[:12])
+    price_section = f"\n{price_context}\n" if price_context else ""
+    if lang == "en":
+        prompt = f"""Ticker: {ticker} | Date: {date} | Move: {sign}{change_pct:.2f}% ({'up' if change_pct >= 0 else 'down'})
+{price_section}
+Articles published around this date ({len(articles)}):
+{headlines}
+
+Based on the price movement, market context and articles, explain in 3-4 sentences what drove this move.
+Note whether the move is stock-specific or correlated with the broader market.
+Start directly with the facts, no introduction."""
+    else:
+        prompt = f"""Ticker : {ticker} | Date : {date} | Mouvement : {sign}{change_pct:.2f}% ({direction})
+{price_section}
+Articles publiés autour de cette date ({len(articles)}) :
+{headlines}
+
+En te basant sur le mouvement de cours, le contexte du marché et les articles, explique en 3-4 phrases ce qui explique ce mouvement.
+Intègre si le move est spécifique au titre ou corrélé au marché général.
+Commence directement par les faits, pas d'introduction."""
+    try:
+        from services.llm_service import llm_call
+        resp = llm_call([{"role": "user", "content": prompt}], groq_model=GROQ_LIGHT, max_tokens=280, timeout=25)
+        return resp["choices"][0]["message"]["content"].strip(), resp.get("_llm_source")
+    except Exception:
+        return None, None
 
 
 def _groq_cause(ticker: str, date: str, change_pct: float, articles: list[dict], price_context: str) -> str | None:
@@ -147,7 +196,18 @@ def _groq_cause(ticker: str, date: str, change_pct: float, articles: list[dict],
 
     price_section = f"\n{price_context}\n" if price_context else ""
 
-    prompt = f"""Ticker : {ticker} | Date : {date} | Mouvement : {sign}{change_pct:.2f}% ({direction})
+    lang = os.environ.get("LLM_LANG", "fr")
+    if lang == "en":
+        prompt = f"""Ticker: {ticker} | Date: {date} | Move: {sign}{change_pct:.2f}% ({'up' if change_pct >= 0 else 'down'})
+{price_section}
+Articles published around this date ({len(articles)}):
+{headlines}
+
+Based on the price movement, market context and articles, explain in 3-4 sentences what drove this move.
+Note whether the move is stock-specific or correlated with the broader market.
+Start directly with the facts, no introduction."""
+    else:
+        prompt = f"""Ticker : {ticker} | Date : {date} | Mouvement : {sign}{change_pct:.2f}% ({direction})
 {price_section}
 Articles publiés autour de cette date ({len(articles)}) :
 {headlines}

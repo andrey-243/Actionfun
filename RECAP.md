@@ -14,7 +14,7 @@
 | Events chart | Finnhub company-news (free, 1 an d'historique) + Groq cause IA |
 | Email digest | Resend (3 000 emails/mois gratuit) — clé configurée, sandbox actif |
 | Logos | Logo.dev free (500k req/mois, attribution requise) — domaine depuis yfinance `t.info["website"]`, stocké dans `stock_news_cache.website` · `NEXT_PUBLIC_LOGODEV_TOKEN` dans `frontend/.env.local` |
-| Cron | APScheduler intégré dans FastAPI — digest gen 18h00 · email 18h30 · weekly lun 3h30 · monthly 1er 4h · yearly 1er jan 5h · yahoo 2h |
+| Cron | APScheduler intégré dans FastAPI — digest gen 18h00 · email 18h30 · cold_start FR 19h · re-enrich 22h30 · weekly lun 3h30 · monthly 1er 4h · yearly 1er jan 5h · yahoo 2h |
 | Git | github.com/andrey-243/Actionfun — repo privé |
 | Déploiement | local → Railway/Render (backend) · Vercel (frontend) · Supabase (DB) |
 
@@ -110,8 +110,8 @@ stock_app/
 | Annotations chart (events) | ✅ | Dots peaks/valleys → EventDrawer Finnhub + cause IA. 24H/5Y sans dots. 1W=top 5, 1M=8, 6M/1Y=10 |
 | Chart — vertical grid lines | ✅ | Tirets par période : 24H=horaire, 1W=jour, 1M=lundi, 6M/1Y=mois, 5Y=année |
 | Lazy loading page stock | ✅ | Default 24H — seul /api/news charge au mount. Articles 1M+ et causes events : on-demand uniquement |
-| Cascade LLM FreeTheAI→Groq | ✅ | gpt-4.1 → gpt-5.4-mini → Groq. Notif Telegram si checkin Discord manquant |
-| EOD digest — backend | ✅ | gen 18h00 (Finnhub → fallback Yahoo cache) · email 18h30 · 2 jobs APScheduler séparés |
+| Cascade LLM FreeTheAI→Groq | ✅ | gpt-4.1 → gpt-5.4-mini → Hapuppy → Groq. Notifs Telegram spécifiques par raison (checkin/quota/429/502/hapuppy_down). Throttle 30min.ram si checkin Discord manquant |
+| EOD digest — backend | ✅ | gen 18h00 (Yahoo cache stock_news_cache en primary, Finnhub+LLM seulement si cache vide) · email 18h30 · 2 jobs APScheduler séparés |
 | EOD digest — email | ✅ | Resend — clé configurée, sandbox `onboarding@resend.dev` (passer à domaine custom en prod) |
 | EOD digest — onglet "Mes news" | ✅ | Page /my-news : 2 tabs Daily (daily_digest) + Weekly (article_week_summaries) · logo Logo.dev · source + date articles |
 | Préférences notif (email on/off + par ticker) | ✅ | Dans /profile : toggle Daily + toggle Weekly (badge Premium, actif pour tous) + chips par action · `notify_weekly` en DB |
@@ -123,6 +123,9 @@ stock_app/
 | Articles multi-source | ✅ | Dedup par headline à chaque fetch Finnhub. `extra_sources` stockés. Badges colorés + multi-CTA dans drawer |
 | Reddit sentiment | ⬜ | À venir |
 | Refresh proactif (cron) | ⬜ | Pour tickers populaires/pinnés |
+| LLM source tracking | ✅ | `llm_source` persisté dans stock_news_cache, article_week/month/year_summaries, event_causes, daily_digest |
+| Re-enrich Groq→FreeTheAI | ✅ | Cron 22h30 — scan `llm_source='groq'`, re-enrich FreeTheAI only (BATCH_MODE). Stop si quota atteint, retry J+1. |
+| Cold start ticker rare | ✅ | Tickers hors top 250 : scrape + enrich progressif en background (1M → 6M → 1Y). EN first, FR traduit EOD si pas de clic FR. Banner `ColdStartBanner` avec poll 10s, steps visuels, reload articles au completion. |
 
 ## LLM — Cascade & modèles
 
@@ -131,24 +134,38 @@ Tous les appels LLM passent par `services/llm_service.py` qui gère la cascade a
 **Cascade :**
 ```
 FreeTheAI: bbl/gpt-4.1          → primary (JSON propre, qualité max)
-FreeTheAI: bbl/gpt-5.4-mini     → secondary si 429/502/timeout sur primary
-Groq: voir tableau ci-dessous    → fallback si 403 checkin Discord manquant
+FreeTheAI: bbl/gpt-5.4-mini     → secondary si 502/timeout sur primary
+Hapuppy:   deepseek-v3.2        → tertiary (happy endpoint, pas de quota partagé)
+Groq: voir tableau ci-dessous    → fallback final si 403 / daily limit / 429
+                                   ⚠️ désactivé en BATCH_MODE=1 (quota préservé pour le site)
 ```
 
-**Comportement 403 (check-in Discord manquant) :**
-- FreeTheAI désactivé jusqu'au prochain minuit UTC
-- Notif Telegram automatique → @mcorp1290_bot
-- Faire `/checkin` sur le serveur Discord FreeTheAI pour débloquer
+**Comportement erreurs FreeTheAI — désactivation jusqu'à minuit UTC + notif Telegram :**
+- **403 / checkin manquant** : faire `/checkin` sur le Discord FreeTheAI pour débloquer
+- **Daily limit** (`"daily successful request limit exceeded"`) : reset automatique à minuit UTC
+- **429 (RPM)** : skip immédiat vers Groq, retry FreeTheAI après 6s (10 RPM, 1 concurrent)
+
+**FreeTheAI — quotas journaliers (rôle Discord) :**
+| Rôle | Requêtes/jour | Images/jour |
+|---|---|---|
+| Seems Legit | 400–500 | 30 |
+| Sans rôle | 250 | 5 |
+| Suspicious | 50 | 2 |
+
+⚠️ Rôle actuel inconnu — vérifier sur le Discord FreeTheAI. Un batch complet (717 tickers × 2 calls) = ~1400 calls, **dépasse tous les tiers**. Prévoir plusieurs nuits ou alterner avec Groq.
 
 **Mapping modèles par usage :**
 
-| Usage | FreeTheAI | Groq fallback |
-|---|---|---|
-| BRUTALIZE (30 articles → résumé 7J) | `bbl/gpt-4.1` | `llama-4-scout-17b` |
-| SUMMARY_24H | `bbl/gpt-4.1` | `llama-3.1-8b-instant` |
-| EVENT_CAUSE (dot chart) | `bbl/gpt-4.1` | `llama-3.1-8b-instant` |
-| DIGEST EOD | `bbl/gpt-4.1` | `llama-4-scout-17b` |
-| WEEKLY / MONTHLY / YEARLY condensation | `bbl/gpt-4.1` | `llama-3.3-70b-versatile` |
+| Usage | Contexte | FreeTheAI/Hapuppy | Groq fallback |
+|---|---|---|---|
+| BRUTALIZE (30 articles → résumé 7J) | site + batch | `bbl/gpt-4.1` | `llama-4-scout-17b` ¹ |
+| SUMMARY_24H | site + batch | `bbl/gpt-4.1` | `llama-3.1-8b-instant` ¹ |
+| EVENT_CAUSE (dot chart) | site | `bbl/gpt-4.1` | `llama-3.1-8b-instant` |
+| DIGEST EOD | site | — (lit stock_news_cache, LLM seulement si cache vide) | `llama-4-scout-17b` (fallback rare) |
+| WEEKLY / MONTHLY condensation | site + batch | `bbl/gpt-4.1` | `llama-3.3-70b-versatile` ¹ |
+| TRADUCTION EN→FR | batch | `bbl/gpt-4.1` | DeepL → Groq `llama-3.1-8b` ¹ |
+
+¹ Groq désactivé quand `BATCH_MODE=1` — le batch échoue proprement sur le ticker et skip.
 
 **FreeTheAI — modèles actifs (testés 29/05/2026) :**
 
@@ -189,45 +206,85 @@ TELEGRAM_CHAT_ID=...          # notifs check-in manquant
 
 **Cascade traduction EN→FR :**
 ```
-1. DeepL API          ← primaire (deepl.com, ~$7/mois, 1M chars)
-2. FreeTheAI          ← backup si DeepL down/quota
-3. Groq               ← fallback final
+1. FreeTheAI          ← primary (gratuit, ~16s/appel)
+                         Si 403 checkin manquant → skip immédiat vers DeepL (même comportement que llm_service)
+2. DeepL API          ← secondary (~200ms, ~$7/mois paid tier)
+3. Groq               ← fallback final (gratuit, toujours dispo)
 ```
-Var d'env à ajouter : `DEEPL_API_KEY=...`
+Vars d'env optionnelles : `DEEPL_API_KEY=...` (clé se terminant par `:fx` = free tier)
 
-**Champs DB à doubler (migration Supabase) :**
+**Stratégie de migration :**
+- Les résumés FR déjà générés (enrich US en cours) → conservés tels quels, renommés `*_fr`
+- Nouvelles colonnes `*_en` ajoutées → alimentées par le prochain enrich EN
+- Zéro re-génération du FR existant — aucun travail perdu
+- **Traduction batch** (717 tickers) : volume > 500k chars → FreeTheAI (~16s/ticker, gratuit)
+- **Traduction real-time** (daily digest, events on-demand) : DeepL (~200ms, $7/mois)
+
+**Champs à doubler (ALTER TABLE ADD COLUMN) :**
 ```
 stock_news_cache :
-  ai_summary        → ai_summary_en  (source of truth)
-  ai_summary_fr     (traduit)
-  ai_summary_24h    → ai_summary_24h_en
-  ai_summary_24h_fr
-  ai_sentiment      → inchangé (BULLISH/BEARISH/NEUTRAL = langue-agnostique)
+  ai_summary (FR existant, gardé)  +  ai_summary_en (nouvelle)
+  ai_summary_24h (FR existant)     +  ai_summary_24h_en (nouvelle)
+  ai_sentiment / ai_sentiment_24h  → inchangés (BULLISH/BEARISH/NEUTRAL agnostiques)
+
+  Exemple FR : "Sur la semaine, Lowe's a affiché une performance légèrement négative
+  (-0,31%) dans un marché américain dynamique (+1,43% pour le S&P 500)..."
 
 daily_digest :
-  summary           → summary_en
-  summary_fr
+  summary (FR existant)  +  summary_en (nouvelle)
+
+  Exemple FR : "L'action Amazon (AMZN) a augmenté de 3,4% depuis la dernière
+  publication de ses résultats financiers. La société a fermé son tableau de
+  bord interne d'IA..."
 
 article_week_summaries :
-  ai_summary        → ai_summary_en
-  ai_summary_fr
+  ai_summary (FR existant)  +  ai_summary_en (nouvelle)
 
-article_month_summaries / article_year_summaries : idem
+  Exemple FR : "La semaine W4 d'avril 2026 a été marquée par des résultats
+  trimestriels positifs pour Amazon, avec une croissance de son secteur d'IA..."
+
+article_month_summaries :
+  ai_summary (FR existant)  +  ai_summary_en (nouvelle)
+
+  Exemple FR : "En mars 2026, Amazon s'est distinguée par l'introduction de
+  solutions publicitaires pilotées par l'IA via BQool..."
+
+article_year_summaries :
+  ai_summary (FR existant)  +  ai_summary_en (nouvelle)
+
+event_causes :
+  cause (FR existant)  +  cause_en (nouvelle)
+
+  Exemple FR : "Le titre AAPL a bénéficié d'une note plus optimiste de la part
+  de Morgan Stanley, qui a augmenté ses prévisions en raison d'une augmentation
+  de 8% de la production d'iPhone..."
 ```
 
-**Fichiers à modifier :**
-- Tous les prompts dans `llm_service.py`, `news_service.py`, `digest_service.py`, `period_articles_service.py` → passer en EN
-- Ajouter `translation_service.py` → gère la cascade traduction
-- `batch_fill_db.py` phase enrich → génère EN + traduit FR
-- Frontend : toggle FR/EN dans `/profile` (`lang` dans `user_preferences`), résumés affichés selon préférence
+**Ce qu'on ne traduit PAS :**
+- `brutalised` par article dans `news_raw` — ~30 × 717 = 4M+ chars, trop cher
+- Titres/sources articles Yahoo/Finnhub — données brutes, toujours EN
+
+**Fichiers à créer/modifier :**
+- `translation_service.py` (nouveau) → cascade FreeTheAI → DeepL → Groq ✅
+- Tous les prompts : `news_service.py`, `digest_service.py`, `period_articles_service.py`, `events_service.py` → EN
+- `batch_fill_db.py` phase enrich → génère EN + appelle traduction → FR
+- `user_preferences` : ajouter colonne `lang TEXT DEFAULT 'fr'`
+- Frontend : toggle FR/EN dans `/profile`, résumés affichés selon `lang`
 
 **Ordre d'implémentation :**
-1. Choisir DeepL vs DeepSeek → ajouter clé `.env`
-2. Créer `translation_service.py` avec cascade
-3. Migrer les colonnes DB (ALTER TABLE + migration des données existantes)
-4. Réécrire tous les prompts en EN
-5. Mettre à jour tous les services pour stocker `_en` + appeler traduction → `_fr`
-6. Frontend : toggle lang dans `/profile` + affichage conditionnel
+1. Migrations DB (ADD COLUMN `*_en` + `cause_en` + `lang` dans user_preferences)
+2. Créer `translation_service.py`
+3. Réécrire prompts en EN dans tous les services
+4. Adapter `batch_fill_db.py` : enrich US EN → puis EU+Asia EN+FR
+5. Frontend : toggle lang + affichage conditionnel des champs `_en` / `_fr`
+
+**Séquence enrichs :**
+```
+✅ En cours  : FR enrich US (~104 min)
+⏳ Ensuite   : EN enrich US (écrit ai_summary_en, pas de traduction car FR existe déjà)
+⏳ Puis      : EN+FR enrich EU (génère EN + traduit FR via FreeTheAI)
+⏳ Puis      : EN+FR enrich Asia (idem)
+```
 
 ### Descriptions intelligentes des tickers (post-beta)
 
@@ -257,7 +314,24 @@ article_archive         — raw articles (ticker, year_month PK, articles JSONB,
 article_week_summaries  — résumé AI + top 10 articles par semaine (ticker, year_month, week_num PK, ai_summary, top_articles)
 article_month_summaries — résumé AI par mois (ticker, year_month PK, ai_summary) — généré depuis weekly summaries
 article_year_summaries  — résumé AI par année (ticker, year PK, ai_summary) — généré depuis monthly summaries
+ticker_init_status      — cold start tickers rares (ticker PK, phase TEXT, status TEXT, pending_fr BOOL, started_at, completed_at, error TEXT, updated_at)
 ```
+
+### Cold start — phases & timings
+
+Pour les tickers hors top 250 (jamais scrappés), le premier clic déclenche un cold start progressif en background :
+
+| Phase | Contenu | ETA estimé | Banner |
+|---|---|---|---|
+| `1m` | Scrape Finnhub 1M + weekly condensation | ~2 min | "Chargement du dernier mois de données..." |
+| `6m` | Scrape Finnhub 6M + weeklies + monthlies | ~7 min | "Chargement des 6 derniers mois..." |
+| `1y` | Scrape Finnhub 1Y + weeklies + monthlies + yearly | ~15 min | "Chargement de l'année complète..." |
+
+- Scrape toujours en **EN** (plus rapide, pas de coût translation au cold start)
+- Si user FR : contenu EN affiché pendant cold start, flag `pending_fr = true`
+- Cron EOD : traduit les tickers `pending_fr` si aucun clic FR depuis le cold start
+- Si user FR clique → translation immédiate (prioritaire sur le cron)
+- Chaque phase complète → banner update automatique (poll 10s frontend) → phase suivante auto
 
 RLS activé sur toutes les tables. `service_role` a GRANT ALL explicite.
 `authenticated` + `anon` ont GRANT SELECT/INSERT/UPDATE/DELETE explicite (requis en plus des RLS policies).
@@ -331,7 +405,7 @@ Finnhub indexe le même article depuis plusieurs outlets (Yahoo proxy + source o
 - `_normalize_finnhub()` passe `extra_sources` dans chaque article retourné à l'UI
 - Badges colorés par source (Yahoo=violet, Bloomberg=noir, Reuters=orange...) dans `NewsCard` et `CompactArticleRow`
 - `ArticleDrawer` : un bouton "Read" par source disponible (principal coloré, alternatives neutres)
-- **Scope** : uniquement pour 1M/6M/1Y (article_archive). 24H/1W (stock_news_cache Yahoo) n'a pas de multi-source.
+- **Scope** : uniquement pour 1M/6M/1Y (article_archive Finnhub). 24H/1W utilise `stock_news_cache` (Yahoo) — pas de `extra_sources`, pas de badges multi-source sur ce path.
 
 **Script refetch :** `backend/scripts/refetch_finnhub.py`
 ```bash

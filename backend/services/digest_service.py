@@ -23,6 +23,23 @@ Format JSON strict :
   "sentiment": "BULLISH"
 }}"""
 
+DIGEST_PROMPT_EN = """You are a financial analyst. Here are today's news for {ticker}.
+
+Articles:
+{articles_text}
+
+Write a complete 4-6 sentence summary covering:
+- What happened today for this stock
+- Relevant macro or sector elements
+- Probable short-term impact on the stock price
+- Overall sentiment: BULLISH, BEARISH or NEUTRAL
+
+Strict JSON format:
+{{
+  "summary": "summary text",
+  "sentiment": "BULLISH"
+}}"""
+
 
 def _get_supabase():
     return create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
@@ -54,24 +71,19 @@ def _fetch_today_news(ticker: str) -> list[dict]:
     ]
 
 
-def _groq_digest(ticker: str, articles: list[dict]) -> dict:
+def _groq_digest(ticker: str, articles: list[dict], lang: str = "fr") -> dict:
+    from services.llm_service import llm_json
     articles_text = "\n".join(f"- {a['headline']}" for a in articles[:12])
-    r = httpx.post(
-        "https://api.groq.com/openai/v1/chat/completions",
-        headers={"Authorization": f"Bearer {os.environ['GROQ_API_KEY']}"},
-        json={
-            "model": "meta-llama/llama-4-scout-17b-16e-instruct",
-            "messages": [{"role": "user", "content": DIGEST_PROMPT.format(
-                ticker=ticker, articles_text=articles_text
-            )}],
-            "response_format": {"type": "json_object"},
-            "temperature": 0.3,
-        },
+    prompt = (DIGEST_PROMPT_EN if lang == "en" else DIGEST_PROMPT).format(
+        ticker=ticker, articles_text=articles_text
+    )
+    return llm_json(
+        [{"role": "user", "content": prompt}],
+        groq_model="meta-llama/llama-4-scout-17b-16e-instruct",
+        max_tokens=500,
+        temperature=0.3,
         timeout=30,
     )
-    r.raise_for_status()
-    import json
-    return json.loads(r.json()["choices"][0]["message"]["content"])
 
 
 def _fetch_from_yahoo_cache(ticker: str, supa) -> dict | None:
@@ -118,39 +130,60 @@ def _fetch_from_yahoo_cache(ticker: str, supa) -> dict | None:
     }
 
 
-def generate_digest_for_ticker(ticker: str) -> dict | None:
+def generate_digest_for_ticker(ticker: str, lang: str = None) -> dict | None:
     """Génère et stocke le digest du jour pour un ticker. Retourne None si pas de news."""
+    lang = lang or os.environ.get("LLM_LANG", "fr")
     today = date.today().isoformat()
     supa = _get_supabase()
 
-    # Déjà généré aujourd'hui ?
     existing = supa.table("daily_digest").select("*").eq("ticker", ticker).eq("date", today).maybe_single().execute()
     if existing and existing.data:
-        return existing.data
+        if lang == "en" and existing.data.get("summary_en"):
+            return existing.data
+        if lang == "fr":
+            return existing.data
 
-    articles = _fetch_today_news(ticker)
-    if articles:
-        ai = _groq_digest(ticker, articles)
+    # 1. Lire le cache Yahoo (stock_news_cache) — déjà enrichi par news_service, zéro LLM
+    yahoo = _fetch_from_yahoo_cache(ticker, supa)
+    llm_source = "cache"
+    if yahoo:
+        articles = yahoo["articles"]
+        summary_key = "summary_en" if lang == "en" else "summary"
+        summary = yahoo.get(summary_key) or yahoo.get("summary", "")
+        sentiment = yahoo.get("sentiment", "NEUTRAL")
+    else:
+        # 2. Fallback : fetch Finnhub + LLM si le cache est vide (ticker jamais enrichi)
+        articles = _fetch_today_news(ticker)
+        if not articles:
+            return None
+        ai = _groq_digest(ticker, articles, lang=lang)
         summary = ai.get("summary", "")
         sentiment = ai.get("sentiment", "NEUTRAL")
-    else:
-        # Finnhub vide → fallback Yahoo cache
-        yahoo = _fetch_from_yahoo_cache(ticker, supa)
-        if not yahoo:
-            return None
-        articles = yahoo["articles"]
-        summary = yahoo["summary"]
-        sentiment = yahoo["sentiment"]
+        llm_source = ai.get("_llm_source", "unknown")
 
-    row = {
-        "ticker": ticker,
-        "date": today,
-        "articles": articles,
-        "summary": summary,
-        "sentiment": sentiment,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-    }
-    supa.table("daily_digest").upsert(row).execute()
+    if lang == "en":
+        row = {
+            "ticker": ticker,
+            "date": today,
+            "articles": articles,
+            "summary_en": summary,
+            "sentiment": sentiment,
+            "llm_source": llm_source,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        supa.table("daily_digest").upsert(row).execute()
+    else:
+        row = {
+            "ticker": ticker,
+            "date": today,
+            "articles": articles,
+            "summary": summary,
+            "sentiment": sentiment,
+            "llm_source": llm_source,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        supa.table("daily_digest").upsert(row).execute()
+
     return row
 
 
