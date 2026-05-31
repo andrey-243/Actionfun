@@ -71,6 +71,12 @@ async def lifespan(app: FastAPI):
         id="yahoo_accumulation",
     )
     scheduler.add_job(
+        _run_hourly_news_refresh,
+        trigger="cron",
+        minute=15,
+        id="hourly_news_refresh",
+    )
+    scheduler.add_job(
         _run_cold_start_translate_fr,
         trigger="cron",
         hour=19,
@@ -85,7 +91,7 @@ async def lifespan(app: FastAPI):
         id="reenrich_groq_to_freetheai",
     )
     scheduler.start()
-    logger.info("Crons démarrés — digest gen 18h + email 18h30, weekly lun 3h30, monthly 1er 4h, yearly 1er jan 5h, yahoo 2h, cold_start FR 19h, re-enrich 22h30")
+    logger.info("Crons démarrés — digest gen 18h + email 18h30, weekly lun 3h30, monthly 1er 4h, yearly 1er jan 5h, yahoo 2h, cold_start FR 19h, re-enrich 22h30, hourly_news :15")
     yield
     scheduler.shutdown()
 
@@ -144,6 +150,14 @@ def _run_reenrich():
         run_reenrich()
     except Exception as e:
         logger.error(f"Re-enrich failed: {e}")
+
+
+def _run_hourly_news_refresh():
+    from services.overview_service import run_hourly_news_refresh
+    try:
+        run_hourly_news_refresh()
+    except Exception as e:
+        logger.error(f"Hourly news refresh failed: {e}")
 
 
 def _run_cold_start_translate_fr():

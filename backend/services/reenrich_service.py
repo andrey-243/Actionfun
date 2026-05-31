@@ -79,7 +79,7 @@ def _reenrich_news_cache(supa) -> bool:
             return False
         ticker = row["ticker"]
         try:
-            from services.news_service import get_news
+            from services.overview_service import get_news
             get_news(ticker)
             logger.info(f"[reenrich] ✓ news_cache {ticker}")
         except RuntimeError:

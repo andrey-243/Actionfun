@@ -1,16 +1,16 @@
 """
 Translation service: EN → FR
-Cascade: FreeTheAI → DeepL → Groq
+Cascade: FreeTheAI → Azure Translator → Groq
 
-- FreeTheAI: primary (free, ~16s). Si 403 checkin manquant → skip immédiat vers DeepL
-- DeepL: secondary (fast, ~200ms, ~$7/mois paid tier)
-- Groq: fallback final (free, toujours dispo)
+- FreeTheAI: primary (free, ~16s). Si 403 checkin → skip immédiat
+- Azure Translator: secondary (free 2M chars/mois, ~200ms). Vars: AZURE_TRANSLATOR_KEY + AZURE_TRANSLATOR_REGION
+- Groq: fallback final (free, toujours dispo). Désactivé en BATCH_MODE.
 """
 import os
 import logging
 import time
 import httpx
-from services.llm_service import _freetheai_available, _freetheai_skip_until, _next_utc_midnight, _notify_telegram, FREETHEAI_URL, FREETHEAI_PRIMARY
+from services.llm_service import _freetheai_available, _freetheai_skip_until, _next_utc_midnight, _notify_telegram, _log_usage, FREETHEAI_URL, FREETHEAI_PRIMARY
 
 logger = logging.getLogger(__name__)
 
@@ -65,23 +65,27 @@ def translate_to_fr(text: str) -> str:
                 _notify_telegram("⚠️ *FreeTheAI* — Check-in Discord manquant\nFais `/checkin` sur leur serveur pour débloquer.\nDeepL/Groq utilisés pour la traduction.")
                 logger.warning("FreeTheAI 403 — skip vers DeepL pour traductions")
             elif r.status_code == 200:
-                content = r.json()["choices"][0]["message"]["content"].strip()
+                data = r.json()
+                content = data["choices"][0]["message"]["content"].strip()
                 if content:
+                    u = data.get("usage", {})
+                    _log_usage(FREETHEAI_PRIMARY, u.get("prompt_tokens", 0), u.get("completion_tokens", 0))
                     return content
         except Exception as e:
             logger.warning(f"FreeTheAI translation failed: {e}")
 
-    # 2. DeepL — secondary (si clé disponible)
-    deepl_key = os.environ.get("DEEPL_API_KEY", "")
-    if deepl_key:
+    # 2. Azure Translator — secondary (free 2M chars/mois)
+    azure_key = os.environ.get("AZURE_TRANSLATOR_KEY", "")
+    azure_region = os.environ.get("AZURE_TRANSLATOR_REGION", "")
+    if azure_key and azure_region:
         try:
-            return _deepl(text, deepl_key)
+            return _azure_translate(text, azure_key, azure_region)
         except Exception as e:
-            logger.warning(f"DeepL failed: {e}")
+            logger.warning(f"Azure Translator failed: {e}")
 
     # 3. Groq — fallback final (désactivé en BATCH_MODE pour préserver le quota site)
     if os.environ.get("BATCH_MODE") == "1":
-        raise RuntimeError("Translation unavailable (FreeTheAI/DeepL down, Groq disabled for batch)")
+        raise RuntimeError("Translation unavailable (FreeTheAI/Azure down, Groq disabled for batch)")
     return _groq_translate(text)
 
 
@@ -93,16 +97,21 @@ def _is_checkin_error(r: httpx.Response) -> bool:
         return False
 
 
-def _deepl(text: str, api_key: str) -> str:
-    base = "api-free.deepl.com" if api_key.endswith(":fx") else "api.deepl.com"
+def _azure_translate(text: str, api_key: str, region: str) -> str:
     r = httpx.post(
-        f"https://{base}/v2/translate",
-        headers={"Authorization": f"DeepL-Auth-Key {api_key}"},
-        json={"text": [text], "target_lang": "FR", "source_lang": "EN"},
+        "https://api.cognitive.microsofttranslator.com/translate",
+        headers={
+            "Ocp-Apim-Subscription-Key": api_key,
+            "Ocp-Apim-Subscription-Region": region,
+            "Content-Type": "application/json",
+        },
+        params={"api-version": "3.0", "from": "en", "to": "fr"},
+        json=[{"Text": text}],
         timeout=15,
     )
     r.raise_for_status()
-    return r.json()["translations"][0]["text"]
+    return r.json()[0]["translations"][0]["text"]
+
 
 
 def _groq_translate(text: str) -> str:
@@ -118,4 +127,7 @@ def _groq_translate(text: str) -> str:
         timeout=30,
     )
     r.raise_for_status()
-    return r.json()["choices"][0]["message"]["content"].strip()
+    data = r.json()
+    u = data.get("usage", {})
+    _log_usage("llama-3.1-8b-instant", u.get("prompt_tokens", 0), u.get("completion_tokens", 0))
+    return data["choices"][0]["message"]["content"].strip()

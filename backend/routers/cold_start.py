@@ -11,7 +11,17 @@ router = APIRouter()
 @router.get("/ticker/{ticker}/init-status")
 async def init_status(ticker: str, lang: str = None):
     lang = lang or os.environ.get("LLM_LANG", "fr")
-    status = get_init_status(ticker.upper())
+    t = ticker.upper()
+
+    # Si le ticker a déjà des données → jamais besoin de cold start
+    if not needs_cold_start(t):
+        return {
+            "ticker": t, "phase": "1y", "status": "done",
+            "pending_fr": False, "label": "", "eta_seconds": 0,
+            "done": True, "error": None,
+        }
+
+    status = get_init_status(t)
     phase = status.get("phase", "uninitialized")
     current_status = status.get("status", "idle")
 
@@ -20,7 +30,7 @@ async def init_status(ticker: str, lang: str = None):
     label = labels.get(phase, "") if current_status == "running" else ""
 
     return {
-        "ticker": ticker.upper(),
+        "ticker": t,
         "phase": phase,
         "status": current_status,
         "pending_fr": status.get("pending_fr", False),

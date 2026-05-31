@@ -88,7 +88,7 @@ def _groq_digest(ticker: str, articles: list[dict], lang: str = "fr") -> dict:
 
 def _fetch_from_yahoo_cache(ticker: str, supa) -> dict | None:
     """Fallback : utilise le summary 24h déjà généré dans stock_news_cache.
-    Si absent, déclenche un refresh actif via news_service."""
+    Si absent, déclenche un refresh actif via overview_service."""
     row = (
         supa.table("stock_news_cache")
         .select("ai_summary_24h, ai_sentiment_24h, news_raw")
@@ -98,7 +98,7 @@ def _fetch_from_yahoo_cache(ticker: str, supa) -> dict | None:
     )
     if not row or not row.data or not row.data.get("ai_summary_24h"):
         try:
-            from services.news_service import get_news
+            from services.overview_service import get_news
             get_news(ticker)
             row = (
                 supa.table("stock_news_cache")
@@ -108,7 +108,7 @@ def _fetch_from_yahoo_cache(ticker: str, supa) -> dict | None:
                 .execute()
             )
         except Exception as e:
-            logger.warning(f"  news_service fallback failed for {ticker}: {e}")
+            logger.warning(f"  overview_service fallback failed for {ticker}: {e}")
     if not row or not row.data or not row.data.get("ai_summary_24h"):
         return None
 
@@ -143,7 +143,7 @@ def generate_digest_for_ticker(ticker: str, lang: str = None) -> dict | None:
         if lang == "fr":
             return existing.data
 
-    # 1. Lire le cache Yahoo (stock_news_cache) — déjà enrichi par news_service, zéro LLM
+    # 1. Lire le cache Yahoo (stock_news_cache) — déjà enrichi par overview_service, zéro LLM
     yahoo = _fetch_from_yahoo_cache(ticker, supa)
     llm_source = "cache"
     if yahoo:

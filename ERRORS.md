@@ -41,7 +41,7 @@ GRANT ALL ON public.stock_news_cache TO service_role;
 
 ## 2026-05-29 · Cache events in-memory — résumés IA périmés après changement de prompt
 
-**Symptôme** : Après modification du prompt Groq dans `events_service.py`, les anciennes réponses courtes continuent d'être servies.
+**Symptôme** : Après modification du prompt Groq dans `bubble_service.py`, les anciennes réponses courtes continuent d'être servies.
 
 **Cause** : Cache `_cache` dict en mémoire Python — persiste pendant toute la durée de vie du process uvicorn.
 
@@ -78,7 +78,7 @@ GRANT ALL ON public.stock_news_cache TO service_role;
 2. `.maybe_single().execute()` retourne `None` (pas un APIResponse) quand 0 lignes → guard `cache.data if cache else None`.
 3. yfinance retourne `clickThroughUrl: null` (pas absent) → `.get("clickThroughUrl", {})` retournait `None`, `.get("url","")` crashait → remplacé par `(c.get("clickThroughUrl") or {}).get("url", "")`.
 
-**Fix** : Les trois corrections dans `services/news_service.py` + guard `if existing and existing.data` dans `digest_service.py`.
+**Fix** : Les trois corrections dans `services/overview_service.py` + guard `if existing and existing.data` dans `digest_service.py`.
 
 ---
 
@@ -137,11 +137,11 @@ GRANT ALL ON public.stock_news_cache TO service_role;
 **Symptôme** : `HTTP/2 406` sur `GET stock_news_cache` + `Expecting value: line 1 column 1 (char 0)` sur NVDA, GOOGL, META.
 
 **Causes** :
-1. `maybe_single()` dans `news_service.py` → même bug 406 que `article_archive`.
+1. `maybe_single()` dans `overview_service.py` → même bug 406 que `article_archive`.
 2. FreeTheAI retourne parfois un JSON vide ou wrappé en markdown code block → `json.loads()` crash.
 
 **Fix** :
-1. `news_service.py` : `.maybe_single().execute()` → `.limit(1).execute()` + `cache.data[0]`.
+1. `overview_service.py` : `.maybe_single().execute()` → `.limit(1).execute()` + `cache.data[0]`.
 2. `llm_service.py` : `llm_json()` strip les ``` markdown avant parsing + raise si content vide.
 
 ---

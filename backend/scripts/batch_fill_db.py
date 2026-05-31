@@ -67,7 +67,8 @@ def _telegram(msg: str):
 
 def _notify_checkpoint(phase: str, i: int, total: int, region: str,
                         done_batch: list[str], errors_batch: list[str],
-                        articles_batch: int, start_time: float):
+                        articles_batch: int, start_time: float,
+                        llm_sources: dict[str, int] | None = None):
     elapsed = int(time.time() - start_time)
     mins, secs = divmod(elapsed, 60)
     remaining = int((elapsed / i) * (total - i)) if i else 0
@@ -76,16 +77,23 @@ def _notify_checkpoint(phase: str, i: int, total: int, region: str,
     err_line = f"❌ Errors: {', '.join(errors_batch)}" if errors_batch else "✅ 0 erreurs"
     art_line = f"📰 Articles: +{articles_batch:,}" if articles_batch else ""
 
+    llm_line = ""
+    if llm_sources:
+        _ICONS = {"freetheai": "🟢", "hapuppy": "🟡", "agentrouter": "🔵", "groq": "🟠", "unknown": "⚪"}
+        parts = [f"{_ICONS.get(k, '⚪')} {k}: {v}" for k, v in sorted(llm_sources.items(), key=lambda x: -x[1])]
+        llm_line = "🤖 LLM: " + " · ".join(parts)
+
     msg = (
         f"📊 *Batch {phase.upper()} — {region}*\n"
         f"Checkpoint {i}/{total} ({i*100//total}%)\n"
         f"⏱ {mins}m{secs:02d}s écoulé · ~{r_mins}m{r_secs:02d}s restant\n"
         f"{err_line}\n"
-        f"{art_line}"
+        f"{art_line}\n"
+        f"{llm_line}"
     ).strip()
 
     _telegram(msg)
-    logger.info(f"[NOTIF] {i}/{total} — {len(errors_batch)} erreurs")
+    logger.info(f"[NOTIF] {i}/{total} — {len(errors_batch)} erreurs · LLM: {llm_sources}")
 
 PROGRESS_FILE = Path(__file__).parent / "batch_progress.json"  # overridable via --progress-file
 FINNHUB_KEY = os.environ["FINNHUB_API_KEY"]
@@ -95,8 +103,7 @@ SUPABASE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 # Rate limits
 FINNHUB_DELAY = 1.1      # 60 req/min → 1s entre calls
 YAHOO_DELAY = 6.0        # 10 req/min safe
-FREETHEAI_DELAY = 17.0   # délai conservateur entre deux appels FreeTheAI
-FREETHEAI_MIN_INTERVAL = float(os.environ.get("FREETHEAI_MIN_INTERVAL", "16.5"))
+FREETHEAI_DELAY = 6.0    # 60s / 10 RPM — on attend la réponse du call (sync) puis 6s
 
 
 def _supa():
@@ -311,7 +318,8 @@ def phase_enrich(tickers: list[str], region: str = "all"):
     Génère le news cache (24H + 7J summaries) pour chaque ticker.
     Respecte le concurrent limit FreeTheAI (séquentiel + délai).
     """
-    from services.news_service import get_news
+    from services.overview_service import get_news
+    from services.llm_service import GroqExhaustedError
 
     supa = _supa()
     progress = load_progress()
@@ -327,29 +335,56 @@ def phase_enrich(tickers: list[str], region: str = "all"):
 
     start_time = time.time()
     batch_errors: list[str] = []
+    batch_llm_sources: dict[str, int] = {}
+    delisted_tickers: list[str] = []
 
     for i, ticker in enumerate(todo, 1):
         logger.info(f"[{i}/{total}] {ticker} — génération AI summary")
         try:
             result = get_news(ticker)
             summary_ok = bool(result.get("summary") or result.get("summary_24h"))
-            logger.info(f"  {'✓' if summary_ok else '⚠'} {ticker} — sentiment: {result.get('sentiment','?')}")
+            src = result.get("llm_source", "unknown")
+            batch_llm_sources[src] = batch_llm_sources.get(src, 0) + 1
+            logger.info(f"  {'✓' if summary_ok else '⚠'} {ticker} — sentiment: {result.get('sentiment','?')} · llm: {src}")
             time.sleep(FREETHEAI_DELAY)
 
-            # Populate website domain for Logo.dev
+            # Populate website domain for Logo.dev + détection delisted
             try:
-                import yfinance as yf
                 from urllib.parse import urlparse
-                raw_url = yf.Ticker(ticker).info.get("website", "") or ""
+                info = yf.Ticker(ticker).info or {}
+                raw_url = info.get("website", "") or ""
                 if raw_url:
                     domain = urlparse(raw_url).netloc.lstrip("www.")
                     if domain:
                         supa.table("stock_news_cache").update({"website": domain}).eq("ticker", ticker).execute()
                         logger.info(f"  🌐 {ticker} → {domain}")
+                if info.get("regularMarketPrice") is None and info.get("currentPrice") is None:
+                    delisted_tickers.append(ticker)
+                    logger.warning(f"  ⚠ {ticker} — possibly delisted (no price data)")
             except Exception as we:
-                logger.warning(f"  website fetch failed for {ticker}: {we}")
+                err = str(we).lower()
+                if "delisted" in err or "no data found" in err or "not found" in err:
+                    delisted_tickers.append(ticker)
+                    logger.warning(f"  ⚠ {ticker} — delisted: {we}")
+                else:
+                    logger.warning(f"  website fetch failed for {ticker}: {we}")
 
             progress["enriched"].append(ticker)
+
+        except GroqExhaustedError:
+            elapsed = int(time.time() - start_time)
+            mins, secs = divmod(elapsed, 60)
+            remaining = total - i + 1
+            save_progress(progress)
+            msg = (
+                f"🛑 *Batch ENRICH arrêté — quota Groq épuisé*\n"
+                f"Progress sauvegardé : {len(progress['enriched'])} done · {remaining} restants\n"
+                f"⏱ {mins}m{secs:02d}s · Relancer après minuit UTC"
+            )
+            _telegram(msg)
+            logger.error(f"GroqExhaustedError — batch stoppé à {i}/{total}, {remaining} tickers restants")
+            return
+
         except Exception as e:
             logger.error(f"  ✗ {ticker}: {e}")
             progress.setdefault("failed_enrich", []).append(ticker)
@@ -358,18 +393,121 @@ def phase_enrich(tickers: list[str], region: str = "all"):
         save_progress(progress)
 
         if i % NOTIFY_EVERY == 0:
-            _notify_checkpoint("enrich", i, total, region, batch_errors, [], 0, start_time)
+            _notify_checkpoint("enrich", i, total, region, batch_errors, [], 0, start_time, batch_llm_sources)
             batch_errors = []
+            batch_llm_sources = {}
 
     elapsed = int(time.time() - start_time)
     mins, secs = divmod(elapsed, 60)
     total_failed = len(progress.get("failed_enrich", []))
+    delisted_line = f"\n⚠️ Delisted ({len(delisted_tickers)}) : {', '.join(delisted_tickers)}" if delisted_tickers else ""
     _telegram(
         f"✅ *Batch ENRICH terminé — {region}*\n"
-        f"{len(progress['enriched'])} tickers done · {total_failed} failed\n"
+        f"{len(progress['enriched'])} tickers done · {total_failed} failed{delisted_line}\n"
         f"⏱ Durée totale : {mins}m{secs:02d}s"
     )
-    logger.info(f"ENRICH terminé: {len(progress['enriched'])} done, {total_failed} failed")
+    logger.info(f"ENRICH terminé: {len(progress['enriched'])} done, {total_failed} failed, {len(delisted_tickers)} delisted: {delisted_tickers}")
+
+
+# ─── Phase bubbles (pre-gen event_causes 6M+1Y) ──────────────────────────────
+
+def _detect_peaks_valleys(closes: list[float], window: int, max_dots: int) -> list[tuple[int, float]]:
+    """Reproduit la logique frontend. Retourne [(idx, pct), ...] triés par abs(pct)."""
+    candidates = []
+    for i in range(window, len(closes) - window):
+        cur = closes[i]
+        before = closes[i - window:i]
+        after  = closes[i + 1:i + window + 1]
+        is_peak   = cur > max(before) and cur > max(after)
+        is_valley = cur < min(before) and cur < min(after)
+        if not is_peak and not is_valley:
+            continue
+        neighbors = before + after
+        avg = sum(neighbors) / len(neighbors)
+        pct = (cur - avg) / avg * 100
+        candidates.append((i, pct))
+    candidates.sort(key=lambda x: -abs(x[1]))
+    return candidates[:max_dots]
+
+
+def phase_bubbles(tickers: list[str], region: str = "all"):
+    """
+    Pré-génère event_causes pour les dots 6M+1Y de chaque ticker.
+    Stable dans le temps — ne regénère pas si déjà en cache.
+    """
+    from services.bubble_service import get_event_news
+
+    supa = _supa()
+    progress = load_progress()
+    done = set(progress.get("bubbles_done", []))
+    todo = [t for t in tickers if t not in done]
+    total = len(todo)
+
+    logger.info(f"BUBBLES: {total} tickers à traiter ({len(done)} déjà done)")
+    if not todo:
+        return
+
+    _telegram(f"🫧 *Batch BUBBLES démarré — {region}*\n{total} tickers\nPériodes : 6M + 1Y")
+
+    PERIODS = [
+        ("6mo", "1d", 4, 10),  # (period, interval, window, max_dots)
+        ("1y",  "1d", 5, 10),
+    ]
+
+    start_time = time.time()
+    batch_errors: list[str] = []
+    total_events = 0
+
+    for i, ticker in enumerate(todo, 1):
+        logger.info(f"[{i}/{total}] {ticker} — bubbles 6M+1Y")
+        ticker_events = 0
+        try:
+            for period, interval, window, max_dots in PERIODS:
+                try:
+                    hist = yf.Ticker(ticker).history(period=period, interval=interval)
+                    if len(hist) < window * 2 + 1:
+                        continue
+
+                    closes = hist["Close"].tolist()
+                    dates  = [d.strftime("%Y-%m-%d") for d in hist.index]
+
+                    events = _detect_peaks_valleys(closes, window, max_dots)
+                    for idx, _ in events:
+                        date = dates[idx]
+                        # change_pct = variation jour J vs J-1
+                        change_pct = (closes[idx] - closes[idx - 1]) / closes[idx - 1] * 100 if idx > 0 else 0.0
+                        try:
+                            get_event_news(ticker, date, round(change_pct, 2))
+                            ticker_events += 1
+                            time.sleep(0.5)  # éviter burst Groq
+                        except Exception as e:
+                            logger.warning(f"  bubble {ticker} {date}: {e}")
+
+                except Exception as e:
+                    logger.warning(f"  period {period} {ticker}: {e}")
+
+            total_events += ticker_events
+            logger.info(f"  ✓ {ticker} — {ticker_events} bubbles générées")
+            progress.setdefault("bubbles_done", []).append(ticker)
+
+        except Exception as e:
+            logger.error(f"  ✗ {ticker}: {e}")
+            batch_errors.append(ticker)
+
+        save_progress(progress)
+
+        if i % NOTIFY_EVERY == 0:
+            _notify_checkpoint("bubbles", i, total, region, batch_errors, [], 0, start_time)
+            batch_errors = []
+
+    elapsed = int(time.time() - start_time)
+    mins, secs = divmod(elapsed, 60)
+    _telegram(
+        f"✅ *Batch BUBBLES terminé — {region}*\n"
+        f"{len(progress.get('bubbles_done', []))} tickers · {total_events} bubbles\n"
+        f"⏱ {mins}m{secs:02d}s"
+    )
+    logger.info(f"BUBBLES terminé: {total_events} events générés")
 
 
 # ─── Phase translate-fr ───────────────────────────────────────────────────────
@@ -442,7 +580,7 @@ def phase_translate_fr(tickers: list[str], region: str = "all"):
 
 def main():
     parser = argparse.ArgumentParser(description="Batch DB filler pour StockVibe")
-    parser.add_argument("--phase", choices=["scrape", "enrich", "all", "translate-fr"], default="scrape")
+    parser.add_argument("--phase", choices=["scrape", "enrich", "all", "translate-fr", "bubbles"], default="scrape")
     parser.add_argument("--region", choices=["US", "EU", "ASIA", "all"], default="all")
     parser.add_argument("--ticker", type=str, default=None, help="Ticker unique")
     parser.add_argument("--reset", action="store_true", help="Remet le progress à zéro")
@@ -489,6 +627,9 @@ def main():
 
     if args.phase == "translate-fr":
         phase_translate_fr(tickers, region=args.region)
+
+    if args.phase == "bubbles":
+        phase_bubbles(tickers, region=args.region)
 
 
 if __name__ == "__main__":

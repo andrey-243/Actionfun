@@ -1,8 +1,8 @@
 """
 Condensation manuelle pour un ticker donné.
 Usage:
-    python scripts/condense_ticker.py AAPL          # weekly + monthly pour les mois passés
-    python scripts/condense_ticker.py AAPL --weekly # weeklies seulement
+    python scripts/break_view_resume.py AAPL          # weekly + monthly pour les mois passés
+    python scripts/break_view_resume.py AAPL --weekly # weeklies seulement
 """
 import sys
 import os

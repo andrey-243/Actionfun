@@ -72,6 +72,7 @@ interface NewsData {
   summary_24h: string;
   sentiment_24h: string;
   sentiment_reason_24h: string;
+  no_24h_news: boolean;
   cached_at: string;
 }
 
@@ -790,11 +791,27 @@ export default function StockPage() {
                   borderRadius: "8px", padding: "22px 24px", marginBottom: "12px",
                 }}>
                   <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "16px" }}>
-                    <span style={{ fontSize: "11px", fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase", color: "var(--color-text-muted)" }}>
-                      AI Overview · {is24h ? "24h" : "7 jours"}
-                    </span>
+                    <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                      <span style={{ fontSize: "11px", fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase", color: "var(--color-text-muted)" }}>
+                        AI Overview · {is24h ? "24h" : "7 jours"}
+                      </span>
+                      {is24h && news.no_24h_news && (
+                        <span style={{
+                          fontSize: "10px", fontWeight: 600, padding: "2px 7px", borderRadius: "4px",
+                          background: "rgba(255,180,0,0.1)", color: "#C8960C",
+                          fontFamily: "var(--font-mono)", letterSpacing: "0.05em",
+                        }}>
+                          AUCUNE NEWS 24H
+                        </span>
+                      )}
+                    </div>
                     <SentimentBadge sentiment={activeSentiment} />
                   </div>
+                  {is24h && news.no_24h_news && (
+                    <p style={{ fontSize: "12px", color: "var(--color-text-muted)", marginBottom: "12px", fontStyle: "italic" }}>
+                      Aucune actualité publiée dans les dernières 24h — analyse basée sur les données récentes disponibles.
+                    </p>
+                  )}
                   <p style={{ fontSize: "15px", color: "var(--color-text-primary)", lineHeight: 1.75, margin: 0, fontWeight: 400 }}>
                     {activeSummary}
                   </p>

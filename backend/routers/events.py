@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException, Query
-from services.events_service import get_event_news
+from services.bubble_service import get_event_news
 
 router = APIRouter()
 

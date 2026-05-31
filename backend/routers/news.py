@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException
-from services.news_service import get_news
+from services.overview_service import get_news
 
 router = APIRouter()
 
