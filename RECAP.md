@@ -145,35 +145,42 @@ Tous les appels LLM passent par `services/llm_service.py` qui gère la cascade a
 
 **Cascade :**
 ```
-FreeTheAI: bbl/gpt-4.1          → primary (JSON propre, qualité max)
-FreeTheAI: bbl/gpt-5.4-mini     → secondary si 502/timeout sur primary
-Hapuppy:   deepseek-v3.2        → tertiary — circuit breaker :
-                                     3 échecs consécutifs → freeze 3h → fallback gpt-4.1-mini
-                                     Probe auto après 3h : succès → reset · échec → refreeze 3h
-                                     Notif TG : frozen / still_down / réactivé
-Hapuppy:   gpt-4.1-mini         → fallback si deepseek frozen (même call, pas de saut vers Groq)
-Groq: voir tableau ci-dessous    → fallback final si hapuppy complètement down
-                                   ⚠️ TODO PROD : désactiver en BATCH_MODE=1 pour préserver le quota site
-```
-AgentRouter (`agentrouter.org`) testé et rejeté — clé `unauthorized_client`, pas d'accès sans activation Discord. Retiré de la cascade et du code.
+FreeTheAI: bbl/gpt-4.1      → primary
+  ✗ 502/503/timeout          → try secondary
+  ✗ 429 (RPM)                → break, skip FreeTheAI 6s
+  ✗ 403/checkin              → break, skip FreeTheAI jusqu'à minuit UTC
+  ✗ daily_limit              → break, skip FreeTheAI jusqu'à minuit UTC
 
-**Comportement erreurs FreeTheAI — désactivation jusqu'à minuit UTC + notif Telegram :**
+FreeTheAI: bbl/gpt-5.4-mini → secondary (seulement si primary = 502/503/timeout)
+  mêmes règles d'erreur
+
+Hapuppy: gpt-4.1-mini       → circuit breaker : 3 échecs → freeze 3h → probe auto
+                               HAPUPPY_MIN_INTERVAL=0 (pas de throttle RPM)
+
+Groq: voir tableau ci-dessous → fallback final
+                                ⚠️ TODO PROD : désactiver en BATCH_MODE=1 pour préserver le quota site
+```
+deepseek-v3.2 retiré — timeouts constants (endpoint probablement deprecated chez Hapuppy).
+AgentRouter (`agentrouter.org`) retiré — clé `unauthorized_client`.
+
+**Comportement erreurs FreeTheAI :**
 - **403 / checkin manquant** : faire `/checkin` sur le Discord FreeTheAI pour débloquer
 - **Daily limit** (`"daily successful request limit exceeded"`) : reset automatique à minuit UTC
-- **429 (RPM)** : skip immédiat vers Groq, retry FreeTheAI après 6s (10 RPM, 1 concurrent)
+- **429 (RPM)** : skip vers étape suivante, retry FreeTheAI après 6s (10 RPM)
+- **2 timeouts consécutifs** : circuit breaker 2h, probe auto après
 
 **Comportement erreurs Hapuppy :**
-- **RPM** : 100 req/min — throttle `HAPUPPY_MIN_INTERVAL=0.6s`, skip vers Groq si dépassé
-- **502/timeout** : circuit breaker deepseek (3 échecs → freeze 3h) → fallback `gpt-4.1-mini` dans le même bloc
+- **3 échecs consécutifs** : freeze 3h, probe auto → reset si succès
 - **Crédits épuisés** : notif TG `hapuppy_down` throttlée 30min
 
 **Notifs Telegram — trail complet de la cascade :**
 ```
-🟠 Hapuppy — down (502/timeout)
+🟠 Hapuppy `gpt-4.1-mini` — down (502/timeout)
 
-FreeTheAI `bbl/gpt-4.1` : ✗ checkin manquant
-Hapuppy `deepseek-v3.2` : ✗ 502
-Groq `llama-4-scout-17b` : ✓
+FreeTheAI `bbl/gpt-4.1` : ✗ 503
+FreeTheAI `bbl/gpt-5.4-mini` : ✗ 503
+Hapuppy `gpt-4.1-mini` : ✗ timeout/connexion
+Groq `llama-3.1-8b-instant` : ✓
 ```
 - Une notif par raison primaire, throttle 30min — `_send_cascade_notif(reason, trail)`
 - Trail buildé au fil de la cascade dans `llm_call`, envoyé quand un non-primary répond (✓ ou ✗)
@@ -391,12 +398,18 @@ python scripts/batch_fill_db.py --phase all --region US
 # bubbles → batch_progress_bubbles_{region}_{lang}.json
 ```
 
+**Progress files** — `backend/scripts/batch_progress_{phase}_{region}[_{lang}].json`
+- Un fichier par combo phase+region+lang → pas de conflit si 2 process tournent en parallèle
+- Créé automatiquement au premier ticker complété si inexistant
+- `scrape` : pas de lang dans le nom · `enrich` et `bubbles` : suffixe `_en` ou `_fr`
+- Write direct dans Supabase à chaque event/ticker — le progress file sert uniquement à savoir où reprendre
+
 **Sync progress depuis Supabase** : `backend/scripts/sync_progress.py`
 ```bash
 python scripts/sync_progress.py           # recrée tous les fichiers progress depuis la DB
 python scripts/sync_progress.py --dry-run # affiche les counts sans écrire
 ```
-Utile après une interruption ou pour recaler l'état local sur la DB réelle. Threshold bubbles_done = 8 causes non-null (min observé ~11 sur les tickers US FR).
+Utile après une interruption ou si les fichiers locaux sont désynchronisés. Threshold bubbles_done = 8 causes non-null (min observé ~11 sur les tickers US FR)..
 
 **Script one-shot websites** : `backend/scripts/populate_websites.py`
 ```bash
