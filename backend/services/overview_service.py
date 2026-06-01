@@ -241,33 +241,62 @@ def _format_stock_context_7d(ctx: dict) -> str:
 # ─── Fetch ────────────────────────────────────────────────────────────────────
 
 def _fetch_news(ticker: str) -> tuple[list[dict], str | None]:
+    import hashlib as _hashlib
     from urllib.parse import urlparse
-    t = yf.Ticker(ticker)
-    raw = t.get_news(count=100)
+
+    # Website via yfinance (inchangé)
     website = None
     try:
+        t = yf.Ticker(ticker)
         raw_url = (t.info or {}).get("website", "") or ""
         if raw_url:
             website = urlparse(raw_url).netloc.lstrip("www.") or None
     except Exception:
         pass
+
+    # Articles depuis article_archive (merge Finn+Yahoo) — 7 derniers jours
+    supa = _get_supabase()
+    now = datetime.now(timezone.utc)
+    cutoff_ts = int((now - timedelta(days=7)).timestamp())
+
+    year_months: set[str] = {now.strftime("%Y-%m")}
+    if now.day <= 7:
+        prev = now.replace(day=1) - timedelta(days=1)
+        year_months.add(prev.strftime("%Y-%m"))
+
+    raw: list[dict] = []
+    for ym in sorted(year_months):
+        r = supa.table("article_archive") \
+            .select("articles") \
+            .eq("ticker", ticker) \
+            .eq("year_month", ym) \
+            .maybe_single() \
+            .execute()
+        if r and r.data and r.data.get("articles"):
+            raw.extend(r.data["articles"])
+
     articles = []
-    for n in raw:
-        c = n.get("content", {})
-        summary = c.get("summary", "").strip()
+    for a in raw:
+        ts = a.get("datetime", 0)
+        if ts < cutoff_ts:
+            continue
+        summary = a.get("summary", "").strip()
         if len(summary) < MIN_SUMMARY_CHARS:
             continue
+        url = a.get("url", "")
         articles.append({
-            "id": c.get("id", ""),
-            "type": c.get("contentType", "STORY"),
-            "title": c.get("title", ""),
-            "summary": summary,
-            "source": c.get("provider", {}).get("displayName", ""),
-            "url": (c.get("clickThroughUrl") or {}).get("url", "") or (c.get("canonicalUrl") or {}).get("url", ""),
-            "thumbnail": (c.get("thumbnail") or {}).get("resolutions", [{}])[-1].get("url", "") if c.get("thumbnail") else "",
-            "pub_date": c.get("pubDate", ""),
+            "id":        _hashlib.md5(url.encode()).hexdigest()[:16] if url else "",
+            "type":      "STORY",
+            "title":     a.get("headline", ""),
+            "summary":   summary,
+            "source":    a.get("source", ""),
+            "url":       url,
+            "thumbnail": a.get("image", ""),
+            "pub_date":  datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(),
         })
-    return articles, website
+
+    articles.sort(key=lambda a: a["pub_date"], reverse=True)
+    return articles[:100], website
 
 
 def _filter_24h(articles: list[dict]) -> list[dict]:

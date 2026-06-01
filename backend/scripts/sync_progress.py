@@ -41,16 +41,18 @@ def _fetch_all(supa, table: str, select: str, page_size: int = 1000) -> list[dic
         resp = supa.table(table).select(select).range(offset, offset + page_size - 1).execute()
         batch = resp.data or []
         rows.extend(batch)
+        print(f"  {table}: {len(rows)} rows fetched...", end="\r", flush=True)
         if len(batch) < page_size:
             break
         offset += page_size
+    print()
     return rows
 
 
 def build_scrape_state(supa) -> set[str]:
-    """Tickers with news_raw not null in stock_news_cache."""
-    rows = _fetch_all(supa, "stock_news_cache", "ticker,news_raw")
-    return {r["ticker"] for r in rows if r.get("news_raw")}
+    """Tickers with at least one row in article_archive (source of truth for all regions)."""
+    rows = _fetch_all(supa, "article_archive", "ticker")
+    return {r["ticker"] for r in rows}
 
 
 def build_enrich_state(supa, lang: str) -> set[str]:

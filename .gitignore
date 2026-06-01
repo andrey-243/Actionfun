@@ -19,7 +19,7 @@ env/
 # Logs & runtime
 *.log
 *.json.tmp
-backend/scripts/batch_progress.json
+backend/scripts/batch_progress*.json
 backend/scripts/batch_fill_db.log
 backend/scripts/progress_*.json
 issues_free

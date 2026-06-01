@@ -68,7 +68,8 @@ def _telegram(msg: str):
 def _notify_checkpoint(phase: str, i: int, total: int, region: str,
                         done_batch: list[str], errors_batch: list[str],
                         articles_batch: int, start_time: float,
-                        llm_sources: dict[str, int] | None = None):
+                        llm_sources: dict[str, int] | None = None,
+                        skipped_info: str = ""):
     elapsed = int(time.time() - start_time)
     mins, secs = divmod(elapsed, 60)
     remaining = int((elapsed / i) * (total - i)) if i else 0
@@ -76,6 +77,7 @@ def _notify_checkpoint(phase: str, i: int, total: int, region: str,
 
     err_line = f"❌ Errors: {', '.join(errors_batch)}" if errors_batch else "✅ 0 erreurs"
     art_line = f"📰 Articles: +{articles_batch:,}" if articles_batch else ""
+    skip_line = f"⏭ Skipped (no news): {skipped_info}" if skipped_info else ""
 
     llm_line = ""
     if llm_sources:
@@ -89,6 +91,7 @@ def _notify_checkpoint(phase: str, i: int, total: int, region: str,
         f"⏱ {mins}m{secs:02d}s écoulé · ~{r_mins}m{r_secs:02d}s restant\n"
         f"{err_line}\n"
         f"{art_line}\n"
+        f"{skip_line}\n"
         f"{llm_line}"
     ).strip()
 
@@ -457,11 +460,14 @@ def phase_bubbles(tickers: list[str], region: str = "all"):
     start_time = time.time()
     batch_errors: list[str] = []
     total_events = 0
+    batch_skipped = 0          # bubbles sans articles au niveau batch
+    batch_skipped_tickers: list[str] = []  # "TICKER×N" pour le TG
 
     for i, ticker in enumerate(todo, 1):
         logger.info(f"[{i}/{total}] {ticker} — bubbles 6M+1Y")
         ticker_events = 0  # bubbles avec cause LLM réelle
-        ticker_total = 0   # toutes les bubbles tentées
+        ticker_total = 0   # bubbles tentées (exclut no-articles)
+        ticker_skipped: list[str] = []  # dates sans articles
         try:
             for period, interval, window, max_dots in PERIODS:
                 try:
@@ -479,6 +485,9 @@ def phase_bubbles(tickers: list[str], region: str = "all"):
                         change_pct = (closes[idx] - closes[idx - 1]) / closes[idx - 1] * 100 if idx > 0 else 0.0
                         try:
                             result = get_event_news(ticker, date, round(change_pct, 2))
+                            if not result.get("articles"):
+                                ticker_skipped.append(date)
+                                continue  # pas d'articles → pas de LLM, ne compte pas dans ticker_total
                             ticker_total += 1
                             if result.get("cause"):
                                 ticker_events += 1
@@ -493,6 +502,12 @@ def phase_bubbles(tickers: list[str], region: str = "all"):
 
             total_events += ticker_events
             null_count = ticker_total - ticker_events
+
+            if ticker_skipped:
+                batch_skipped += len(ticker_skipped)
+                batch_skipped_tickers.append(f"{ticker}×{len(ticker_skipped)}")
+                logger.info(f"  ⏭ {ticker} — {len(ticker_skipped)} dates sans articles: {', '.join(ticker_skipped)}")
+
             if null_count == 0:
                 logger.info(f"  ✓ {ticker} — {ticker_events} bubbles avec cause")
                 progress.setdefault("bubbles_done", []).append(ticker)
@@ -506,8 +521,12 @@ def phase_bubbles(tickers: list[str], region: str = "all"):
         save_progress(progress)
 
         if i % NOTIFY_EVERY == 0:
-            _notify_checkpoint("bubbles", i, total, region, batch_errors, [], 0, start_time)
+            skip_info = f"{batch_skipped} bubbles — {', '.join(batch_skipped_tickers)}" if batch_skipped else ""
+            _notify_checkpoint("bubbles", i, total, region, batch_errors, [], 0, start_time,
+                               skipped_info=skip_info)
             batch_errors = []
+            batch_skipped = 0
+            batch_skipped_tickers = []
 
     elapsed = int(time.time() - start_time)
     mins, secs = divmod(elapsed, 60)
@@ -523,73 +542,162 @@ def phase_bubbles(tickers: list[str], region: str = "all"):
 
 def phase_translate_fr(tickers: list[str], region: str = "all"):
     """
-    Lit ai_summary_en depuis stock_news_cache et traduit vers ai_summary (FR).
-    Ne traite que les tickers qui ont ai_summary_en mais pas ai_summary.
+    event_causes : cause_en → cause (skip si cause déjà présent)
+    OW retiré — trop volatile (refresh 3h), traduit à la demande au launch.
     """
     from services.translation_service import translate_to_fr
 
     supa = _supa()
     progress = load_progress()
-    translated = set(progress.get("translated_fr", []))
 
-    # Charger les tickers qui ont EN mais pas FR
-    rows = supa.table("stock_news_cache") \
-        .select("ticker, ai_summary_en, ai_summary_24h_en, ai_summary") \
+    # ── BUBBLES (event_causes) ─────────────────────────────────────────────────
+    translated_bub = set(progress.get("translated_fr_bubbles", []))
+
+    cause_rows = supa.table("event_causes") \
+        .select("ticker, date, cause_en") \
         .in_("ticker", tickers) \
-        .not_.is_("ai_summary_en", "null") \
+        .not_.is_("cause_en", "null") \
+        .is_("cause", "null") \
+        .execute()
+
+    # Grouper par ticker pour le progress tracking
+    causes_by_ticker: dict[str, list[dict]] = {}
+    for r in (cause_rows.data or []):
+        if r["ticker"] not in translated_bub:
+            causes_by_ticker.setdefault(r["ticker"], []).append(r)
+
+    total_bub = sum(len(v) for v in causes_by_ticker.values())
+    logger.info(f"TRANSLATE-FR BUBBLES: {total_bub} event_causes sur {len(causes_by_ticker)} tickers")
+
+    if not causes_by_ticker:
+        logger.info("Rien à traduire.")
+        return
+
+    _telegram(f"🌐 *Batch TRANSLATE-FR BUBBLES démarré — {region}*\n{total_bub} events sur {len(causes_by_ticker)} tickers")
+
+    start_time = time.time()
+    bub_errors = []
+    bub_done = 0
+    for ticker, events in causes_by_ticker.items():
+        ticker_ok = True
+        for ev in events:
+            try:
+                cause_fr = translate_to_fr(ev["cause_en"])
+                supa.table("event_causes").update({"cause": cause_fr}) \
+                    .eq("ticker", ticker).eq("date", ev["date"]).execute()
+                bub_done += 1
+                logger.info(f"  ✓ {ticker} {ev['date']}")
+            except Exception as e:
+                logger.error(f"  ✗ {ticker} {ev['date']}: {e}")
+                bub_errors.append(f"{ticker}:{ev['date']}")
+                ticker_ok = False
+
+        if ticker_ok:
+            progress.setdefault("translated_fr_bubbles", []).append(ticker)
+        save_progress(progress)
+
+    elapsed = int(time.time() - start_time)
+    mins, secs = divmod(elapsed, 60)
+    _telegram(
+        f"✅ *Batch TRANSLATE-FR BUBBLES terminé — {region}*\n"
+        f"{bub_done} events · {len(bub_errors)} erreurs\n"
+        f"⏱ {mins}m{secs:02d}s"
+    )
+
+
+# ─── Phase translate-fr-dumb ──────────────────────────────────────────────────
+
+def phase_translate_fr_dumb(tickers: list[str], region: str = "all"):
+    """
+    Traduit news_raw[].brutalised → ajoute brutalised_fr dans chaque article.
+    Utilise Azure batch (25 articles/appel) pour ne pas exploser le quota FreeTheAI.
+    Skip les articles qui ont déjà brutalised_fr.
+    """
+    from services.translation_service import translate_batch_to_fr, DUMB_BATCH_SIZE
+
+    supa = _supa()
+    progress = load_progress()
+    translated = set(progress.get("translated_fr_dumb", []))
+
+    rows = supa.table("stock_news_cache") \
+        .select("ticker, news_raw") \
+        .in_("ticker", tickers) \
+        .not_.is_("news_raw", "null") \
         .execute()
 
     todo = [
         r for r in (rows.data or [])
-        if r["ticker"] not in translated and not r.get("ai_summary")
+        if r["ticker"] not in translated and r.get("news_raw")
     ]
     total = len(todo)
-    logger.info(f"TRANSLATE-FR: {total} tickers à traduire ({len(translated)} déjà fait)")
+    logger.info(f"TRANSLATE-FR DUMB: {total} tickers à traiter ({len(translated)} déjà fait)")
 
     if not todo:
         logger.info("Rien à traduire.")
         return
 
-    _telegram(f"🌐 *Batch TRANSLATE-FR démarré — {region}*\n{total} tickers à traduire")
+    _telegram(f"📝 *Batch TRANSLATE-FR DUMB démarré — {region}*\n{total} tickers")
 
     start_time = time.time()
     batch_errors = []
+    total_articles = 0
 
     for i, row in enumerate(todo, 1):
         ticker = row["ticker"]
-        logger.info(f"[{i}/{total}] {ticker} — traduction FR")
+        articles = row["news_raw"] or []
+
+        # Articles avec brutalised mais sans brutalised_fr
+        to_translate = [
+            (idx, a) for idx, a in enumerate(articles)
+            if a.get("brutalised") and a["brutalised"].upper() != "SKIP" and not a.get("brutalised_fr")
+        ]
+
+        if not to_translate:
+            progress.setdefault("translated_fr_dumb", []).append(ticker)
+            save_progress(progress)
+            continue
+
+        logger.info(f"[DUMB {i}/{total}] {ticker} — {len(to_translate)} articles")
         try:
-            summary_fr = translate_to_fr(row["ai_summary_en"])
-            summary_24h_fr = translate_to_fr(row.get("ai_summary_24h_en") or "") if row.get("ai_summary_24h_en") else ""
+            indices = [idx for idx, _ in to_translate]
+            texts = [a["brutalised"] for _, a in to_translate]
 
-            supa.table("stock_news_cache").update({
-                "ai_summary": summary_fr,
-                "ai_summary_24h": summary_24h_fr,
-            }).eq("ticker", ticker).execute()
+            # Batch par tranches de DUMB_BATCH_SIZE
+            for chunk_start in range(0, len(texts), DUMB_BATCH_SIZE):
+                chunk_texts = texts[chunk_start:chunk_start + DUMB_BATCH_SIZE]
+                chunk_indices = indices[chunk_start:chunk_start + DUMB_BATCH_SIZE]
+                translations = translate_batch_to_fr(chunk_texts)
+                for idx, fr_text in zip(chunk_indices, translations):
+                    articles[idx]["brutalised_fr"] = fr_text
 
-            logger.info(f"  ✓ {ticker}")
-            progress.setdefault("translated_fr", []).append(ticker)
+            supa.table("stock_news_cache").update({"news_raw": articles}).eq("ticker", ticker).execute()
+            total_articles += len(to_translate)
+            logger.info(f"  ✓ {ticker} ({len(to_translate)} articles traduits)")
+            progress.setdefault("translated_fr_dumb", []).append(ticker)
         except Exception as e:
             logger.error(f"  ✗ {ticker}: {e}")
             batch_errors.append(ticker)
 
         save_progress(progress)
-        time.sleep(FREETHEAI_DELAY)
 
         if i % NOTIFY_EVERY == 0:
-            _notify_checkpoint("translate-fr", i, total, region, batch_errors, [], 0, start_time)
+            _notify_checkpoint("translate-fr-dumb", i, total, region, batch_errors, [], 0, start_time)
             batch_errors = []
 
     elapsed = int(time.time() - start_time)
     mins, secs = divmod(elapsed, 60)
-    _telegram(f"✅ *Batch TRANSLATE-FR terminé — {region}*\n{len(progress.get('translated_fr',[]))} tickers · ⏱ {mins}m{secs:02d}s")
+    _telegram(
+        f"✅ *Batch TRANSLATE-FR DUMB terminé — {region}*\n"
+        f"{len(progress.get('translated_fr_dumb', []))} tickers · {total_articles} articles\n"
+        f"⏱ {mins}m{secs:02d}s"
+    )
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description="Batch DB filler pour StockVibe")
-    parser.add_argument("--phase", choices=["scrape", "enrich", "all", "translate-fr", "bubbles"], default="scrape")
+    parser.add_argument("--phase", choices=["scrape", "enrich", "all", "translate-fr", "translate-fr-dumb", "bubbles"], default="scrape")
     parser.add_argument("--region", choices=["US", "EU", "ASIA", "all"], default="all")
     parser.add_argument("--ticker", type=str, default=None, help="Ticker unique")
     parser.add_argument("--reset", action="store_true", help="Remet le progress à zéro")
@@ -610,6 +718,10 @@ def main():
         lang_slug = (args.lang or os.environ.get("LLM_LANG", "en")).lower()
         if args.phase in ("enrich", "bubbles"):
             PROGRESS_FILE = Path(__file__).parent / f"batch_progress_{args.phase}_{region_slug}_{lang_slug}.json"
+        elif args.phase == "translate-fr-dumb":
+            PROGRESS_FILE = Path(__file__).parent / f"batch_progress_translate_fr_dumb_{region_slug}.json"
+        elif args.phase == "translate-fr":
+            PROGRESS_FILE = Path(__file__).parent / f"batch_progress_translate_fr_{region_slug}.json"
         else:
             PROGRESS_FILE = Path(__file__).parent / f"batch_progress_{args.phase}_{region_slug}.json"
 
@@ -643,6 +755,9 @@ def main():
 
     if args.phase == "translate-fr":
         phase_translate_fr(tickers, region=args.region)
+
+    if args.phase == "translate-fr-dumb":
+        phase_translate_fr_dumb(tickers, region=args.region)
 
     if args.phase == "bubbles":
         phase_bubbles(tickers, region=args.region)

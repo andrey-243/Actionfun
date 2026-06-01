@@ -1,5 +1,22 @@
 # StockVibe — Recap
 
+## Règles architecture & nommage
+
+**Source de données — règle absolue :**
+Toute génération IA (OW, BUB, Breaks, EOD Digest) doit lire depuis `article_archive` (merge Finn+Yahoo).
+Ne jamais appeler Finnhub ou Yahoo directement pour alimenter le LLM — les crons maintiennent `article_archive` à jour.
+Si une feature bypass `article_archive` c'est un bug architectural à corriger.
+
+**Nommage — toujours utiliser les termes suivants :**
+| Terme | Signifie |
+|---|---|
+| OW | AI Overview (24H / 7J) — `overview_service.py` |
+| DUMB / abrutis | Articles brutalised (résumé 2-3 phrases par article) |
+| BUB / bubble | Event cause sur un dot du chart — `bubble_service.py` |
+| Breaks | Résumés W1/W2/W3/W4 (1M) ou mensuels (6M/1Y) |
+| EOD Digest | Digest end-of-day — page my-news + email 18h |
+| article_archive | DB mergée Finn+Yahoo — source de vérité pour le LLM |
+
 ## Stack
 
 | Layer | Tech ||---|---|
@@ -111,18 +128,18 @@ stock_app/
 | Annotations chart (events) | ✅ | Dots peaks/valleys → EventDrawer Finnhub + cause IA. 24H/5Y sans dots. 1W=top 5, 1M=8, 6M/1Y=10 |
 | Chart — vertical grid lines | ✅ | Tirets par période : 24H=horaire, 1W=jour, 1M=lundi, 6M/1Y=mois, 5Y=année |
 | Lazy loading page stock | ✅ | Default 24H — seul /api/news charge au mount. Articles 1M+ et causes events : on-demand uniquement |
-| Cascade LLM FreeTheAI→Groq | ✅ | gpt-4.1 → gpt-5.4-mini → Hapuppy deepseek-v3.2 (circuit breaker 3 échecs → freeze 3h → fallback gpt-4.1-mini dans même bloc hapuppy, pas de saut Groq) → Groq. Notif TG frozen/still_down/réactivé. Throttle 30min. `_llm_source` = "hapuppy" / "hapuppy_mini". Fix `_next_utc_midnight()` end-of-month bug (timedelta). **Hapuppy throttle 100 RPM** : `HAPUPPY_MIN_INTERVAL=0.6s` — skip vers Groq si dernier appel < 0.6s. |
+| Cascade LLM FreeTheAI→Groq | ✅ | gpt-4.1 → gpt-5.4-mini → Hapuppy gpt-4.1-mini → Groq. Circuit breakers indépendants : FreeTheAI (3 rounds 502/503/timeout → freeze 30min → probe auto) + Hapuppy (3 échecs → freeze 3h → probe auto). deepseek-v3.2 retiré (timeouts constants). `HAPUPPY_MIN_INTERVAL=0` (pas de throttle). Notif TG throttlée 30min par raison. |
 | EOD digest — backend | ✅ | gen 18h00 (Yahoo cache stock_news_cache en primary, Finnhub+LLM seulement si cache vide) · email 18h30 · 2 jobs APScheduler séparés |
 | EOD digest — email | ✅ | Resend — clé configurée, sandbox `onboarding@resend.dev` (passer à domaine custom en prod) |
 | EOD digest — onglet "Mes news" | ✅ | Page /my-news : toggle Daily/Weekly **pill style vert** (même style que bouton "Mes news" navbar) · auto-refresh si digest > 3h (`?force=1` backend) · `generated_at` dans réponse digest · `condensed_at` dans réponse weekly · DigestCard : chevron conditionnel (articles seulement), logo cliquable → stock page, freshness par carte · WeeklyCard : source+date alignés à droite du titre · top_articles triées par date desc |
 | Préférences notif (email on/off + par ticker) | ✅ | Dans /profile : toggle Daily (badge PREMIUM jaune) + toggle Weekly (badge PREMIUM vert accent) + chips par action · `notify_weekly` en DB |
-| Batch DB filler (717 tickers) | 🔄 | Scrape : US ✅ · EU ✅ · ASIA 🔄. OW enrich : **EN par défaut** (`LLM_LANG=en`). US EN ✅ (256/269 `ai_summary_en`) · EU ⏳ · ASIA ⏳. BUB 6M+1Y US : 🔄 58/259 done (`cause_en`). 812 rows FR existantes se refillent en EN au prochain batch ou visite bulle. Fix batch : `ticker_events` compte uniquement causes non-null, ticker non marqué `done` si cause=null. **Séquence en cours** → voir ci-dessous. |
+| Batch DB filler (717 tickers) | 🔄 | Scrape : US ✅ · EU ✅ · ASIA 🔄. OW enrich : **EN par défaut** (`LLM_LANG=en`). US EN ✅ (256/269 `ai_summary_en`) · EU ⏳ · ASIA ⏳. BUB 6M+1Y US : 🔄 en cours. Fix batch : dates sans articles (Finnhub 0) → skip LLM + log + notif TG `⏭ Skipped (no news)`. Progress files nommés par phase+région+lang (isolation concurrence). **Séquence en cours** → voir ci-dessous. |
 
 **Séquence batch — EN first (2026-06-01)**
 
 | # | Phase | Région | Statut |
 |---|---|---|---|
-| 1 | Bubbles 6M+1Y | US | 🔄 en cours — 58/259 done, 201 restants |
+| 1 | Bubbles 6M+1Y | US | 🔄 en cours — 28/260 done EN · 59/260 done FR, 232 restants EN |
 | 2 | Bubbles 6M+1Y | EU | ⏳ |
 | 3 | Bubbles 6M+1Y | ASIA | ⏳ |
 | 4 | Monthly summaries (breaks) | US+EU+ASIA | ⏳ après bubbles |
@@ -153,21 +170,23 @@ FreeTheAI: bbl/gpt-4.1      → primary
 
 FreeTheAI: bbl/gpt-5.4-mini → secondary (seulement si primary = 502/503/timeout)
   mêmes règles d'erreur
+  → 3 rounds échoués consécutifs (502/503/timeout) → circuit breaker 30min → probe auto
+  → reset sur succès · 429/checkin/daily ne comptent pas comme "round échoué"
 
 Hapuppy: gpt-4.1-mini       → circuit breaker : 3 échecs → freeze 3h → probe auto
-                               HAPUPPY_MIN_INTERVAL=0 (pas de throttle RPM)
+                               HAPUPPY_MIN_INTERVAL=0 (pas de throttle — 100 RPM Hapuppy)
 
 Groq: voir tableau ci-dessous → fallback final
                                 ⚠️ TODO PROD : désactiver en BATCH_MODE=1 pour préserver le quota site
 ```
-deepseek-v3.2 retiré — timeouts constants (endpoint probablement deprecated chez Hapuppy).
+deepseek-v3.2 retiré — timeouts constants (endpoint deprecated chez Hapuppy).
 AgentRouter (`agentrouter.org`) retiré — clé `unauthorized_client`.
 
 **Comportement erreurs FreeTheAI :**
 - **403 / checkin manquant** : faire `/checkin` sur le Discord FreeTheAI pour débloquer
 - **Daily limit** (`"daily successful request limit exceeded"`) : reset automatique à minuit UTC
 - **429 (RPM)** : skip vers étape suivante, retry FreeTheAI après 6s (10 RPM)
-- **2 timeouts consécutifs** : circuit breaker 2h, probe auto après
+- **3 rounds échoués consécutifs** (502/503/timeout sur primary+secondary) : circuit breaker 30min, probe auto après
 
 **Comportement erreurs Hapuppy :**
 - **3 échecs consécutifs** : freeze 3h, probe auto → reset si succès
@@ -220,9 +239,23 @@ Notes :
 | EVENT_CAUSE (dot chart) | site | `bbl/gpt-4.1` | `llama-3.1-8b-instant` |
 | DIGEST EOD | site | — (lit stock_news_cache, LLM seulement si cache vide) | `llama-4-scout-17b` (fallback rare) |
 | WEEKLY / MONTHLY condensation | site + batch | `bbl/gpt-4.1` | `llama-3.3-70b-versatile` ¹ |
-| TRADUCTION EN→FR | batch | `bbl/gpt-4.1` | Azure Translator → Groq `llama-3.1-8b` ¹ |
+| TRADUCTION EN→FR | batch + site | `bbl/gpt-5.4-mini` (trad légère) | Azure → Yandex (TODO) → FreeTheAI `gpt-5.4-mini` → Hapuppy `gpt-4.1-mini` → Groq `llama-3.1-8b-instant` |
 
 ¹ Groq désactivé quand `BATCH_MODE=1` — le batch échoue proprement sur le ticker et skip.
+
+**Règle invariante traduction :** EN est toujours généré en premier par le LLM principal. FR = traduction de l'EN uniquement, jamais généré directement. Si tout le waterfall de traduction échoue → EN conservé en DB, FR vide, retry au prochain batch. On ne peut pas avoir `FR filled + EN empty`.
+
+**`translation_service.py` — waterfall :**
+```
+Azure Translator (batch natif 25 items/appel, ~200ms)
+  → Yandex (TODO — clés configurées, pas encore intégré)
+  → FreeTheAI bbl/gpt-5.4-mini (circuit breaker partagé avec llm_service)
+  → Hapuppy gpt-4.1-mini (circuit breaker partagé avec llm_service)
+  → Groq llama-3.1-8b-instant
+```
+- Circuit breakers FreeTheAI + Hapuppy partagés avec `llm_service` (même état en mémoire)
+- Trail + notif TG throttlée 30min (même style que cascade LLM) — notif si Azure down, provider fallback utilisé, ou tous down
+- Azure 2M chars/mois free tier — OW non inclus dans batch (trop volatile, refresh 3h)
 
 **FreeTheAI — modèles actifs (testés 29/05/2026) :**
 
@@ -287,6 +320,15 @@ YANDEX_SECRET_KEY=...              # Yandex Translate — clé secrète (configu
 | **LLM4** | BRUTALIZE retourne déjà `summary` (7J) → stocké directement comme `ai_summary` + `ow7d_cached_at`. Call 2 (`_call2_ow7d`) actif uniquement en `BATCH_MODE=1` | `overview_service.py` |
 | **Weekly Pool 1** | `_maybe_regen_weekly()` dans cron hourly — Pool 1 (tickers `no_24h_news`) | `overview_service.py` |
 | **Weekly Pool 2** | `run_weekly_condensation` (lundi 3h30) génère semaine courante pour tous les pinnés sans summary via `get_weekly_ondemand()` | `period_articles_service.py` |
+
+### À faire — sources articles ⬜
+
+| Feature | Situation actuelle | Cible |
+|---|---|---|
+| **OW** (`overview_service._fetch_news`) | ✅ `article_archive` 7 derniers jours (merge Finn+Yahoo) — prod + batch | — |
+| **BUB** (`bubble_service.get_event_news`) | ✅ `article_archive` fenêtre T-3→T+3 (merge Finn+Yahoo) — batch + prod | — |
+
+Toutes les features lisent maintenant depuis `article_archive`. EOD Digest et Breaks l'étaient déjà.
 
 ### Post-beta ⬜
 
@@ -392,16 +434,24 @@ python scripts/batch_fill_db.py --phase bubbles --region US
 # Tout (scrape + enrich)
 python scripts/batch_fill_db.py --phase all --region US
 
+# Traduction BUBBLES EN→FR (event_causes.cause_en → cause, skip si cause déjà présent)
+python scripts/batch_fill_db.py --phase translate-fr --region US
+
+# Traduction DUMB EN→FR (news_raw[].brutalised → brutalised_fr, Azure batch 25/appel)
+python scripts/batch_fill_db.py --phase translate-fr-dumb --region US
+
 # Reprend automatiquement — fichier auto-nommé par phase+region[+lang]
-# scrape  → batch_progress_scrape_{region}.json
-# enrich  → batch_progress_enrich_{region}_{lang}.json
-# bubbles → batch_progress_bubbles_{region}_{lang}.json
+# scrape           → batch_progress_scrape_{region}.json
+# enrich           → batch_progress_enrich_{region}_{lang}.json
+# bubbles          → batch_progress_bubbles_{region}_{lang}.json
+# translate-fr     → batch_progress_translate_fr_{region}.json
+# translate-fr-dumb → batch_progress_translate_fr_dumb_{region}.json
 ```
 
 **Progress files** — `backend/scripts/batch_progress_{phase}_{region}[_{lang}].json`
 - Un fichier par combo phase+region+lang → pas de conflit si 2 process tournent en parallèle
 - Créé automatiquement au premier ticker complété si inexistant
-- `scrape` : pas de lang dans le nom · `enrich` et `bubbles` : suffixe `_en` ou `_fr`
+- `scrape` : pas de lang dans le nom · `enrich` et `bubbles` : suffixe `_en` ou `_fr` · `translate-fr*` : pas de lang (toujours → FR)
 - Write direct dans Supabase à chaque event/ticker — le progress file sert uniquement à savoir où reprendre
 
 **Sync progress depuis Supabase** : `backend/scripts/sync_progress.py`

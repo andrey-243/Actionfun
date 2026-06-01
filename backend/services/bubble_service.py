@@ -1,4 +1,3 @@
-import httpx
 import yfinance as yf
 import os
 from datetime import datetime, timedelta, timezone
@@ -100,30 +99,46 @@ def get_event_news(ticker: str, date: str, change_pct: float = 0.0) -> dict:
         if cause:
             return {"date": date, "articles": cached["articles"], "cause": cause}
 
-    # Fetch Finnhub T-3 → T+3
+    # Lire article_archive (merge Finn+Yahoo) pour la fenêtre T-3→T+3
     dt = datetime.fromisoformat(date[:10])
-    from_date = (dt - timedelta(days=3)).strftime("%Y-%m-%d")
-    to_date   = (dt + timedelta(days=3)).strftime("%Y-%m-%d")
+    from_dt = dt - timedelta(days=3)
+    to_dt   = dt + timedelta(days=3)
+    from_ts = int(from_dt.replace(tzinfo=timezone.utc).timestamp())
+    to_ts   = int((to_dt + timedelta(days=1)).replace(tzinfo=timezone.utc).timestamp())
 
-    r = httpx.get(
-        "https://finnhub.io/api/v1/company-news",
-        params={"symbol": ticker, "from": from_date, "to": to_date, "token": os.environ["FINNHUB_API_KEY"]},
-        timeout=10,
-    )
-    r.raise_for_status()
-    raw = r.json()[:12]
+    # Déterminer les year_months couverts (1 ou 2 selon le mois)
+    year_months: set[str] = set()
+    cursor = from_dt.replace(day=1)
+    while cursor <= to_dt:
+        year_months.add(cursor.strftime("%Y-%m"))
+        cursor = (cursor.replace(day=28) + timedelta(days=4)).replace(day=1)
 
+    raw_articles: list[dict] = []
+    for ym in sorted(year_months):
+        r = supa.table("article_archive") \
+            .select("articles") \
+            .eq("ticker", ticker) \
+            .eq("year_month", ym) \
+            .maybe_single() \
+            .execute()
+        if r and r.data and r.data.get("articles"):
+            raw_articles.extend(r.data["articles"])
+
+    # Filtrer T-3→T+3, trier par proximité à la date, max 12
     articles = [
         {
             "headline": a["headline"],
-            "source":   a["source"],
-            "url":      a["url"],
-            "datetime": a["datetime"],
+            "source":   a.get("source", ""),
+            "url":      a.get("url", ""),
+            "datetime": a.get("datetime", 0),
             "summary":  a.get("summary", ""),
         }
-        for a in raw
-        if a.get("headline")
+        for a in raw_articles
+        if a.get("headline") and from_ts <= a.get("datetime", 0) <= to_ts
     ]
+    event_ts = int(dt.replace(tzinfo=timezone.utc).timestamp())
+    articles.sort(key=lambda a: abs(a["datetime"] - event_ts))
+    articles = articles[:12]
 
     # Contexte prix + benchmark
     benchmark_name, benchmark_ticker = _get_benchmark(ticker)

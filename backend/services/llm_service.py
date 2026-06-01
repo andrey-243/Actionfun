@@ -4,6 +4,7 @@ Cascade LLM : FreeTheAI (primary → secondary) → Hapuppy → Groq
 Logique :
   1. bbl/gpt-4.1 (FreeTheAI primary)
   2. bbl/gpt-5.4-mini (FreeTheAI secondary) — si 502/503/timeout sur #1
+     → circuit breaker : 3 rounds échoués → freeze 30min → probe auto
   3. Hapuppy gpt-4.1-mini — circuit breaker : 3 échecs → freeze 3h → probe auto
   4. Groq — fallback final
 """
@@ -66,11 +67,11 @@ _freetheai_skip_until: datetime | None = None
 _freetheai_last_attempt: float = 0.0
 FREETHEAI_MIN_INTERVAL = float(os.environ.get("FREETHEAI_MIN_INTERVAL", "6.0"))  # 10 RPM → 6s min
 
-# Circuit breaker FreeTheAI timeout — même logique que Hapuppy
-_freetheai_timeout_count: int = 0
-_freetheai_timeout_freeze_until: float | None = None  # monotonic timestamp
-FREETHEAI_TIMEOUT_THRESHOLD = 2    # timeouts consécutifs avant freeze
-FREETHEAI_TIMEOUT_FREEZE_SECONDS = 7200  # 2h
+# Circuit breaker FreeTheAI 502/503/timeout — par round (pas par tentative modèle)
+_freetheai_fail_count: int = 0
+_freetheai_fail_freeze_until: float | None = None  # monotonic timestamp
+FREETHEAI_FAIL_THRESHOLD = 3       # rounds échoués consécutifs avant freeze
+FREETHEAI_FAIL_FREEZE_SECONDS = 1800  # 30 min
 
 # Circuit breaker Hapuppy gpt-4.1-mini
 # States : None=CLOSED · float(future)=OPEN · float(past)=HALF-OPEN (probe)
@@ -99,7 +100,7 @@ _CASCADE_HEADERS = {
     "daily_limit":          "🔴 *FreeTheAI — quota journalier épuisé*\nReset automatique à minuit UTC.",
     "rpm_429":              "🟡 *FreeTheAI — rate limit (429 RPM)*",
     "502_timeout":          "🟠 *FreeTheAI — injoignable (502/timeout)*",
-    "freetheai_timeout_frozen": f"🔴 *FreeTheAI — circuit breaker timeout* ({FREETHEAI_TIMEOUT_THRESHOLD} timeouts consécutifs)\nSkip FreeTheAI 2h. Probe auto après.",
+    "freetheai_down_frozen": f"🔴 *FreeTheAI — circuit breaker* ({FREETHEAI_FAIL_THRESHOLD} rounds échoués)\nSkip FreeTheAI 30min. Probe auto après.",
     "groq_exhausted":       "🔴 *Groq — quota daily épuisé*\nBatch arrêté proprement. Reset à minuit UTC.",
     "hapuppy_down":         f"🟠 *Hapuppy `{HAPUPPY_MODEL}` — down (502/timeout)*\nVérifier les crédits Hapuppy.",
     "hapuppy_dsk_frozen":   f"🔴 *Hapuppy `{HAPUPPY_MODEL}` — circuit breaker déclenché* ({HAPUPPY_FAIL_THRESHOLD} échecs consécutifs)\nRecheck dans 3h.",
@@ -121,21 +122,21 @@ def _send_cascade_notif(reason: str, trail: list[str]) -> None:
 
 
 def _freetheai_available() -> bool:
-    global _freetheai_skip_until, _freetheai_last_attempt, _freetheai_timeout_freeze_until, _freetheai_timeout_count
+    global _freetheai_skip_until, _freetheai_last_attempt, _freetheai_fail_freeze_until, _freetheai_fail_count
     if _freetheai_skip_until is not None:
         if datetime.now(timezone.utc) >= _freetheai_skip_until:
             _freetheai_skip_until = None
         else:
             return False
-    # Circuit breaker timeout : freeze 2h après 2 timeouts consécutifs
-    if _freetheai_timeout_freeze_until is not None:
+    # Circuit breaker 502/503/timeout : freeze 30min après 3 rounds échoués
+    if _freetheai_fail_freeze_until is not None:
         now_mono = time.monotonic()
-        if now_mono < _freetheai_timeout_freeze_until:
+        if now_mono < _freetheai_fail_freeze_until:
             return False
         else:
-            # Probe : reset le freeze, on retente
-            _freetheai_timeout_freeze_until = None
-            _freetheai_timeout_count = 0
+            # Probe : reset freeze, on retente
+            _freetheai_fail_freeze_until = None
+            _freetheai_fail_count = 0
     # Respecter le RPM : si dernier appel < 6s → skip sans sleep (Groq prend le relais)
     if time.monotonic() - _freetheai_last_attempt < FREETHEAI_MIN_INTERVAL:
         return False
@@ -197,6 +198,8 @@ def llm_call(
 
     # ── FreeTheAI ──────────────────────────────────────────────────────────────
     if freetheai_key and _freetheai_available():
+        global _freetheai_fail_count, _freetheai_fail_freeze_until
+        _round_failed = False  # True si primary+secondary échouent (502/503/timeout)
         for model in [FREETHEAI_PRIMARY, FREETHEAI_SECONDARY]:
             try:
                 _freetheai_last_attempt = time.monotonic()
@@ -220,6 +223,7 @@ def llm_call(
                     break
 
                 if r.status_code == 200:
+                    _freetheai_fail_count = 0  # reset sur succès
                     result = r.json()
                     result["_llm_source"] = "freetheai"
                     _last_llm_source = "freetheai"
@@ -232,21 +236,25 @@ def llm_call(
                     trail.append(f"FreeTheAI `{model}` : ✗ rate limit (429)")
                     break
 
-                # 502 / 503 → essai sur le secondary
+                # 502 / 503 → essai sur le secondary puis marque round échoué
                 trail.append(f"FreeTheAI `{model}` : ✗ {r.status_code}")
+                _round_failed = True
                 continue
 
-            except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError) as e:
+            except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError):
                 trail.append(f"FreeTheAI `{model}` : ✗ timeout/connexion")
-                global _freetheai_timeout_count, _freetheai_timeout_freeze_until
-                _freetheai_timeout_count += 1
-                if _freetheai_timeout_count >= FREETHEAI_TIMEOUT_THRESHOLD:
-                    _freetheai_timeout_freeze_until = time.monotonic() + FREETHEAI_TIMEOUT_FREEZE_SECONDS
-                    _freetheai_timeout_count = 0
-                    _send_cascade_notif("freetheai_timeout_frozen", trail)
+                _round_failed = True
                 continue
+
+        # Circuit breaker : 3 rounds échoués → freeze 30min
+        if _round_failed:
+            _freetheai_fail_count += 1
+            if _freetheai_fail_count >= FREETHEAI_FAIL_THRESHOLD:
+                _freetheai_fail_freeze_until = time.monotonic() + FREETHEAI_FAIL_FREEZE_SECONDS
+                _freetheai_fail_count = 0
+                _send_cascade_notif("freetheai_down_frozen", trail)
     else:
-        trail.append("FreeTheAI : ⏭ skipped (checkin/quota/RPM)")
+        trail.append("FreeTheAI : ⏭ skipped (checkin/quota/RPM/circuit breaker)")
 
     # ── Hapuppy gpt-4.1-mini — circuit breaker ───────────────────────────────────
     hapuppy_key = os.environ.get("HAPUPPY_API_KEY", "")
