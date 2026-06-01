@@ -8,7 +8,7 @@ import hashlib
 
 logger = logging.getLogger(__name__)
 
-ACTIVE_MONTH_TTL_HOURS = 24
+ACTIVE_MONTH_TTL_HOURS = 12
 
 # Densité articles bruts (fallback quand pas encore de summaries)
 DENSITY_CONFIG = {
@@ -142,7 +142,8 @@ def _fetch_finnhub_month(ticker: str, year_month: str) -> list[dict]:
 def _get_or_fetch_month(ticker: str, year_month: str, supa) -> tuple[list[dict], str]:
     """
     Retourne (articles_raw, source) depuis article_archive ou Finnhub.
-    source = 'finnhub' | 'yahoo'
+    Merge les nouveaux articles Finnhub avec l'existant (Yahoo inclus), pas d'écrasement.
+    source = 'finnhub' | 'yahoo' | 'mixed'
     """
     row = supa.table("article_archive") \
         .select("articles, source, cached_at") \
@@ -160,20 +161,31 @@ def _get_or_fetch_month(ticker: str, year_month: str, supa) -> tuple[list[dict],
         if datetime.now(timezone.utc) - cached_at < timedelta(hours=ACTIVE_MONTH_TTL_HOURS):
             return cached["articles"], cached["source"]
 
-    # Fetch Finnhub → dedup+merge extra_sources avant stockage
+    existing = (cached or {}).get("articles") or []
     raw = _fetch_finnhub_month(ticker, year_month)
-    source = "finnhub" if raw else "yahoo"
-    articles = _dedup_by_headline(raw)  # stocke propre avec extra_sources
+
+    if not raw:
+        # Pas de données Finnhub : bump cached_at pour éviter des refetches constants
+        if cached:
+            supa.table("article_archive").update({
+                "cached_at": datetime.now(timezone.utc).isoformat()
+            }).eq("ticker", ticker).eq("year_month", year_month).execute()
+            return existing, cached["source"]
+        return [], "yahoo"
+
+    # Merge Finnhub + existant (Yahoo ou Finnhub précédent), dedup par headline
+    merged = _dedup_by_headline(raw + existing)
+    source = "mixed" if existing else "finnhub"
 
     supa.table("article_archive").upsert({
         "ticker":     ticker,
         "year_month": year_month,
-        "articles":   articles,
+        "articles":   merged,
         "source":     source,
         "cached_at":  datetime.now(timezone.utc).isoformat(),
     }).execute()
-    logger.info(f"Finnhub fetched {len(raw)}→{len(articles)} articles for {ticker} {year_month} (source={source})")
-    return articles, source
+    logger.info(f"Finnhub merged {len(raw)} new + {len(existing)} existing → {len(merged)} for {ticker} {year_month} (source={source})")
+    return merged, source
 
 
 # ─── Density ──────────────────────────────────────────────────────────────────
@@ -594,7 +606,7 @@ def run_weekly_condensation():
                 label=label,
                 articles_text=articles_text,
             ))
-            top_articles = [_normalize_finnhub(a) for a in sorted(week_articles, key=lambda x: len(x.get("summary", "")), reverse=True)[:10]]
+            top_articles = [_normalize_finnhub(a) for a in sorted(week_articles, key=lambda x: x.get("pub_date", ""), reverse=True)[:10]]
             supa.table("article_week_summaries").upsert({
                 "ticker":        ticker,
                 "year_month":    target_ym,
@@ -610,6 +622,30 @@ def run_weekly_condensation():
             _purge_excess_weeklies(ticker, supa, max_weeks=5)
         except Exception as e:
             logger.error(f"  ✗ Weekly {ticker} {target_ym} W{target_wnum}: {e}")
+
+    # Pool 2: générer la semaine courante pour tous les tickers pinnés sans summary
+    now = datetime.now(timezone.utc)
+    current_ym = f"{now.year:04d}-{now.month:02d}"
+    current_wnum = _week_num(now.day)
+    all_pinned = _get_eligible_tickers(supa, min_users=1)
+
+    logger.info(f"Weekly Pool2: semaine courante {current_ym} W{current_wnum} pour {len(all_pinned)} tickers")
+    for ticker in all_pinned:
+        try:
+            exists = supa.table("article_week_summaries") \
+                .select("week_num") \
+                .eq("ticker", ticker) \
+                .eq("year_month", current_ym) \
+                .eq("week_num", current_wnum) \
+                .maybe_single() \
+                .execute()
+            if exists.data:
+                continue
+            result = get_weekly_ondemand(ticker)
+            if result:
+                logger.info(f"  ✓ Pool2 {ticker} {current_ym} W{current_wnum}")
+        except Exception as e:
+            logger.error(f"  ✗ Pool2 {ticker}: {e}")
 
 
 def run_monthly_condensation():
@@ -770,9 +806,8 @@ def run_yearly_condensation():
 
 def run_yahoo_accumulation():
     """
-    Cron daily (2h) : accumule les articles Yahoo pour les tickers
-    dont Finnhub ne couvre pas (source='yahoo') et pinnés ≥ 3 users.
-    Déduplique par URL.
+    Cron 6h : accumule les articles Yahoo pour tous les tickers pinnés ≥ 3 users.
+    Merge avec l'existant (Finnhub ou Yahoo), dedup par headline.
     """
     supa = _get_supabase()
 
@@ -783,26 +818,9 @@ def run_yahoo_accumulation():
     today = date.today()
     current_ym = f"{today.year:04d}-{today.month:02d}"
 
-    # Tickers yahoo seulement
-    yahoo_tickers_rows = supa.table("article_archive") \
-        .select("ticker, source") \
-        .eq("source", "yahoo") \
-        .in_("ticker", list(eligible)) \
-        .execute()
-    yahoo_tickers = {r["ticker"] for r in (yahoo_tickers_rows.data or [])}
+    logger.info(f"Yahoo accumulation: {len(eligible)} tickers")
 
-    # Si un ticker n'a jamais été fetché, vérifier Finnhub d'abord
-    for ticker in eligible - yahoo_tickers:
-        try:
-            articles, source = _get_or_fetch_month(ticker, current_ym, supa)
-            if source == "yahoo":
-                yahoo_tickers.add(ticker)
-        except Exception:
-            pass
-
-    logger.info(f"Yahoo accumulation: {len(yahoo_tickers)} tickers à accumuler")
-
-    for ticker in yahoo_tickers:
+    for ticker in eligible:
         try:
             _accumulate_yahoo(ticker, current_ym, supa)
         except Exception as e:
@@ -810,12 +828,11 @@ def run_yahoo_accumulation():
 
 
 def _accumulate_yahoo(ticker: str, year_month: str, supa) -> None:
-    """Fetch Yahoo news, déduplique par URL, upsert dans article_archive."""
+    """Fetch Yahoo news, merge avec l'existant (Finnhub ou Yahoo), dedup par headline."""
     import yfinance as yf
     t = yf.Ticker(ticker)
     raw = t.get_news(count=100)
 
-    # Format normalisé pour archive (compatible _normalize_finnhub via pub_date → datetime)
     new_articles = []
     for n in raw:
         c = n.get("content", {})
@@ -825,7 +842,7 @@ def _accumulate_yahoo(ticker: str, year_month: str, supa) -> None:
         except Exception:
             ts = 0
         url = (c.get("clickThroughUrl") or {}).get("url", "") or (c.get("canonicalUrl") or {}).get("url", "")
-        if not url:
+        if not url or not ts:
             continue
         new_articles.append({
             "headline": c.get("title", ""),
@@ -839,32 +856,55 @@ def _accumulate_yahoo(ticker: str, year_month: str, supa) -> None:
     if not new_articles:
         return
 
-    # Lire le cache existant
     row = supa.table("article_archive") \
-        .select("articles") \
+        .select("articles, source") \
         .eq("ticker", ticker) \
         .eq("year_month", year_month) \
         .maybe_single() \
         .execute()
 
-    existing = row.data["articles"] if row.data else []
-    existing_urls = {a.get("url") for a in existing}
+    existing = (row.data or {}).get("articles") or []
+    existing_source = (row.data or {}).get("source", "yahoo")
 
-    # Ajouter seulement les nouveaux
-    added = [a for a in new_articles if a.get("url") not in existing_urls]
-    if not added:
+    # Merge + dedup par headline (Yahoo en tête pour avoir les résumés Yahoo)
+    merged = _dedup_by_headline(new_articles + existing)
+    if len(merged) == len(existing):
         logger.info(f"  Yahoo {ticker} {year_month}: 0 nouveaux articles")
         return
 
-    merged = existing + added
+    new_source = "mixed" if existing_source == "finnhub" else "yahoo"
+    added = len(merged) - len(existing)
     supa.table("article_archive").upsert({
         "ticker":     ticker,
         "year_month": year_month,
         "articles":   merged,
-        "source":     "yahoo",
+        "source":     new_source,
         "cached_at":  datetime.now(timezone.utc).isoformat(),
     }).execute()
-    logger.info(f"  Yahoo {ticker} {year_month}: +{len(added)} articles ({len(merged)} total)")
+    logger.info(f"  Yahoo {ticker} {year_month}: +{added} articles ({len(merged)} total, source={new_source})")
+
+
+def run_finnhub_refresh():
+    """
+    Cron 12h : refresh Finnhub pour le mois courant sur tous les tickers pinnés ≥ 3 users.
+    Merge avec l'existant via _get_or_fetch_month (TTL 12h).
+    """
+    supa = _get_supabase()
+    today = date.today()
+    current_ym = f"{today.year:04d}-{today.month:02d}"
+
+    eligible = _get_eligible_tickers(supa, min_users=3)
+    if not eligible:
+        return
+
+    logger.info(f"Finnhub refresh: {len(eligible)} tickers pour {current_ym}")
+
+    for ticker in eligible:
+        try:
+            articles, source = _get_or_fetch_month(ticker, current_ym, supa)
+            logger.info(f"  ✓ Finnhub {ticker}: {len(articles)} articles (source={source})")
+        except Exception as e:
+            logger.error(f"  ✗ Finnhub refresh {ticker}: {e}")
 
 
 def _get_eligible_tickers(supa, min_users: int = 3) -> set[str]:
@@ -989,6 +1029,60 @@ def run_monthly_calendaire(tickers: list[str] | None = None):
 
 
 # ─── Monthly on-demand (rolling 4 semaines) ───────────────────────────────────
+
+def get_weekly_ondemand(ticker: str) -> str | None:
+    """
+    Génère un résumé IA de la semaine en cours depuis stock_news_cache.news_raw (Yahoo 7j).
+    Stocke dans article_week_summaries et retourne le texte.
+    """
+    ticker = ticker.upper()
+    supa = _get_supabase()
+
+    row = supa.table("stock_news_cache").select("news_raw").eq("ticker", ticker).maybe_single().execute()
+    if not row or not row.data:
+        return None
+
+    cutoff = datetime.now(timezone.utc).timestamp() - 7 * 24 * 3600
+    articles = []
+    for a in (row.data.get("news_raw") or []):
+        try:
+            pub = a.get("pub_date", "")
+            ts = datetime.fromisoformat(pub.replace("Z", "+00:00")).timestamp() if pub else float(a.get("datetime", 0) or 0)
+            if not ts or ts < cutoff:
+                continue
+        except Exception:
+            continue
+        articles.append({"headline": a.get("title", "") or a.get("headline", ""), "pub_date": pub})
+
+    if not articles:
+        return None
+
+    now = datetime.now(timezone.utc)
+    year_month = now.strftime("%Y-%m")
+    day = now.day
+    week_num = 1 if day <= 7 else 2 if day <= 14 else 3 if day <= 21 else 4
+    label = _week_label(year_month, week_num)
+
+    articles_text = "\n".join(f"- {a['headline']}" for a in articles[:25])
+    try:
+        summary = _llm_call(_pick(WEEK_CONDENSE_PROMPT, WEEK_CONDENSE_PROMPT_EN).format(
+            ticker=ticker, label=label, articles_text=articles_text,
+        ), max_tokens=400)
+    except Exception as e:
+        logger.error(f"Weekly ondemand {ticker}: {e}")
+        return None
+
+    supa.table("article_week_summaries").upsert({
+        "ticker":       ticker,
+        "year_month":   year_month,
+        "week_num":     week_num,
+        _summary_col(): summary,
+        "top_articles": [],
+        "article_count": len(articles),
+        "condensed_at": now.isoformat(),
+    }).execute()
+    return summary
+
 
 def get_monthly_ondemand(ticker: str) -> str | None:
     """

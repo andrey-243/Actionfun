@@ -95,7 +95,7 @@ def _notify_checkpoint(phase: str, i: int, total: int, region: str,
     _telegram(msg)
     logger.info(f"[NOTIF] {i}/{total} — {len(errors_batch)} erreurs · LLM: {llm_sources}")
 
-PROGRESS_FILE = Path(__file__).parent / "batch_progress.json"  # overridable via --progress-file
+PROGRESS_FILE = Path(__file__).parent / "batch_progress.json"  # overridden in main() per phase+region
 FINNHUB_KEY = os.environ["FINNHUB_API_KEY"]
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
@@ -460,7 +460,8 @@ def phase_bubbles(tickers: list[str], region: str = "all"):
 
     for i, ticker in enumerate(todo, 1):
         logger.info(f"[{i}/{total}] {ticker} — bubbles 6M+1Y")
-        ticker_events = 0
+        ticker_events = 0  # bubbles avec cause LLM réelle
+        ticker_total = 0   # toutes les bubbles tentées
         try:
             for period, interval, window, max_dots in PERIODS:
                 try:
@@ -477,8 +478,12 @@ def phase_bubbles(tickers: list[str], region: str = "all"):
                         # change_pct = variation jour J vs J-1
                         change_pct = (closes[idx] - closes[idx - 1]) / closes[idx - 1] * 100 if idx > 0 else 0.0
                         try:
-                            get_event_news(ticker, date, round(change_pct, 2))
-                            ticker_events += 1
+                            result = get_event_news(ticker, date, round(change_pct, 2))
+                            ticker_total += 1
+                            if result.get("cause"):
+                                ticker_events += 1
+                            else:
+                                logger.warning(f"  bubble {ticker} {date}: cause=null (LLM failed)")
                             time.sleep(0.5)  # éviter burst Groq
                         except Exception as e:
                             logger.warning(f"  bubble {ticker} {date}: {e}")
@@ -487,8 +492,12 @@ def phase_bubbles(tickers: list[str], region: str = "all"):
                     logger.warning(f"  period {period} {ticker}: {e}")
 
             total_events += ticker_events
-            logger.info(f"  ✓ {ticker} — {ticker_events} bubbles générées")
-            progress.setdefault("bubbles_done", []).append(ticker)
+            null_count = ticker_total - ticker_events
+            if null_count == 0:
+                logger.info(f"  ✓ {ticker} — {ticker_events} bubbles avec cause")
+                progress.setdefault("bubbles_done", []).append(ticker)
+            else:
+                logger.warning(f"  ⚠ {ticker} — {ticker_events} avec cause, {null_count} cause=null (LLM down) → pas marqué done")
 
         except Exception as e:
             logger.error(f"  ✗ {ticker}: {e}")
@@ -592,10 +601,17 @@ def main():
                         help="Fichier de progress custom (défaut: batch_progress.json)")
     args = parser.parse_args()
 
-    # Override progress file si spécifié
+    # Progress file : custom > auto-namé par phase+region pour éviter les dirty writes concurrents
+    global PROGRESS_FILE
     if args.progress_file:
-        global PROGRESS_FILE
         PROGRESS_FILE = Path(args.progress_file)
+    else:
+        region_slug = args.region.lower()
+        lang_slug = (args.lang or os.environ.get("LLM_LANG", "en")).lower()
+        if args.phase in ("enrich", "bubbles"):
+            PROGRESS_FILE = Path(__file__).parent / f"batch_progress_{args.phase}_{region_slug}_{lang_slug}.json"
+        else:
+            PROGRESS_FILE = Path(__file__).parent / f"batch_progress_{args.phase}_{region_slug}.json"
 
     # Appliquer la langue via env var (lu par tous les services)
     if args.lang:

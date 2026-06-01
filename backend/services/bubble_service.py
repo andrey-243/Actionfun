@@ -87,13 +87,13 @@ def get_event_news(ticker: str, date: str, change_pct: float = 0.0) -> dict:
 
     # Cache Supabase permanent
     row = supa.table("event_causes") \
-        .select("articles, cause") \
+        .select("articles, cause, cause_en") \
         .eq("ticker", ticker) \
         .eq("date", date) \
         .maybe_single() \
         .execute()
 
-    lang = os.environ.get("LLM_LANG", "fr")
+    lang = os.environ.get("LLM_LANG", "en")
     cached = row.data if row else None
     if cached:
         cause = cached.get("cause_en" if lang == "en" else "cause")

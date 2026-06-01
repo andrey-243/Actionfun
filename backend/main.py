@@ -66,9 +66,16 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(
         _run_yahoo_accumulation,
         trigger="cron",
-        hour=2,
+        hour="*/6",
         minute=0,
         id="yahoo_accumulation",
+    )
+    scheduler.add_job(
+        _run_finnhub_refresh,
+        trigger="cron",
+        hour="*/12",
+        minute=30,
+        id="finnhub_refresh",
     )
     scheduler.add_job(
         _run_hourly_news_refresh,
@@ -91,7 +98,7 @@ async def lifespan(app: FastAPI):
         id="reenrich_groq_to_freetheai",
     )
     scheduler.start()
-    logger.info("Crons démarrés — digest gen 18h + email 18h30, weekly lun 3h30, monthly 1er 4h, yearly 1er jan 5h, yahoo 2h, cold_start FR 19h, re-enrich 22h30, hourly_news :15")
+    logger.info("Crons démarrés — digest gen 18h + email 18h30, weekly lun 3h30, monthly 1er 4h, yearly 1er jan 5h, yahoo */6h, finnhub */12h, cold_start FR 19h, re-enrich 22h30, hourly_news :15")
     yield
     scheduler.shutdown()
 
@@ -144,6 +151,14 @@ def _run_yahoo_accumulation():
         logger.error(f"Yahoo accumulation failed: {e}")
 
 
+def _run_finnhub_refresh():
+    from services.period_articles_service import run_finnhub_refresh
+    try:
+        run_finnhub_refresh()
+    except Exception as e:
+        logger.error(f"Finnhub refresh failed: {e}")
+
+
 def _run_reenrich():
     from services.reenrich_service import run_reenrich
     try:
@@ -173,9 +188,12 @@ def _purge_old_digests():
     from datetime import date, timedelta
     try:
         supa = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
-        cutoff = (date.today() - timedelta(days=30)).isoformat()
-        result = supa.table("daily_digest").delete().lt("date", cutoff).execute()
-        logger.info(f"Purge digests > 30J (cutoff {cutoff}) : {len(result.data or [])} rows supprimées")
+        cutoff_30d = (date.today() - timedelta(days=30)).isoformat()
+        r1 = supa.table("daily_digest").delete().lt("date", cutoff_30d).execute()
+        logger.info(f"Purge digests > 30J : {len(r1.data or [])} rows supprimées")
+        cutoff_1y = (date.today() - timedelta(days=365)).isoformat()
+        r2 = supa.table("event_causes").delete().lt("date", cutoff_1y).execute()
+        logger.info(f"Purge event_causes > 1 an : {len(r2.data or [])} rows supprimées")
     except Exception as e:
         logger.error(f"Purge failed: {e}")
 

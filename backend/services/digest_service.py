@@ -91,57 +91,66 @@ def _fetch_from_yahoo_cache(ticker: str, supa) -> dict | None:
     Si absent, déclenche un refresh actif via overview_service."""
     row = (
         supa.table("stock_news_cache")
-        .select("ai_summary_24h, ai_sentiment_24h, news_raw")
+        .select("ai_summary_24h, ai_summary_24h_en, ai_sentiment_24h, news_raw")
         .eq("ticker", ticker)
         .maybe_single()
         .execute()
     )
-    if not row or not row.data or not row.data.get("ai_summary_24h"):
+    has_summary = row and row.data and (row.data.get("ai_summary_24h_en") or row.data.get("ai_summary_24h"))
+    if not has_summary:
         try:
             from services.overview_service import get_news
             get_news(ticker)
             row = (
                 supa.table("stock_news_cache")
-                .select("ai_summary_24h, ai_sentiment_24h, news_raw")
+                .select("ai_summary_24h, ai_summary_24h_en, ai_sentiment_24h, news_raw")
                 .eq("ticker", ticker)
                 .maybe_single()
                 .execute()
             )
         except Exception as e:
             logger.warning(f"  overview_service fallback failed for {ticker}: {e}")
-    if not row or not row.data or not row.data.get("ai_summary_24h"):
+    if not row or not row.data or not (row.data.get("ai_summary_24h_en") or row.data.get("ai_summary_24h")):
         return None
 
     cutoff = (datetime.now(timezone.utc).timestamp()) - 86400
     articles = []
     for a in (row.data.get("news_raw") or []):
         try:
-            ts = datetime.fromisoformat(a["pub_date"].replace("Z", "+00:00")).timestamp()
+            pub = a.get("pub_date", "")
+            if pub:
+                ts = datetime.fromisoformat(pub.replace("Z", "+00:00")).timestamp()
+            else:
+                ts = float(a.get("datetime", 0) or 0)
+            if not ts:
+                continue
         except Exception:
             continue
         if ts >= cutoff:
-            articles.append({"headline": a.get("title", ""), "source": a.get("source", ""), "url": a.get("url", ""), "datetime": int(ts)})
+            articles.append({"headline": a.get("title", "") or a.get("headline", ""), "source": a.get("source", ""), "url": a.get("url", ""), "datetime": int(ts)})
 
+    summary = row.data.get("ai_summary_24h_en") or row.data.get("ai_summary_24h", "")
     return {
-        "summary": row.data["ai_summary_24h"],
+        "summary": summary,
         "sentiment": row.data.get("ai_sentiment_24h") or "NEUTRAL",
         "articles": articles[:12],
         "source": "yahoo",
     }
 
 
-def generate_digest_for_ticker(ticker: str, lang: str = None) -> dict | None:
+def generate_digest_for_ticker(ticker: str, lang: str = None, force: bool = False) -> dict | None:
     """Génère et stocke le digest du jour pour un ticker. Retourne None si pas de news."""
-    lang = lang or os.environ.get("LLM_LANG", "fr")
+    lang = lang or os.environ.get("LLM_LANG", "en")
     today = date.today().isoformat()
     supa = _get_supabase()
 
-    existing = supa.table("daily_digest").select("*").eq("ticker", ticker).eq("date", today).maybe_single().execute()
-    if existing and existing.data:
-        if lang == "en" and existing.data.get("summary_en"):
-            return existing.data
-        if lang == "fr":
-            return existing.data
+    if not force:
+        existing = supa.table("daily_digest").select("*").eq("ticker", ticker).eq("date", today).maybe_single().execute()
+        if existing and existing.data:
+            if lang == "en" and existing.data.get("summary_en"):
+                return existing.data
+            if lang == "fr":
+                return existing.data
 
     # 1. Lire le cache Yahoo (stock_news_cache) — déjà enrichi par overview_service, zéro LLM
     yahoo = _fetch_from_yahoo_cache(ticker, supa)
@@ -165,7 +174,6 @@ def generate_digest_for_ticker(ticker: str, lang: str = None) -> dict | None:
         row = {
             "ticker": ticker,
             "date": today,
-            "articles": articles,
             "summary_en": summary,
             "sentiment": sentiment,
             "llm_source": llm_source,
@@ -176,7 +184,6 @@ def generate_digest_for_ticker(ticker: str, lang: str = None) -> dict | None:
         row = {
             "ticker": ticker,
             "date": today,
-            "articles": articles,
             "summary": summary,
             "sentiment": sentiment,
             "llm_source": llm_source,

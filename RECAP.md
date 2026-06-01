@@ -14,7 +14,7 @@
 | Events chart | Finnhub company-news (free, 1 an d'historique) + Groq cause IA |
 | Email digest | Resend (3 000 emails/mois gratuit) — clé configurée, sandbox actif |
 | Logos | Logo.dev free (500k req/mois, attribution requise) — domaine depuis yfinance `t.info["website"]`, stocké dans `stock_news_cache.website` · `NEXT_PUBLIC_LOGODEV_TOKEN` dans `frontend/.env.local` |
-| Cron | APScheduler intégré dans FastAPI — digest gen 18h00 · email 18h30 · cold_start FR 19h · re-enrich 22h30 · weekly lun 3h30 · monthly 1er 4h · yearly 1er jan 5h · yahoo 2h · **hourly_news_refresh :15** (pinned + visités récemment avec no_24h_news) |
+| Cron | APScheduler intégré dans FastAPI — digest gen 18h00 · email 18h30 · cold_start FR 19h · re-enrich 22h30 · weekly lun 3h30 · monthly 1er 4h · yearly 1er jan 5h · **yahoo */6h** (tous pinnés ≥3, merge article_archive) · **finnhub */12h** (current month, merge) · **hourly_news_refresh :15** (pinned + visités récemment avec no_24h_news) |
 | Git | github.com/andrey-243/Actionfun — repo privé |
 | Déploiement | local → Railway/Render (backend) · Vercel (frontend) · Supabase (DB) |
 
@@ -23,7 +23,7 @@
 Theme **dark earthy** — bg `#141412` · surfaces `#1E1D1B` · accent vert menthe `#4CAF82` · texte crème `#E8E5DF`.
 Vert `#4CAF82` / rouge `#E05C4B` pour les variations de cours.
 
-**Navbar** — frosted glass `rgba(14,14,12,0.45)` + `blur(22px)` · hauteur 66px · logo chien SVG (tracé crème, rotation anti-horaire 60s) dans container menthe · `NavBrand` + `BackButton` réutilisables sur toutes les pages · avatar OAuth rond (Google/Discord) · pill "Mes news" accent.
+**Navbar** — frosted glass `rgba(14,14,12,0.45)` + `blur(22px)` · hauteur 66px · logo chien SVG (tracé crème, rotation anti-horaire 60s) dans container menthe · `NavBrand` + `BackButton` + `Avatar` (exported) réutilisables sur toutes les pages · avatar OAuth rond (Google/Discord) · pill "Mes news" accent (homepage uniquement) · pages secondaires (stock, my-news) : avatar seulement ou rien.
 
 ## Lancer le projet
 
@@ -106,25 +106,36 @@ stock_app/
 | Page profile | ✅ | Devise + compte + sign out |
 | News — fetch + drawer + vidéo | ✅ | |
 | News — résumés IA | ✅ | Cascade FreeTheAI → Groq (voir section LLM) |
-| Cache news Supabase | ✅ | Deux TTL indépendants : OW 24H = 6h (Call 1) · OW 7J = 24h (Call 2). Cold start = 1 call lourd (DUMB+OW7J) + 1 call léger (OW24H). Refresh = Call 1 abrutiize seulement les nouveaux articles, Call 2 lit les abrutis en DB. |
+| Cache news Supabase | ✅ | Deux TTL indépendants : OW 24H = **3h** (Call 1) · OW 7J = 24h (Call 2). Cold start = 1 call lourd (DUMB+OW7J+OW24H). Refresh = Call 1 brutalise les nouveaux, stocke 7J depuis BRUTALIZE (LLM4 — évite Call 2). LLM2 : skip si hash IDs inchangé. Call 2 actif uniquement BATCH_MODE=1. TTL checks vérifient la colonne EN ou FR selon `LLM_LANG`. |
+| **EN-first migration** | ✅ | `LLM_LANG=en` dans `.env`. Tous les services (overview, digest, bubble, period_articles) génèrent EN par défaut. `_build_response()` sert `ai_summary_en` en premier. Routers normalisent `summary`/`ai_summary` EN first. Reenrich étendu : cible aussi `ai_summary_en IS NULL` (pas seulement `llm_source='groq'`). Colonnes DB ajoutées : `daily_digest.summary_en` · `event_causes.cause_en`. État DB : stock_news_cache 256/269 EN · weekly 0/10 · monthly 0/2 · bubbles 0/812 (se refill au fur et à mesure). |
 | Annotations chart (events) | ✅ | Dots peaks/valleys → EventDrawer Finnhub + cause IA. 24H/5Y sans dots. 1W=top 5, 1M=8, 6M/1Y=10 |
 | Chart — vertical grid lines | ✅ | Tirets par période : 24H=horaire, 1W=jour, 1M=lundi, 6M/1Y=mois, 5Y=année |
 | Lazy loading page stock | ✅ | Default 24H — seul /api/news charge au mount. Articles 1M+ et causes events : on-demand uniquement |
-| Cascade LLM FreeTheAI→Groq | ✅ | gpt-4.1 → gpt-5.4-mini → Hapuppy → Groq. Notif TG unique avec **trail complet** de la cascade (chaque modèle tenté + ✓/✗ + raison). Throttle 30min par raison. Notif aussi si tous les LLM échouent. |
+| Cascade LLM FreeTheAI→Groq | ✅ | gpt-4.1 → gpt-5.4-mini → Hapuppy deepseek-v3.2 (circuit breaker 3 échecs → freeze 3h → fallback gpt-4.1-mini dans même bloc hapuppy, pas de saut Groq) → Groq. Notif TG frozen/still_down/réactivé. Throttle 30min. `_llm_source` = "hapuppy" / "hapuppy_mini". Fix `_next_utc_midnight()` end-of-month bug (timedelta). **Hapuppy throttle 100 RPM** : `HAPUPPY_MIN_INTERVAL=0.6s` — skip vers Groq si dernier appel < 0.6s. |
 | EOD digest — backend | ✅ | gen 18h00 (Yahoo cache stock_news_cache en primary, Finnhub+LLM seulement si cache vide) · email 18h30 · 2 jobs APScheduler séparés |
 | EOD digest — email | ✅ | Resend — clé configurée, sandbox `onboarding@resend.dev` (passer à domaine custom en prod) |
-| EOD digest — onglet "Mes news" | ✅ | Page /my-news : 2 tabs Daily (daily_digest) + Weekly (article_week_summaries) · logo Logo.dev · source + date articles |
-| Préférences notif (email on/off + par ticker) | ✅ | Dans /profile : toggle Daily + toggle Weekly (badge Premium, actif pour tous) + chips par action · `notify_weekly` en DB |
-| Batch DB filler (717 tickers) | 🔄 | Scrape US+EU+Asia terminé. OW enrich : US FR 260/260 ✅ · US EN 260/260 ✅ · EU 0/227 · ASIA 0/230. BUB 6M+1Y US : à gen (nuit 1). Phase enrich populate aussi `website` pour Logo.dev. Progress dans `batch_progress.json`. Notifs Telegram tous les 25 tickers. FREETHEAI_DELAY = 6s (10 RPM, call sync). |
+| EOD digest — onglet "Mes news" | ✅ | Page /my-news : toggle Daily/Weekly **pill style vert** (même style que bouton "Mes news" navbar) · auto-refresh si digest > 3h (`?force=1` backend) · `generated_at` dans réponse digest · `condensed_at` dans réponse weekly · DigestCard : chevron conditionnel (articles seulement), logo cliquable → stock page, freshness par carte · WeeklyCard : source+date alignés à droite du titre · top_articles triées par date desc |
+| Préférences notif (email on/off + par ticker) | ✅ | Dans /profile : toggle Daily (badge PREMIUM jaune) + toggle Weekly (badge PREMIUM vert accent) + chips par action · `notify_weekly` en DB |
+| Batch DB filler (717 tickers) | 🔄 | Scrape : US ✅ · EU ✅ · ASIA 🔄. OW enrich : **EN par défaut** (`LLM_LANG=en`). US EN ✅ (256/269 `ai_summary_en`) · EU ⏳ · ASIA ⏳. BUB 6M+1Y US : 🔄 58/259 done (`cause_en`). 812 rows FR existantes se refillent en EN au prochain batch ou visite bulle. Fix batch : `ticker_events` compte uniquement causes non-null, ticker non marqué `done` si cause=null. **Séquence en cours** → voir ci-dessous. |
+
+**Séquence batch — EN first (2026-06-01)**
+
+| # | Phase | Région | Statut |
+|---|---|---|---|
+| 1 | Bubbles 6M+1Y | US | 🔄 en cours — 58/259 done, 201 restants |
+| 2 | Bubbles 6M+1Y | EU | ⏳ |
+| 3 | Bubbles 6M+1Y | ASIA | ⏳ |
+| 4 | Monthly summaries (breaks) | US+EU+ASIA | ⏳ après bubbles |
+| — | OW enrich (ai_summary_en) | EU · ASIA | ⏭ skip — se remplit via cron 3h + reenrich 22h30 |
 | Loading animation — DogLoader | ✅ | Sleeping dog SVG, 2 comètes sens inverse, rotation 3D lente. Actif sur newsLoading + periodLoading (page stock) + EventDrawer |
-| DB articles — rotation & purge | ✅ | 5W max, monthly calendaire 1er du mois, yearly purge monthlies |
+| DB articles — rotation & purge | ✅ | 5W max, monthly calendaire 1er du mois, yearly purge monthlies. Purge event_causes > 1 an dans cron lundi 3h. |
 | Monthly on-demand (premium) | ✅ | `get_monthly_ondemand()` — rolling 4 weeklies → LLM, pas de cache persistant |
 | Articles 1M/6M/1Y — sections par période | ✅ | 1M=semaines (skew detection), 6M/1Y=mois. Rendu avec résumé AI si dispo + articles compacts |
 | Articles multi-source | ✅ | Dedup par headline à chaque fetch Finnhub. `extra_sources` stockés. Badges colorés + multi-CTA dans drawer |
 | Reddit sentiment | ⬜ | À venir |
 | Refresh proactif (cron) | ⬜ | Pour tickers populaires/pinnés |
 | LLM source tracking | ✅ | `llm_source` persisté dans stock_news_cache, article_week/month/year_summaries, event_causes, daily_digest |
-| Re-enrich Groq→FreeTheAI | ✅ | Cron 22h30 — scan `llm_source='groq'`, re-enrich FreeTheAI only (BATCH_MODE). Stop si quota atteint, retry J+1. |
+| Re-enrich Groq→FreeTheAI | ✅ | Cron 22h30 — scan `llm_source='groq'` **+ `ai_summary_en IS NULL`** (news_cache + weekly + monthly), re-enrich FreeTheAI only (BATCH_MODE). Stop si quota atteint, retry J+1. |
 | Cold start ticker rare | ✅ | Tickers hors top 250 : scrape + enrich progressif en background (1M → 6M → 1Y). EN first, FR traduit EOD si pas de clic FR. Banner `ColdStartBanner` avec poll 10s, steps visuels, reload articles au completion. `init-status` retourne `done:true` immédiatement si le ticker a des données (évite faux positif). |
 | 24h vide — fallback 0 token | ✅ | Si aucun article dans les 24h (ticker peu couvert) : pas d'appel LLM, résumé composé de "Aucune actualité 24h" + perf benchmark du jour + résumé 7J. Badge `AUCUNE NEWS 24H` + note italique dans l'UI. `no_24h_news` persisté en DB. |
 
@@ -136,8 +147,12 @@ Tous les appels LLM passent par `services/llm_service.py` qui gère la cascade a
 ```
 FreeTheAI: bbl/gpt-4.1          → primary (JSON propre, qualité max)
 FreeTheAI: bbl/gpt-5.4-mini     → secondary si 502/timeout sur primary
-Hapuppy:   deepseek-v3.2        → tertiary (happy endpoint, pas de quota partagé)
-Groq: voir tableau ci-dessous    → fallback final si 403 / daily limit / 429
+Hapuppy:   deepseek-v3.2        → tertiary — circuit breaker :
+                                     3 échecs consécutifs → freeze 3h → fallback gpt-4.1-mini
+                                     Probe auto après 3h : succès → reset · échec → refreeze 3h
+                                     Notif TG : frozen / still_down / réactivé
+Hapuppy:   gpt-4.1-mini         → fallback si deepseek frozen (même call, pas de saut vers Groq)
+Groq: voir tableau ci-dessous    → fallback final si hapuppy complètement down
                                    ⚠️ TODO PROD : désactiver en BATCH_MODE=1 pour préserver le quota site
 ```
 AgentRouter (`agentrouter.org`) testé et rejeté — clé `unauthorized_client`, pas d'accès sans activation Discord. Retiré de la cascade et du code.
@@ -146,6 +161,11 @@ AgentRouter (`agentrouter.org`) testé et rejeté — clé `unauthorized_client`
 - **403 / checkin manquant** : faire `/checkin` sur le Discord FreeTheAI pour débloquer
 - **Daily limit** (`"daily successful request limit exceeded"`) : reset automatique à minuit UTC
 - **429 (RPM)** : skip immédiat vers Groq, retry FreeTheAI après 6s (10 RPM, 1 concurrent)
+
+**Comportement erreurs Hapuppy :**
+- **RPM** : 100 req/min — throttle `HAPUPPY_MIN_INTERVAL=0.6s`, skip vers Groq si dépassé
+- **502/timeout** : circuit breaker deepseek (3 échecs → freeze 3h) → fallback `gpt-4.1-mini` dans le même bloc
+- **Crédits épuisés** : notif TG `hapuppy_down` throttlée 30min
 
 **Notifs Telegram — trail complet de la cascade :**
 ```
@@ -242,101 +262,53 @@ TELEGRAM_BOT_TOKEN=...             # @mcorp1290_bot
 TELEGRAM_CHAT_ID=...               # notifs cascade LLM
 AZURE_TRANSLATOR_KEY=...           # F0 free tier 2M chars/mois (traduction EN→FR)
 AZURE_TRANSLATOR_REGION=...        # ex: eastus
+YANDEX_API_KEY_ID=...              # Yandex Translate — ID de la clé IAM
+YANDEX_SECRET_KEY=...              # Yandex Translate — clé secrète (configuré, pas encore intégré dans translation_service.py)
 ```
+
+## Optimisations — État d'implémentation
+
+### Fait ✅
+
+| # | Décision | Fichier |
+|---|---|---|
+| **article_archive pipeline** | Yahoo */6h + Finnhub */12h → merge dans `article_archive`. `_get_or_fetch_month` merge au lieu d'écraser. `_accumulate_yahoo` pour tous les pinnés (plus filtre source='yahoo'). `run_finnhub_refresh()` nouveau cron. | `period_articles_service.py`, `main.py` |
+| **DB2** | `daily_digest` ne stocke plus `articles` — lu depuis `stock_news_cache.news_raw` via fallback router | `digest_service.py` |
+| **DB3** | `CREATE INDEX IF NOT EXISTS idx_article_week_summaries_ticker_date ON article_week_summaries (ticker, year_month DESC, week_num DESC)` — à exécuter en SQL Editor Supabase | — |
+| **DB4** | Purge `event_causes > 1 an` dans cron Monday 3h (`_purge_old_digests`) | `main.py` |
+| **LLM2** | `_articles_hash()` — skip brutalise si IDs inchangés. Stocke `articles_hash` dans `stock_news_cache` | `overview_service.py` |
+| **LLM4** | BRUTALIZE retourne déjà `summary` (7J) → stocké directement comme `ai_summary` + `ow7d_cached_at`. Call 2 (`_call2_ow7d`) actif uniquement en `BATCH_MODE=1` | `overview_service.py` |
+| **Weekly Pool 1** | `_maybe_regen_weekly()` dans cron hourly — Pool 1 (tickers `no_24h_news`) | `overview_service.py` |
+| **Weekly Pool 2** | `run_weekly_condensation` (lundi 3h30) génère semaine courante pour tous les pinnés sans summary via `get_weekly_ondemand()` | `period_articles_service.py` |
+
+### Post-beta ⬜
+
+| # | Décision | Notes |
+|---|---|---|
+| LLM5 | Routing par complexité | Calls légers → modèle rapide, calls lourds → modèle principal |
+| LLM6 | ~~Dedup cross-tickers~~ | Non pertinent : `brutalised` est ticker-spécifique. LLM2 couvre déjà l'intra-ticker. |
+| FE1 | `ArticleDrawer` → lien direct si pas de `brutalised` | `window.open(url)` au lieu du drawer si pas d'analyse IA |
+
+### Weekly regen — flow implémenté
+
+**Pool 1 (cron 1h)** : tickers `no_24h_news=True` → si news trouvée → `get_news()` (Call 1) → `_maybe_regen_weekly()` → `get_weekly_ondemand()`. ✅
+
+**Pool 2 (lundi 3h30)** : `run_weekly_condensation` → condense W-1 (article_archive) PUIS itère tous pinnés (min_users=1) → `get_weekly_ondemand()` pour ceux sans weekly semaine courante. ✅
+
+**Monthly** : `article_week_summaries` accumule W1→W4. Cron 1er du mois → monthly → purge weeklies du mois passé. ✅
+
+### Frontend
+
+| # | Décision | Notes |
+|---|---|---|
+| FE1 | `ArticleDrawer` → lien direct si pas de `brutalised` | Articles sans AI analysis → `window.open(url)` au lieu du drawer. Libère de l'espace DB |
 
 ## Post-beta — Roadmap
 
 | Feature | Priorité | Notes |
 |---|---|---|
 | Descriptions intelligentes des tickers | 🔜 | Voir détail ci-dessous |
-| **Migration EN-first + traduction FR** | 🔜 | Voir détail ci-dessous — gros chantier |
-| AI Overview toggle FR/EN | 🔜 | Dépend de la migration EN-first |
-
-### Migration EN-first + traduction FR
-
-**Décision :** passer tous les prompts LLM de FR à EN. Stocker les résumés en EN comme source de vérité. Traduire vers FR via API dédiée.
-
-**Cascade traduction EN→FR :**
-```
-1. FreeTheAI              ← primary (gratuit, ~16s/appel)
-                             Si 403 checkin manquant → skip immédiat vers Azure
-2. Azure Translator       ← secondary (~200ms, gratuit 2M chars/mois — F0 tier)
-3. Groq                   ← fallback final (gratuit, toujours dispo)
-```
-Vars d'env : `AZURE_TRANSLATOR_KEY=...` · `AZURE_TRANSLATOR_REGION=...`
-
-**Stratégie de migration :**
-- Les résumés FR déjà générés (enrich US en cours) → conservés tels quels, renommés `*_fr`
-- Nouvelles colonnes `*_en` ajoutées → alimentées par le prochain enrich EN
-- Zéro re-génération du FR existant — aucun travail perdu
-- **Traduction batch** (717 tickers) : volume > 500k chars → FreeTheAI (~16s/ticker, gratuit)
-- **Traduction real-time** (daily digest, events on-demand) : DeepL (~200ms, $7/mois)
-
-**Champs à doubler (ALTER TABLE ADD COLUMN) :**
-```
-stock_news_cache :
-  ai_summary (FR existant, gardé)  +  ai_summary_en (nouvelle)
-  ai_summary_24h (FR existant)     +  ai_summary_24h_en (nouvelle)
-  ai_sentiment / ai_sentiment_24h  → inchangés (BULLISH/BEARISH/NEUTRAL agnostiques)
-
-  Exemple FR : "Sur la semaine, Lowe's a affiché une performance légèrement négative
-  (-0,31%) dans un marché américain dynamique (+1,43% pour le S&P 500)..."
-
-daily_digest :
-  summary (FR existant)  +  summary_en (nouvelle)
-
-  Exemple FR : "L'action Amazon (AMZN) a augmenté de 3,4% depuis la dernière
-  publication de ses résultats financiers. La société a fermé son tableau de
-  bord interne d'IA..."
-
-article_week_summaries :
-  ai_summary (FR existant)  +  ai_summary_en (nouvelle)
-
-  Exemple FR : "La semaine W4 d'avril 2026 a été marquée par des résultats
-  trimestriels positifs pour Amazon, avec une croissance de son secteur d'IA..."
-
-article_month_summaries :
-  ai_summary (FR existant)  +  ai_summary_en (nouvelle)
-
-  Exemple FR : "En mars 2026, Amazon s'est distinguée par l'introduction de
-  solutions publicitaires pilotées par l'IA via BQool..."
-
-article_year_summaries :
-  ai_summary (FR existant)  +  ai_summary_en (nouvelle)
-
-event_causes :
-  cause (FR existant)  +  cause_en (nouvelle)
-
-  Exemple FR : "Le titre AAPL a bénéficié d'une note plus optimiste de la part
-  de Morgan Stanley, qui a augmenté ses prévisions en raison d'une augmentation
-  de 8% de la production d'iPhone..."
-```
-
-**Ce qu'on ne traduit PAS :**
-- `brutalised` par article dans `news_raw` — ~30 × 717 = 4M+ chars, trop cher
-- Titres/sources articles Yahoo/Finnhub — données brutes, toujours EN
-
-**Fichiers à créer/modifier :**
-- `translation_service.py` (nouveau) → cascade FreeTheAI → DeepL → Groq ✅
-- Tous les prompts : `overview_service.py`, `digest_service.py`, `period_articles_service.py`, `bubble_service.py` → EN
-- `batch_fill_db.py` phase enrich → génère EN + appelle traduction → FR
-- `user_preferences` : ajouter colonne `lang TEXT DEFAULT 'fr'`
-- Frontend : toggle FR/EN dans `/profile`, résumés affichés selon `lang`
-
-**Ordre d'implémentation :**
-1. Migrations DB (ADD COLUMN `*_en` + `cause_en` + `lang` dans user_preferences)
-2. Créer `translation_service.py`
-3. Réécrire prompts en EN dans tous les services
-4. Adapter `batch_fill_db.py` : enrich US EN → puis EU+Asia EN+FR
-5. Frontend : toggle lang + affichage conditionnel des champs `_en` / `_fr`
-
-**Séquence enrichs :**
-```
-✅ En cours  : FR enrich US (~104 min)
-⏳ Ensuite   : EN enrich US (écrit ai_summary_en, pas de traduction car FR existe déjà)
-⏳ Puis      : EN+FR enrich EU (génère EN + traduit FR via FreeTheAI)
-⏳ Puis      : EN+FR enrich Asia (idem)
-```
+| AI Overview toggle FR/EN | 🔜 | EN affiché par défaut. Toggle FR dans profile : post-beta |
 
 ### Descriptions intelligentes des tickers (post-beta)
 
@@ -357,12 +329,12 @@ Après la beta, processer toutes les descriptions yfinance (`t.info["longBusines
 ## Supabase — Tables actives
 
 ```
-stock_news_cache        — cache news IA Yahoo (ticker PK, news_raw, ai_summary, ai_summary_24h, ai_summary_en, ai_summary_24h_en, ai_sentiment, ai_sentiment_24h, cached_at, ow7d_cached_at, website, generated_by_en, generated_by_fr, no_24h_news) — TTL 6h (24H) / 24h (7J)
+stock_news_cache        — cache news IA Yahoo (ticker PK, news_raw, ai_summary, ai_summary_24h, **ai_summary_en**, **ai_summary_24h_en**, ai_sentiment, ai_sentiment_24h, cached_at, ow7d_cached_at, website, generated_by_en, generated_by_fr, no_24h_news, articles_hash) — TTL **3h** (24H) / 24h (7J). EN served first.
 user_preferences        — préférences (user_id PK, currency, notify_email, notify_weekly, digest_tickers text[])
 pinned_stocks           — watchlist (user_id, ticker, company_name, pinned_at) — unique(user_id, ticker)
-daily_digest            — digest EOD (ticker, date, articles, summary, sentiment) — purge auto 30J
-event_causes            — causes AI événements chart (ticker, date PK, articles, cause) — permanent
-article_archive         — raw articles (ticker, year_month PK, articles JSONB, source: "finnhub"|"yahoo") — mois actif refresh 24h, passés permanent
+daily_digest            — digest EOD (ticker, date, summary, **summary_en**, sentiment) — purge auto 30J
+event_causes            — causes AI événements chart (ticker, date PK, articles, cause, **cause_en**) — permanent
+article_archive         — raw articles (ticker, year_month PK, articles JSONB, source: "finnhub"|"yahoo"|"mixed") — mois actif refresh 12h, passés permanent
 article_week_summaries  — résumé AI + top 10 articles par semaine (ticker, year_month, week_num PK, ai_summary, top_articles)
 article_month_summaries — résumé AI par mois (ticker, year_month PK, ai_summary) — généré depuis weekly summaries
 article_year_summaries  — résumé AI par année (ticker, year PK, ai_summary) — généré depuis monthly summaries
@@ -402,19 +374,29 @@ Fichier de référence : `backend/data/tickers.py`
 **Batch scraper** : `backend/scripts/batch_fill_db.py`
 ```bash
 # Scraping articles seulement (pas de LLM)
-python scripts/batch_fill_db.py --phase scrape
+python scripts/batch_fill_db.py --phase scrape --region US
 
 # OW + DUMB (Call 2 seulement en BATCH_MODE — skip OW 24H)
-python scripts/batch_fill_db.py --phase enrich
+python scripts/batch_fill_db.py --phase enrich --region US
 
-# Bubbles 6M+1Y (event_causes pré-générées — permanent)
+# Bubbles 6M+1Y (event_causes pré-générées — cause_en si LLM_LANG=en)
 python scripts/batch_fill_db.py --phase bubbles --region US
 
 # Tout (scrape + enrich)
 python scripts/batch_fill_db.py --phase all --region US
 
-# Reprend automatiquement où il s'est arrêté (batch_progress.json)
+# Reprend automatiquement — fichier auto-nommé par phase+region[+lang]
+# scrape  → batch_progress_scrape_{region}.json
+# enrich  → batch_progress_enrich_{region}_{lang}.json
+# bubbles → batch_progress_bubbles_{region}_{lang}.json
 ```
+
+**Sync progress depuis Supabase** : `backend/scripts/sync_progress.py`
+```bash
+python scripts/sync_progress.py           # recrée tous les fichiers progress depuis la DB
+python scripts/sync_progress.py --dry-run # affiche les counts sans écrire
+```
+Utile après une interruption ou pour recaler l'état local sur la DB réelle. Threshold bubbles_done = 8 causes non-null (min observé ~11 sur les tickers US FR).
 
 **Script one-shot websites** : `backend/scripts/populate_websites.py`
 ```bash
@@ -523,8 +505,11 @@ Lundi 3h    : weekly summary généré → purge si > 5 weeklies
 - Finnhub retourne des articles → `source: "finnhub"` → bootstrap immédiat 12 mois
 - Finnhub retourne 0 articles (hors US, small cap) → `source: "yahoo"` → accumulation daily via cron, historique construit sur 12 mois
 
-**Cron daily d'accumulation Yahoo** (tickers non couverts par Finnhub, pinnés ≥ 3 users) :
-- Fetch `get_news(count=100)` → compare par URL avec `article_archive` → insert uniquement les nouveaux articles
+**Cron Yahoo */6h** (tous pinnés ≥ 3 users) :
+- Fetch `get_news(count=100)` → `_dedup_by_headline` merge avec existant → source `"mixed"` si Finnhub déjà présent
+
+**Cron Finnhub */12h** (mois courant, tous pinnés ≥ 3 users) :
+- `_get_or_fetch_month()` → merge Finnhub + existant Yahoo → dedup headline → `ACTIVE_MONTH_TTL_HOURS = 12`
 
 **Cold start non-US :** 12 mois de run nécessaires avant d'avoir une année complète. Inévitable sans API payante.
 
@@ -543,10 +528,9 @@ Lundi 3h    : weekly summary généré → purge si > 5 weeklies
 - **Source** : `yfinance.Ticker(ticker).get_news(count=100)` · filtre summaries < 80 chars
 - **Filtre pertinence** : le LLM marque les articles hors-sujet "SKIP" → exclus du cache avant stockage. Si **tous** sont SKIP (ticker peu couvert) → fallback articles bruts (sans abrutis) plutôt qu'afficher 0 news.
 - **2 TTL indépendants — `overview_service.py` :**
-  - **Call 1 — OW 24H (TTL 6h)** : fetch Yahoo → détecte nouveaux articles (IDs pas encore en DB) → abrutis uniquement sur les nouveaux → OW 24H depuis abrutis <24h. Si `latest_news_id` inchangé → juste bump `cached_at`, 0 LLM. Si `articles_24h` vide → fallback "Aucune actualité 24h" + `_bench_context_line()` + OW 7J existant.
-  - **Call 2 — OW 7J (TTL 24h)** : lit abrutis déjà en DB (`news_raw`) → génère OW 7J via `_ow7d_from_abrutis()`. Pas de re-fetch, pas de re-abrutiage. Si pas d'abrutis (cold start) → full `_brutalise()` sur 30 articles.
-  - **Cold start (aucun cache)** : Call 1 + Call 2 s'enchaînent → Call 1 peuple `news_raw` avec abrutis → Call 2 lit ces abrutis → même comportement qu'avant.
-  - **BATCH_MODE=1** : Call 1 skippé (OW 24H expire vite), Call 2 seulement.
+  - **Call 1 — OW 24H + OW 7J (TTL 3h)** : fetch Yahoo → **LLM2** : skip si hash IDs inchangé (bump `cached_at`, 0 LLM) → brutalise nouveaux articles → OW 24H depuis abrutis <24h → **LLM4** : stocke aussi `ai_summary_en` (7J) depuis BRUTALIZE directement → `ow7d_cached_at = now`. Si `articles_24h` vide → fallback "No news 24h" + `_bench_context_line()` + OW 7J existant. TTL checks vérifient `ai_summary_24h_en` (EN) ou `ai_summary_24h` (FR) selon `LLM_LANG`.
+  - **Call 2 — OW 7J (BATCH_MODE=1 uniquement)** : lit abrutis en DB → `_ow7d_from_abrutis()`. Inactif en mode site (Call 1 couvre déjà le 7J).
+  - **Cold start (aucun cache)** : Call 1 seul → BRUTALIZE → stocke news_raw brutalised + OW 24H + OW 7J en un call.
 - **AI Overview affiché selon la période** : 24H → `summary_24h` (+ badge `AUCUNE NEWS 24H` si `no_24h_news`) · 1W → `summary` (7J) · 1M+ → pas d'overview Yahoo
 - **Cache logic** : `cached_at` = timestamp Call 1 · `ow7d_cached_at` = timestamp Call 2 — deux TTL indépendants dans `stock_news_cache`
 - **Hourly refresh** (cron :15 chaque heure) : pinned tickers + tickers visités dans les 6h avec `no_24h_news=True` → fetch Yahoo sans LLM → si ≥1 article 24h trouvé → `get_news()` complet (Call 1)

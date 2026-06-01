@@ -170,7 +170,14 @@ export default function ProfilePage() {
               {/* Daily email toggle */}
               <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "14px 18px", borderBottom: "1px solid var(--color-border)" }}>
                 <div>
-                  <div style={{ fontSize: "13px", fontWeight: 600, color: "var(--color-text-primary)" }}>Digest quotidien par email</div>
+                  <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                    <span style={{ fontSize: "13px", fontWeight: 600, color: "var(--color-text-primary)" }}>Digest quotidien par email</span>
+                    <span style={{
+                      padding: "1px 7px", borderRadius: "4px", fontSize: "9px", fontWeight: 700,
+                      fontFamily: "var(--font-mono)", letterSpacing: "0.06em", textTransform: "uppercase",
+                      background: "rgba(255,180,0,0.10)", color: "#C8960C",
+                    }}>Premium</span>
+                  </div>
                   <div style={{ fontSize: "12px", color: "var(--color-text-muted)", marginTop: "2px" }}>Un seul email EOD avec toutes tes actions</div>
                 </div>
                 <Toggle value={notifyEmail} onChange={handleNotifyEmail} />

@@ -20,7 +20,8 @@ import VideoModal from "../../components/VideoModal";
 import EventDrawer from "../../components/EventDrawer";
 import DogLoader from "../../components/DogLoader";
 import ColdStartBanner from "../../components/ColdStartBanner";
-import { NavBrand, BackButton, HEADER_STYLE, HEADER_INNER } from "../../components/Navbar";
+import { NavBrand, BackButton, Avatar, HEADER_STYLE, HEADER_INNER } from "../../components/Navbar";
+import type { User } from "../../lib/supabase";
 import type { Article } from "../../components/ArticleDrawer";
 import { sourceStyle } from "../../components/ArticleDrawer";
 
@@ -297,6 +298,7 @@ export default function StockPage() {
   const [isPinned, setIsPinned] = useState(false);
   const [pinLoading, setPinLoading] = useState(false);
   const [userId, setUserId] = useState<string | null>(null);
+  const [user, setUser] = useState<User | null>(null);
   const [periodArticles, setPeriodArticles] = useState<Article[]>([]);
   const [periodSummaries, setPeriodSummaries] = useState<{type: string; year_month?: string; year?: string; week_num?: number | null; label: string; ai_summary?: string | null; article_count?: number; top_articles?: Article[]; skewed?: boolean; skewed_range?: string}[]>([]);
   const [periodLoading, setPeriodLoading] = useState(false);
@@ -371,6 +373,7 @@ export default function StockPage() {
       const uid = data.user?.id;
       if (!uid) return;
       setUserId(uid);
+      setUser(data.user as User);
       const { data: pin } = await supa.from("pinned_stocks").select("ticker").eq("user_id", uid).eq("ticker", ticker.toUpperCase()).maybeSingle();
       setIsPinned(!!pin);
     });
@@ -596,18 +599,6 @@ export default function StockPage() {
             <NavBrand />
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
-            {stock?.website ? (
-              <img
-                src={`https://img.logo.dev/${stock.website}?token=${process.env.NEXT_PUBLIC_LOGODEV_TOKEN ?? ""}&size=40`}
-                alt={ticker ?? ""}
-                onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
-                style={{ width: "26px", height: "26px", borderRadius: "5px", objectFit: "contain", background: "#fff", flexShrink: 0 }}
-              />
-            ) : (
-              <span style={{ fontFamily: "var(--font-mono)", fontWeight: 700, fontSize: "13px", color: "var(--color-text-secondary)", letterSpacing: "0.04em" }}>
-                {ticker?.toUpperCase()}
-              </span>
-            )}
             <button
               onClick={() => setCurrency(currency === "USD" ? "EUR" : "USD")}
               style={{
@@ -619,6 +610,15 @@ export default function StockPage() {
             >
               {currency === "USD" ? "→ EUR" : "→ USD"}
             </button>
+            {user && (
+              <button
+                onClick={() => router.push("/profile")}
+                title={user.email ?? "Profile"}
+                style={{ background: "none", border: "none", cursor: "pointer", padding: 0, display: "flex" }}
+              >
+                <Avatar user={user} />
+              </button>
+            )}
           </div>
         </div>
       </header>

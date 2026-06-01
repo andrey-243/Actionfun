@@ -6,6 +6,7 @@ Overview service — deux TTL indépendants :
 
   BATCH_MODE=1 : Call 1 skippé (OW 24H expire vite), Call 2 seulement.
 """
+import hashlib
 import yfinance as yf
 import json
 import os
@@ -18,7 +19,7 @@ from services.llm_service import llm_json
 GROQ_HEAVY = "meta-llama/llama-4-scout-17b-16e-instruct"
 GROQ_LIGHT  = "llama-3.1-8b-instant"
 
-CACHE_TTL_24H_HOURS = 6   # Call 1 — OW 24H
+CACHE_TTL_24H_HOURS = 3   # Call 1 — OW 24H
 CACHE_TTL_7D_HOURS  = 24  # Call 2 — OW 7J
 MIN_SUMMARY_CHARS   = 80
 
@@ -329,10 +330,19 @@ def _ow24h_from_abrutis(ticker: str, articles_24h: list[dict], stock_context: st
     return llm_json([{"role": "user", "content": prompt}], groq_model=GROQ_LIGHT, max_tokens=500, timeout=25)
 
 
+# ─── LLM2 — hash articles ─────────────────────────────────────────────────────
+
+def _articles_hash(articles: list[dict]) -> str:
+    ids = sorted(a.get("id", "") for a in articles if a.get("id"))
+    return hashlib.md5(",".join(ids).encode()).hexdigest()[:16]
+
+
 # ─── TTL checks ───────────────────────────────────────────────────────────────
 
 def _needs_24h_refresh(row: dict | None, now: datetime) -> bool:
-    if not row or not row.get("ai_summary_24h"):
+    lang = os.environ.get("LLM_LANG", "en")
+    col = "ai_summary_24h_en" if lang == "en" else "ai_summary_24h"
+    if not row or not row.get(col):
         return True
     try:
         cached_at = datetime.fromisoformat(row["cached_at"].replace("Z", "+00:00"))
@@ -342,7 +352,9 @@ def _needs_24h_refresh(row: dict | None, now: datetime) -> bool:
 
 
 def _needs_7d_refresh(row: dict | None, now: datetime) -> bool:
-    if not row or not row.get("ai_summary"):
+    lang = os.environ.get("LLM_LANG", "en")
+    col = "ai_summary_en" if lang == "en" else "ai_summary"
+    if not row or not row.get(col):
         return True
     ow7d_str = row.get("ow7d_cached_at")
     if not ow7d_str:
@@ -354,15 +366,18 @@ def _needs_7d_refresh(row: dict | None, now: datetime) -> bool:
         return True
 
 
-# ─── Call 1 — DUMB + OW 24H (TTL 6h) ─────────────────────────────────────────
+# ─── Call 1 — DUMB + OW 24H (TTL 3h) ─────────────────────────────────────────
 
 def _call1_dumb_ow24h(ticker: str, fresh_articles: list[dict], row: dict | None,
                       supa, website: str | None, lang: str, now: datetime) -> dict:
     existing_raw = (row.get("news_raw") or []) if row else []
     existing_ids = {a.get("id", "") for a in existing_raw}
 
-    # Aucun nouvel article et latest_news_id inchangé → bump cached_at seulement
-    if existing_raw and fresh_articles and fresh_articles[0].get("id") == (row or {}).get("latest_news_id"):
+    # LLM2: skip brutalise si les articles n'ont pas changé depuis le dernier run
+    new_hash = _articles_hash(fresh_articles[:30])
+    cached_hash = (row or {}).get("articles_hash", "")
+    has_summary = bool((row or {}).get("ai_summary_24h") or (row or {}).get("ai_summary_24h_en"))
+    if existing_raw and cached_hash and cached_hash == new_hash and has_summary:
         update = {"cached_at": now.isoformat()}
         if website and not (row or {}).get("website"):
             update["website"] = website
@@ -422,6 +437,11 @@ def _call1_dumb_ow24h(ticker: str, fresh_articles: list[dict], row: dict | None,
             "no_24h_news": no_24h,
             "cached_at": now.isoformat(),
             "generated_by_en": llm_source,
+            "articles_hash": new_hash,
+            # LLM4: stocker le résumé 7J produit par BRUTALIZE → évite un call séparé
+            "ai_summary_en": ai_result.get("summary", ""),
+            "ai_sentiment": ai_result.get("sentiment", "NEUTRAL"),
+            "ow7d_cached_at": now.isoformat(),
         }
         if website:
             update["website"] = website
@@ -439,6 +459,12 @@ def _call1_dumb_ow24h(ticker: str, fresh_articles: list[dict], row: dict | None,
             "latest_news_id": merged[0]["id"] if merged else "",
             "website": website,
             "generated_by_fr": llm_source,
+            "articles_hash": new_hash,
+            # LLM4: stocker le résumé 7J produit par BRUTALIZE → évite un call séparé
+            "ai_summary": ai_result.get("summary", ""),
+            "ai_sentiment": ai_result.get("sentiment", "NEUTRAL"),
+            "ai_sentiment_reason": ai_result.get("sentiment_reason", ""),
+            "ow7d_cached_at": now.isoformat(),
         }
         supa.table("stock_news_cache").upsert(update).execute()
         return {**(row or {}), **update}
@@ -500,16 +526,12 @@ def _call2_ow7d(ticker: str, fresh_articles: list[dict], row: dict | None,
 
 def get_news(ticker: str, lang: str = None) -> dict:
     ticker = ticker.upper()
-    lang = lang or os.environ.get("LLM_LANG", "fr")
+    lang = lang or os.environ.get("LLM_LANG", "en")
     batch_mode = os.environ.get("BATCH_MODE") == "1"
     supa = _get_supabase()
 
     cache = supa.table("stock_news_cache").select("*").eq("ticker", ticker).limit(1).execute()
     row = cache.data[0] if cache.data else None
-
-    # EN : servi depuis cache une fois généré (pas de re-expiration)
-    if lang == "en" and row and row.get("ai_summary_en"):
-        return _build_response(ticker, row.get("news_raw") or [], row)
 
     now = datetime.now(timezone.utc)
     needs_24h = _needs_24h_refresh(row, now) and not batch_mode
@@ -548,10 +570,10 @@ def _build_response(ticker: str, articles: list, row: dict) -> dict:
     return {
         "ticker": ticker,
         "articles": articles,
-        "summary": row.get("ai_summary", "") or row.get("ai_summary_en", ""),
+        "summary": row.get("ai_summary_en", "") or row.get("ai_summary", ""),
         "sentiment": row.get("ai_sentiment", "NEUTRAL"),
         "sentiment_reason": row.get("ai_sentiment_reason", ""),
-        "summary_24h": row.get("ai_summary_24h", "") or row.get("ai_summary_24h_en", ""),
+        "summary_24h": row.get("ai_summary_24h_en", "") or row.get("ai_summary_24h", ""),
         "sentiment_24h": row.get("ai_sentiment_24h", "NEUTRAL"),
         "sentiment_reason_24h": row.get("ai_sentiment_reason_24h", ""),
         "no_24h_news": row.get("no_24h_news", False),
@@ -561,6 +583,33 @@ def _build_response(ticker: str, articles: list, row: dict) -> dict:
 
 
 # ─── Cron hourly refresh ──────────────────────────────────────────────────────
+
+def _maybe_regen_weekly(ticker: str, supa, logger) -> None:
+    """Si le résumé IA de la semaine courante est absent, le génère (1 call LLM max/semaine/ticker)."""
+    try:
+        now = datetime.now(timezone.utc)
+        current_ym = now.strftime("%Y-%m")
+        day = now.day
+        current_wnum = 1 if day <= 7 else 2 if day <= 14 else 3 if day <= 21 else 4
+        row = (
+            supa.table("article_week_summaries")
+            .select("year_month, week_num, ai_summary")
+            .eq("ticker", ticker)
+            .order("year_month", desc=True)
+            .order("week_num", desc=True)
+            .limit(1)
+            .maybe_single()
+            .execute()
+        )
+        if row and row.data and row.data.get("ai_summary") \
+                and row.data["year_month"] == current_ym and row.data["week_num"] == current_wnum:
+            return  # résumé de la semaine courante déjà là
+        from services.period_articles_service import get_weekly_ondemand
+        get_weekly_ondemand(ticker)
+        logger.info(f"[hourly_refresh] ✓ weekly regen {ticker} W{current_wnum} {current_ym}")
+    except Exception as e:
+        logger.warning(f"[hourly_refresh] weekly regen {ticker}: {e}")
+
 
 def run_hourly_news_refresh():
     """
@@ -602,5 +651,6 @@ def run_hourly_news_refresh():
                 continue
             get_news(ticker)
             logger.info(f"[hourly_refresh] ✓ {ticker} — {len(articles_24h)} articles 24h")
+            _maybe_regen_weekly(ticker, supa, logger)
         except Exception as e:
             logger.warning(f"[hourly_refresh] ✗ {ticker}: {e}")

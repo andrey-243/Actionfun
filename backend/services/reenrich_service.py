@@ -65,14 +65,14 @@ def _reenrich_news_cache(supa) -> bool:
     rows = (
         supa.table("stock_news_cache")
         .select("ticker, news_raw, generated_by_fr, generated_by_en")
-        .or_("generated_by_fr.eq.groq,generated_by_en.eq.groq")
+        .or_("generated_by_fr.eq.groq,generated_by_en.eq.groq,ai_summary_en.is.null")
         .limit(50)
         .execute()
     )
     if not rows.data:
         return True
 
-    logger.info(f"[reenrich] news_cache: {len(rows.data)} tickers Groq à re-enrichir")
+    logger.info(f"[reenrich] news_cache: {len(rows.data)} tickers à re-enrichir (Groq ou EN manquant)")
 
     for row in rows.data:
         if not _freetheai_ok():
@@ -96,14 +96,14 @@ def _reenrich_weekly(supa) -> bool:
     rows = (
         supa.table("article_week_summaries")
         .select("ticker, year_month, week_num, top_articles, article_count")
-        .eq("llm_source", "groq")
+        .or_("llm_source.eq.groq,ai_summary_en.is.null")
         .limit(30)
         .execute()
     )
     if not rows.data:
         return True
 
-    logger.info(f"[reenrich] weekly: {len(rows.data)} semaines Groq à re-enrichir")
+    logger.info(f"[reenrich] weekly: {len(rows.data)} semaines à re-enrichir (Groq ou EN manquant)")
 
     from services.period_articles_service import (
         _llm_call, WEEK_CONDENSE_PROMPT_EN, _week_label, _summary_col,

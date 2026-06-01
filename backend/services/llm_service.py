@@ -4,7 +4,7 @@ Cascade LLM : FreeTheAI (primary → secondary) → Hapuppy → Groq
 Logique :
   1. bbl/gpt-4.1 (FreeTheAI primary)
   2. bbl/gpt-5.4-mini (FreeTheAI secondary) — si 502/503/timeout sur #1
-  3. Hapuppy deepseek-v3.2 — si FreeTheAI 403/429/daily limit
+  3. Hapuppy deepseek-v3.2 — circuit breaker : 3 échecs → freeze 3h → fallback gpt-4.1-mini
   4. Groq — fallback final
 """
 
@@ -57,12 +57,28 @@ GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 FREETHEAI_PRIMARY = "bbl/gpt-4.1"
 FREETHEAI_SECONDARY = "bbl/gpt-5.4-mini"
-HAPUPPY_MODEL = "deepseek-v3.2"
+HAPUPPY_MODEL = "gpt-4.1-mini"
+HAPUPPY_FALLBACK_MODEL = "gpt-4.1-mini"
+HAPUPPY_FAIL_THRESHOLD = 3   # échecs consécutifs avant freeze
+HAPUPPY_FREEZE_SECONDS = 10800  # 3h
 
 # Désactive FreeTheAI jusqu'au prochain minuit UTC quand checkin manquant
 _freetheai_skip_until: datetime | None = None
 _freetheai_last_attempt: float = 0.0
 FREETHEAI_MIN_INTERVAL = float(os.environ.get("FREETHEAI_MIN_INTERVAL", "6.0"))  # 10 RPM → 6s min
+
+# Circuit breaker FreeTheAI timeout — même logique que Hapuppy
+_freetheai_timeout_count: int = 0
+_freetheai_timeout_freeze_until: float | None = None  # monotonic timestamp
+FREETHEAI_TIMEOUT_THRESHOLD = 2    # timeouts consécutifs avant freeze
+FREETHEAI_TIMEOUT_FREEZE_SECONDS = 7200  # 2h
+
+# Circuit breaker Hapuppy deepseek
+# States : None=CLOSED · float(future)=OPEN · float(past)=HALF-OPEN (probe)
+_hapuppy_fail_count: int = 0
+_hapuppy_freeze_until: float | None = None  # monotonic timestamp
+_hapuppy_last_attempt: float = 0.0
+HAPUPPY_MIN_INTERVAL = float(os.environ.get("HAPUPPY_MIN_INTERVAL", "0.6"))  # 100 RPM → 0.6s min
 
 # Throttle notifs Groq/Hapuppy — 1 ping par raison toutes les 30 min max
 _notif_sent_at: dict[str, float] = {}
@@ -80,13 +96,17 @@ class GroqExhaustedError(RuntimeError):
 
 
 _CASCADE_HEADERS = {
-    "checkin":        "🔴 *FreeTheAI — checkin Discord manquant*\nFais `/checkin` pour débloquer. Reset à minuit UTC.",
-    "daily_limit":    "🔴 *FreeTheAI — quota journalier épuisé*\nReset automatique à minuit UTC.",
-    "rpm_429":        "🟡 *FreeTheAI — rate limit (429 RPM)*",
-    "502_timeout":    "🟠 *FreeTheAI — injoignable (502/timeout)*",
-    "groq_exhausted": "🔴 *Groq — quota daily épuisé*\nBatch arrêté proprement. Reset à minuit UTC.",
-    "hapuppy_down":"🟠 *Hapuppy — down (502/timeout)*\nVérifier les crédits Hapuppy.",
-    "all_failed":  "🔴 *Tous les LLM en échec*",
+    "checkin":              "🔴 *FreeTheAI — checkin Discord manquant*\nFais `/checkin` pour débloquer. Reset à minuit UTC.",
+    "daily_limit":          "🔴 *FreeTheAI — quota journalier épuisé*\nReset automatique à minuit UTC.",
+    "rpm_429":              "🟡 *FreeTheAI — rate limit (429 RPM)*",
+    "502_timeout":          "🟠 *FreeTheAI — injoignable (502/timeout)*",
+    "freetheai_timeout_frozen": f"🔴 *FreeTheAI — circuit breaker timeout* ({FREETHEAI_TIMEOUT_THRESHOLD} timeouts consécutifs)\nSkip FreeTheAI 2h. Probe auto après.",
+    "groq_exhausted":       "🔴 *Groq — quota daily épuisé*\nBatch arrêté proprement. Reset à minuit UTC.",
+    "hapuppy_down":         "🟠 *Hapuppy — down (502/timeout)*\nVérifier les crédits Hapuppy.",
+    "hapuppy_dsk_frozen":   f"🔴 *Hapuppy deepseek-v3.2 — circuit breaker déclenché* ({HAPUPPY_FAIL_THRESHOLD} échecs consécutifs)\nFallback: {HAPUPPY_FALLBACK_MODEL}. Recheck dans 3h.",
+    "hapuppy_dsk_still_down": f"🟠 *Hapuppy deepseek-v3.2 — toujours down* (probe échoué)\nRecheck dans 3h.",
+    "hapuppy_dsk_back":     "✅ *Hapuppy deepseek-v3.2 — réactivé*\nCircuit breaker reset.",
+    "all_failed":           "🔴 *Tous les LLM en échec*",
 }
 
 
@@ -102,12 +122,21 @@ def _send_cascade_notif(reason: str, trail: list[str]) -> None:
 
 
 def _freetheai_available() -> bool:
-    global _freetheai_skip_until, _freetheai_last_attempt
+    global _freetheai_skip_until, _freetheai_last_attempt, _freetheai_timeout_freeze_until, _freetheai_timeout_count
     if _freetheai_skip_until is not None:
         if datetime.now(timezone.utc) >= _freetheai_skip_until:
             _freetheai_skip_until = None
         else:
             return False
+    # Circuit breaker timeout : freeze 2h après 2 timeouts consécutifs
+    if _freetheai_timeout_freeze_until is not None:
+        now_mono = time.monotonic()
+        if now_mono < _freetheai_timeout_freeze_until:
+            return False
+        else:
+            # Probe : reset le freeze, on retente
+            _freetheai_timeout_freeze_until = None
+            _freetheai_timeout_count = 0
     # Respecter le RPM : si dernier appel < 6s → skip sans sleep (Groq prend le relais)
     if time.monotonic() - _freetheai_last_attempt < FREETHEAI_MIN_INTERVAL:
         return False
@@ -115,10 +144,9 @@ def _freetheai_available() -> bool:
 
 
 def _next_utc_midnight() -> datetime:
+    from datetime import timedelta
     now = datetime.now(timezone.utc)
-    return now.replace(hour=0, minute=0, second=0, microsecond=0).replace(
-        day=now.day + 1
-    )
+    return (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
 
 
 def _is_checkin_error(r: httpx.Response) -> bool:
@@ -211,34 +239,101 @@ def llm_call(
 
             except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError) as e:
                 trail.append(f"FreeTheAI `{model}` : ✗ timeout/connexion")
+                global _freetheai_timeout_count, _freetheai_timeout_freeze_until
+                _freetheai_timeout_count += 1
+                if _freetheai_timeout_count >= FREETHEAI_TIMEOUT_THRESHOLD:
+                    _freetheai_timeout_freeze_until = time.monotonic() + FREETHEAI_TIMEOUT_FREEZE_SECONDS
+                    _freetheai_timeout_count = 0
+                    _send_cascade_notif("freetheai_timeout_frozen", trail)
                 continue
     else:
         trail.append("FreeTheAI : ⏭ skipped (checkin/quota/RPM)")
 
-    # ── Hapuppy tertiary — happy endpoint, pas de quota partagé ──────────────
+    # ── Hapuppy — circuit breaker deepseek-v3.2 → fallback gpt-4.1-mini ────────
+    # Ordre dans ce bloc : deepseek (si pas frozen) → gpt-4.1-mini → Groq
     hapuppy_key = os.environ.get("HAPUPPY_API_KEY", "")
     if hapuppy_key:
+        global _hapuppy_fail_count, _hapuppy_freeze_until, _hapuppy_last_attempt
+        now_mono = time.monotonic()
+
+        # Throttle 100 RPM : si dernier appel < 0.6s → skip vers Groq
+        if now_mono - _hapuppy_last_attempt < HAPUPPY_MIN_INTERVAL:
+            trail.append("Hapuppy : ⏭ skipped (RPM throttle)")
+            hapuppy_key = ""  # force skip du bloc entier
+
+        # ── Tentative deepseek (CLOSED ou HALF-OPEN probe) ──
+        dsk_frozen = _hapuppy_freeze_until is not None and now_mono < _hapuppy_freeze_until
+        is_probe   = _hapuppy_freeze_until is not None and now_mono >= _hapuppy_freeze_until
+
+        if not dsk_frozen:
+            dsk_ok = False
+            try:
+                _hapuppy_last_attempt = time.monotonic()
+                r = httpx.post(
+                    HAPUPPY_URL,
+                    headers={"Authorization": f"Bearer {hapuppy_key}", "Content-Type": "application/json"},
+                    json={**payload_base, "model": HAPUPPY_MODEL},
+                    timeout=timeout,
+                )
+                if r.status_code == 200:
+                    dsk_ok = True
+                    result = r.json()
+                    u = result.get("usage", {})
+                    _log_usage(HAPUPPY_MODEL, u.get("prompt_tokens", 0), u.get("completion_tokens", 0))
+                    # Reset circuit breaker sur succès
+                    if is_probe or _hapuppy_fail_count > 0:
+                        _hapuppy_fail_count = 0
+                        _hapuppy_freeze_until = None
+                        if is_probe:
+                            trail.append(f"Hapuppy `{HAPUPPY_MODEL}` : ✓ (probe — réactivé)")
+                            _send_cascade_notif("hapuppy_dsk_back", trail)
+                    result["_llm_source"] = "hapuppy"
+                    _last_llm_source = "hapuppy"
+                    trail.append(f"Hapuppy `{HAPUPPY_MODEL}` : ✓")
+                    _send_cascade_notif(groq_reason, trail)
+                    return result
+                else:
+                    trail.append(f"Hapuppy `{HAPUPPY_MODEL}` : ✗ {r.status_code}")
+            except Exception:
+                trail.append(f"Hapuppy `{HAPUPPY_MODEL}` : ✗ timeout/connexion")
+
+            if not dsk_ok:
+                # Incrémenter le compteur d'échecs deepseek
+                if is_probe:
+                    _hapuppy_freeze_until = time.monotonic() + HAPUPPY_FREEZE_SECONDS
+                    _send_cascade_notif("hapuppy_dsk_still_down", trail)
+                else:
+                    _hapuppy_fail_count += 1
+                    if _hapuppy_fail_count >= HAPUPPY_FAIL_THRESHOLD:
+                        _hapuppy_freeze_until = time.monotonic() + HAPUPPY_FREEZE_SECONDS
+                        _send_cascade_notif("hapuppy_dsk_frozen", trail)
+
+        else:
+            trail.append(f"Hapuppy `{HAPUPPY_MODEL}` : ⏭ frozen (circuit breaker)")
+
+        # ── Fallback gpt-4.1-mini sur hapuppy ──
         try:
+            _hapuppy_last_attempt = time.monotonic()
             r = httpx.post(
                 HAPUPPY_URL,
                 headers={"Authorization": f"Bearer {hapuppy_key}", "Content-Type": "application/json"},
-                json={**payload_base, "model": HAPUPPY_MODEL},
+                json={**payload_base, "model": HAPUPPY_FALLBACK_MODEL},
                 timeout=timeout,
             )
             if r.status_code == 200:
                 result = r.json()
-                result["_llm_source"] = "hapuppy"
-                _last_llm_source = "hapuppy"
                 u = result.get("usage", {})
-                _log_usage(HAPUPPY_MODEL, u.get("prompt_tokens", 0), u.get("completion_tokens", 0))
-                trail.append(f"Hapuppy `{HAPUPPY_MODEL}` : ✓")
+                _log_usage(HAPUPPY_FALLBACK_MODEL, u.get("prompt_tokens", 0), u.get("completion_tokens", 0))
+                result["_llm_source"] = "hapuppy_mini"
+                _last_llm_source = "hapuppy_mini"
+                trail.append(f"Hapuppy `{HAPUPPY_FALLBACK_MODEL}` : ✓")
                 _send_cascade_notif(groq_reason, trail)
                 return result
-            groq_reason = "hapuppy_down"
-            trail.append(f"Hapuppy `{HAPUPPY_MODEL}` : ✗ {r.status_code}")
+            trail.append(f"Hapuppy `{HAPUPPY_FALLBACK_MODEL}` : ✗ {r.status_code}")
         except Exception:
-            groq_reason = "hapuppy_down"
-            trail.append(f"Hapuppy `{HAPUPPY_MODEL}` : ✗ timeout/connexion")
+            trail.append(f"Hapuppy `{HAPUPPY_FALLBACK_MODEL}` : ✗ timeout/connexion")
+
+        groq_reason = "hapuppy_down"
 
     # ── Groq (fallback final) ──────────────────────────────────────────────────
     # TODO PROD : réactiver la restriction BATCH_MODE pour préserver le quota Groq prod

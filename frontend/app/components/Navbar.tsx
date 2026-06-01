@@ -57,7 +57,7 @@ function DogLogo() {
   );
 }
 
-function Avatar({ user }: { user: User }) {
+export function Avatar({ user }: { user: User }) {
   const avatarUrl = (user.user_metadata as Record<string, string> | undefined)?.avatar_url;
   const initial = user.email?.[0]?.toUpperCase() ?? "?";
   const [imgError, setImgError] = useState(false);

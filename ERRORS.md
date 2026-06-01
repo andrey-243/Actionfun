@@ -176,3 +176,40 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON public.pinned_stocks TO anon;
 3. `FREETHEAI_DELAY=17s` dans le batch est suffisant pour respecter le RPM (10 RPM, 1 concurrent).
 
 **Règle** : Avant tout batch FreeTheAI, vérifier `ps aux | grep python` et killer tout processus concurrent utilisant la même clé API.
+
+---
+
+## 2026-05-31 · Batch bubbles — cause=null comptée comme succès
+
+**Symptôme** : Le batch affichait `✓ ABBV — 20 bubbles générées` et marquait le ticker `done` dans `batch_progress.json`, mais les 264 rows en DB avaient `cause=null`. Hapuppy était en 502, Groq reçu comme down → `get_event_news()` upsertait la row avec `cause=null` et retournait `{"cause": None}`. Le batch ne vérifiait pas `result.get("cause")`.
+
+**Tickers affectés** : ABBV, AMGN, APO, ARES, BMY, BR, CME, FDS, GILD, ICE, JNJ, LLY, MCO, MRK, MSCI, NDAQ, NET, PFE, REGN, SPGI, TSLA, UNH (22 tickers, 264 rows).
+
+**Fix batch** : `phase_bubbles` compte maintenant `ticker_total` (tous les appels) et `ticker_events` (cause non-null seulement). Si `null_count > 0` → log `⚠` + ticker **pas** ajouté à `bubbles_done` → sera retenté au prochain run.
+
+**Fix DB** : 264 rows null supprimées + 21 tickers retirés de `bubbles_done` via script one-shot.
+
+**Règle** : Toujours vérifier `result.get("cause")` avant de compter un succès LLM dans un batch.
+
+---
+
+## 2026-05-31 · Nouveau champ upsert Supabase — colonne manquante en DB
+
+**Symptôme** : `PGRST204 — Could not find the 'articles_hash' column of 'stock_news_cache' in the schema cache` → 500 sur `/api/news/{ticker}` → "Failed to fetch" côté frontend.
+
+**Cause** : LLM2 ajoute `articles_hash` dans le payload upsert de `_call1_dumb_ow24h`, mais la colonne n'avait pas été créée dans la table `stock_news_cache`. PostgREST rejette tout upsert qui référence un champ absent du schéma.
+
+**Fix** :
+```sql
+ALTER TABLE stock_news_cache ADD COLUMN IF NOT EXISTS articles_hash TEXT;
+NOTIFY pgrst, 'reload schema';
+```
+
+Le `NOTIFY` peut être envoyé via l'API management Supabase si le SQL Editor ne suffit pas :
+```python
+httpx.post(f'https://api.supabase.com/v1/projects/{ref}/database/query',
+           headers={'Authorization': f'Bearer {mgmt_token}'},
+           json={'query': "NOTIFY pgrst, 'reload schema';"})
+```
+
+**Règle** : Quand on ajoute un champ à un upsert Supabase, créer la colonne DB en même temps (`ALTER TABLE ... ADD COLUMN IF NOT EXISTS`). Ne pas laisser la migration DB pour après.
