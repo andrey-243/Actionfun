@@ -1,29 +1,35 @@
 from fastapi import APIRouter, HTTPException, Query
 from services.digest_service import generate_digest_for_ticker
 from supabase import create_client
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import os
 
 router = APIRouter()
 
 
-def _articles_from_cache(supa, ticker: str) -> list[dict]:
-    """Lit news_raw depuis stock_news_cache et retourne les articles < 48h triés par date desc."""
-    row = supa.table("stock_news_cache").select("news_raw").eq("ticker", ticker).maybe_single().execute()
-    if not row or not row.data:
-        return []
-    cutoff = datetime.now(timezone.utc).timestamp() - 48 * 3600
+def _articles_from_archive(supa, ticker: str, hours: int = 48) -> list[dict]:
+    """Lit articles depuis articles_merged_finn_yahoo pour la fenêtre demandée."""
+    now = datetime.now(timezone.utc)
+    cutoff_ts = int((now.timestamp()) - hours * 3600)
+    year_months = {now.strftime("%Y-%m")}
+    if now.day <= (hours // 24 + 1):
+        prev = now.replace(day=1) - timedelta(days=1)
+        year_months.add(prev.strftime("%Y-%m"))
+
+    raw = []
+    for ym in sorted(year_months):
+        r = supa.table("articles_merged_finn_yahoo").select("articles") \
+            .eq("ticker", ticker).eq("year_month", ym).maybe_single().execute()
+        if r and r.data and r.data.get("articles"):
+            raw.extend(r.data["articles"])
+
     articles = []
-    for a in (row.data.get("news_raw") or []):
-        try:
-            pub = a.get("pub_date", "")
-            ts = datetime.fromisoformat(pub.replace("Z", "+00:00")).timestamp() if pub else float(a.get("datetime", 0) or 0)
-            if not ts or ts < cutoff:
-                continue
-        except Exception:
+    for a in raw:
+        ts = a.get("datetime", 0)
+        if not ts or ts < cutoff_ts:
             continue
         articles.append({
-            "headline": a.get("title", "") or a.get("headline", ""),
+            "headline": a.get("headline", ""),
             "source": a.get("source", ""),
             "url": a.get("url", ""),
             "datetime": int(ts),
@@ -48,35 +54,24 @@ async def digest(ticker: str, date: str = Query(default=None), force: bool = Que
             result["summary"] = result["summary_en"]
         # Fallback : si le digest n'a pas d'articles, les lire directement depuis le cache
         if not result.get("articles"):
-            result["articles"] = _articles_from_cache(supa, t)
+            result["articles"] = _articles_from_archive(supa, t, hours=48)
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-def _week_articles_from_cache(supa, ticker: str) -> list[dict]:
-    """Retourne les articles de stock_news_cache.news_raw des 7 derniers jours, triés desc."""
-    row = supa.table("stock_news_cache").select("news_raw").eq("ticker", ticker).maybe_single().execute()
-    if not row or not row.data:
-        return []
-    cutoff = datetime.now(timezone.utc).timestamp() - 7 * 24 * 3600
-    articles = []
-    for a in (row.data.get("news_raw") or []):
-        try:
-            pub = a.get("pub_date", "")
-            ts = datetime.fromisoformat(pub.replace("Z", "+00:00")).timestamp() if pub else float(a.get("datetime", 0) or 0)
-            if not ts or ts < cutoff:
-                continue
-        except Exception:
-            continue
-        articles.append({
-            "title": a.get("title", "") or a.get("headline", ""),
+def _week_articles_from_archive(supa, ticker: str) -> list[dict]:
+    """Retourne les articles de articles_merged_finn_yahoo des 7 derniers jours, triés desc."""
+    raw = _articles_from_archive(supa, ticker, hours=7 * 24)
+    return [
+        {
+            "title": a.get("headline", ""),
             "source": a.get("source", ""),
             "url": a.get("url", ""),
-            "pub_date": datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(),
-        })
-    articles.sort(key=lambda x: x["pub_date"], reverse=True)
-    return articles[:20]
+            "pub_date": datetime.fromtimestamp(a["datetime"], tz=timezone.utc).isoformat(),
+        }
+        for a in raw[:20]
+    ]
 
 
 @router.get("/weekly/{ticker}")
@@ -96,7 +91,7 @@ async def weekly(ticker: str):
         )
         cache = supa.table("stock_news_cache").select("website").eq("ticker", t).maybe_single().execute()
         website = (cache.data or {}).get("website") if cache else None
-        current_articles = _week_articles_from_cache(supa, t)
+        current_articles = _week_articles_from_archive(supa, t)
 
         row_data = (row.data or {}) if row and row.data else {}
         ai_summary = row_data.get("ai_summary_en") or row_data.get("ai_summary", "")

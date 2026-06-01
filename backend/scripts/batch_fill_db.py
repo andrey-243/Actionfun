@@ -1,5 +1,5 @@
 """
-Batch scraper — remplit article_archive pour 717 tickers (US + EU + Asie).
+Batch scraper — remplit articles_merged_finn_yahoo pour 717 tickers (US + EU + Asie).
 
 Usage :
   python scripts/batch_fill_db.py --phase scrape          # articles seulement
@@ -195,11 +195,11 @@ def fetch_yahoo_news(ticker: str) -> list[dict]:
         return []
 
 
-# ─── Stockage article_archive ─────────────────────────────────────────────────
+# ─── Stockage articles_merged_finn_yahoo ─────────────────────────────────────────────────
 
 def store_articles(ticker: str, articles: list[dict], source: str, supa):
     """
-    Répartit les articles par year_month et upsert dans article_archive.
+    Répartit les articles par year_month et upsert dans articles_merged_finn_yahoo.
     Garde max 50 articles par year_month (les plus récents).
     """
     by_month: dict[str, list[dict]] = {}
@@ -214,7 +214,7 @@ def store_articles(ticker: str, articles: list[dict], source: str, supa):
     inserted = 0
     for ym, month_articles in by_month.items():
         # Lire existant pour dédupliquer
-        row = supa.table("article_archive") \
+        row = supa.table("articles_merged_finn_yahoo") \
             .select("articles") \
             .eq("ticker", ticker) \
             .eq("year_month", ym) \
@@ -230,7 +230,7 @@ def store_articles(ticker: str, articles: list[dict], source: str, supa):
 
         merged = sorted(existing + new_ones, key=lambda a: a.get("datetime", 0), reverse=True)[:50]
 
-        supa.table("article_archive").upsert({
+        supa.table("articles_merged_finn_yahoo").upsert({
             "ticker":     ticker,
             "year_month": ym,
             "articles":   merged,
@@ -442,7 +442,7 @@ def phase_bubbles(tickers: list[str], region: str = "all"):
 
     supa = _supa()
     progress = load_progress()
-    done = set(progress.get("bubbles_done", []))
+    done = set(progress.get("bubbles_done", [])) | set(progress.get("bubbles_no_data", []))
     todo = [t for t in tickers if t not in done]
     total = len(todo)
 
@@ -508,7 +508,10 @@ def phase_bubbles(tickers: list[str], region: str = "all"):
                 batch_skipped_tickers.append(f"{ticker}×{len(ticker_skipped)}")
                 logger.info(f"  ⏭ {ticker} — {len(ticker_skipped)} dates sans articles: {', '.join(ticker_skipped)}")
 
-            if null_count == 0:
+            if ticker_total == 0:
+                logger.info(f"  ⏭ {ticker} — 0 bubbles avec articles → bubbles_no_data")
+                progress.setdefault("bubbles_no_data", []).append(ticker)
+            elif null_count == 0:
                 logger.info(f"  ✓ {ticker} — {ticker_events} bubbles avec cause")
                 progress.setdefault("bubbles_done", []).append(ticker)
             else:

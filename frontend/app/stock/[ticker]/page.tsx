@@ -268,9 +268,9 @@ function NewsCard({ article, onClick }: { article: Article; onClick: () => void 
         <div style={{ fontSize: "13px", fontWeight: 600, color: "var(--color-text-primary)", lineHeight: 1.4, marginBottom: "6px" }}>
           {article.title}
         </div>
-        {article.brutalised && (
+        {(article.dumb_en || article.dumb_fr) && (
           <div style={{ fontSize: "12px", color: "var(--color-accent)", lineHeight: 1.5 }}>
-            {article.brutalised}
+            {article.dumb_en || article.dumb_fr}
           </div>
         )}
       </div>
@@ -570,7 +570,7 @@ export default function StockPage() {
       }
       const result: Article[] = [];
       for (const key of Object.keys(slots).map(Number).sort((a, b) => b - a)) {
-        const bucket = slots[key].sort((a, b) => (b.brutalised?.length ?? 0) - (a.brutalised?.length ?? 0));
+        const bucket = slots[key].sort((a, b) => ((b.dumb_en || b.dumb_fr)?.length ?? 0) - ((a.dumb_en || a.dumb_fr)?.length ?? 0));
         result.push(...bucket.slice(0, 3));
       }
       return result;

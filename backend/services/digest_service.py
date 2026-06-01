@@ -91,7 +91,7 @@ def _fetch_from_yahoo_cache(ticker: str, supa) -> dict | None:
     Si absent, déclenche un refresh actif via overview_service."""
     row = (
         supa.table("stock_news_cache")
-        .select("ai_summary_24h, ai_summary_24h_en, ai_sentiment_24h, news_raw")
+        .select("ai_summary_24h, ai_summary_24h_en, ai_sentiment_24h")
         .eq("ticker", ticker)
         .maybe_single()
         .execute()
@@ -103,7 +103,7 @@ def _fetch_from_yahoo_cache(ticker: str, supa) -> dict | None:
             get_news(ticker)
             row = (
                 supa.table("stock_news_cache")
-                .select("ai_summary_24h, ai_summary_24h_en, ai_sentiment_24h, news_raw")
+                .select("ai_summary_24h, ai_summary_24h_en, ai_sentiment_24h")
                 .eq("ticker", ticker)
                 .maybe_single()
                 .execute()
@@ -113,21 +113,22 @@ def _fetch_from_yahoo_cache(ticker: str, supa) -> dict | None:
     if not row or not row.data or not (row.data.get("ai_summary_24h_en") or row.data.get("ai_summary_24h")):
         return None
 
-    cutoff = (datetime.now(timezone.utc).timestamp()) - 86400
+    # Articles depuis articles_merged_finn_yahoo — dernières 24h
+    cutoff_ts = int(datetime.now(timezone.utc).timestamp()) - 86400
+    now = datetime.now(timezone.utc)
+    year_months = {now.strftime("%Y-%m")}
+    raw = []
+    for ym in sorted(year_months):
+        r = supa.table("articles_merged_finn_yahoo").select("articles") \
+            .eq("ticker", ticker).eq("year_month", ym).maybe_single().execute()
+        if r and r.data and r.data.get("articles"):
+            raw.extend(r.data["articles"])
+
     articles = []
-    for a in (row.data.get("news_raw") or []):
-        try:
-            pub = a.get("pub_date", "")
-            if pub:
-                ts = datetime.fromisoformat(pub.replace("Z", "+00:00")).timestamp()
-            else:
-                ts = float(a.get("datetime", 0) or 0)
-            if not ts:
-                continue
-        except Exception:
-            continue
-        if ts >= cutoff:
-            articles.append({"headline": a.get("title", "") or a.get("headline", ""), "source": a.get("source", ""), "url": a.get("url", ""), "datetime": int(ts)})
+    for a in raw:
+        ts = a.get("datetime", 0)
+        if ts and ts >= cutoff_ts:
+            articles.append({"headline": a.get("headline", ""), "source": a.get("source", ""), "url": a.get("url", ""), "datetime": int(ts)})
 
     summary = row.data.get("ai_summary_24h_en") or row.data.get("ai_summary_24h", "")
     return {

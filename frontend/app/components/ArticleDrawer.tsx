@@ -7,7 +7,8 @@ export interface Article {
   type: string;
   title: string;
   summary: string;
-  brutalised?: string;
+  dumb_en?: string;
+  dumb_fr?: string;
   source: string;
   url: string;
   thumbnail: string;
@@ -176,8 +177,8 @@ export default function ArticleDrawer({ article, onClose }: Props) {
                 {article.title}
               </h2>
 
-              {/* AI Brutalised */}
-              {article.brutalised && (
+              {/* AI Dumb */}
+              {(article.dumb_en || article.dumb_fr) && (
                 <div
                   style={{
                     background: "var(--color-accent-light)",
@@ -208,7 +209,7 @@ export default function ArticleDrawer({ article, onClose }: Props) {
                     </span>
                   </div>
                   <p style={{ fontSize: "13px", color: "var(--color-text-primary)", lineHeight: 1.6, margin: 0 }}>
-                    {article.brutalised}
+                    {article.dumb_en || article.dumb_fr}
                   </p>
                 </div>
               )}

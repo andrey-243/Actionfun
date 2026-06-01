@@ -59,8 +59,6 @@ GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 FREETHEAI_PRIMARY = "bbl/gpt-4.1"
 FREETHEAI_SECONDARY = "bbl/gpt-5.4-mini"
 HAPUPPY_MODEL = "gpt-4.1-mini"
-HAPUPPY_FAIL_THRESHOLD = 3   # échecs consécutifs avant freeze
-HAPUPPY_FREEZE_SECONDS = 10800  # 3h
 
 # Désactive FreeTheAI jusqu'au prochain minuit UTC quand checkin manquant
 _freetheai_skip_until: datetime | None = None
@@ -73,10 +71,9 @@ _freetheai_fail_freeze_until: float | None = None  # monotonic timestamp
 FREETHEAI_FAIL_THRESHOLD = 3       # rounds échoués consécutifs avant freeze
 FREETHEAI_FAIL_FREEZE_SECONDS = 1800  # 30 min
 
-# Circuit breaker Hapuppy gpt-4.1-mini
-# States : None=CLOSED · float(future)=OPEN · float(past)=HALF-OPEN (probe)
-_hapuppy_fail_count: int = 0
-_hapuppy_freeze_until: float | None = None  # monotonic timestamp
+# Hapuppy — freeze uniquement sur 429 quota épuisé (rolling window ~4h)
+HAPUPPY_QUOTA_FREEZE_SECONDS = int(os.environ.get("HAPUPPY_QUOTA_FREEZE_SECONDS", str(4 * 3600)))
+_hapuppy_quota_skip_until: float | None = None  # monotonic timestamp
 _hapuppy_last_attempt: float = 0.0
 HAPUPPY_MIN_INTERVAL = float(os.environ.get("HAPUPPY_MIN_INTERVAL", "0.0"))  # pas de throttle par défaut
 
@@ -103,9 +100,7 @@ _CASCADE_HEADERS = {
     "freetheai_down_frozen": f"🔴 *FreeTheAI — circuit breaker* ({FREETHEAI_FAIL_THRESHOLD} rounds échoués)\nSkip FreeTheAI 30min. Probe auto après.",
     "groq_exhausted":       "🔴 *Groq — quota daily épuisé*\nBatch arrêté proprement. Reset à minuit UTC.",
     "hapuppy_down":         f"🟠 *Hapuppy `{HAPUPPY_MODEL}` — down (502/timeout)*\nVérifier les crédits Hapuppy.",
-    "hapuppy_dsk_frozen":   f"🔴 *Hapuppy `{HAPUPPY_MODEL}` — circuit breaker déclenché* ({HAPUPPY_FAIL_THRESHOLD} échecs consécutifs)\nRecheck dans 3h.",
-    "hapuppy_dsk_still_down": f"🟠 *Hapuppy `{HAPUPPY_MODEL}` — toujours down* (probe échoué)\nRecheck dans 3h.",
-    "hapuppy_dsk_back":     f"✅ *Hapuppy `{HAPUPPY_MODEL}` — réactivé*\nCircuit breaker reset.",
+    "hapuppy_quota":        f"🔴 *Hapuppy `{HAPUPPY_MODEL}` — quota épuisé (429)*\nSkip jusqu'à minuit UTC.",
     "all_failed":           "🔴 *Tous les LLM en échec*",
 }
 
@@ -256,63 +251,58 @@ def llm_call(
     else:
         trail.append("FreeTheAI : ⏭ skipped (checkin/quota/RPM/circuit breaker)")
 
-    # ── Hapuppy gpt-4.1-mini — circuit breaker ───────────────────────────────────
+    # ── Hapuppy gpt-4.1-mini — freeze sur 429 quota seulement ───────────────────
     hapuppy_key = os.environ.get("HAPUPPY_API_KEY", "")
     if hapuppy_key:
-        global _hapuppy_fail_count, _hapuppy_freeze_until, _hapuppy_last_attempt
+        global _hapuppy_quota_skip_until, _hapuppy_last_attempt
         now_mono = time.monotonic()
 
-        if HAPUPPY_MIN_INTERVAL > 0 and now_mono - _hapuppy_last_attempt < HAPUPPY_MIN_INTERVAL:
-            trail.append("Hapuppy : ⏭ skipped (RPM throttle)")
-            hapuppy_key = ""  # force skip du bloc entier
+        # Freeze quota : skip jusqu'à expiration du rolling window (~4h)
+        if _hapuppy_quota_skip_until is not None:
+            if time.monotonic() >= _hapuppy_quota_skip_until:
+                _hapuppy_quota_skip_until = None
+            else:
+                trail.append(f"Hapuppy `{HAPUPPY_MODEL}` : ⏭ frozen (quota épuisé)")
+                hapuppy_key = ""
 
     if hapuppy_key:
-        now_mono = time.monotonic()
-        frozen  = _hapuppy_freeze_until is not None and now_mono < _hapuppy_freeze_until
-        is_probe = _hapuppy_freeze_until is not None and now_mono >= _hapuppy_freeze_until
-
-        if frozen:
-            trail.append(f"Hapuppy `{HAPUPPY_MODEL}` : ⏭ frozen (circuit breaker)")
+        if HAPUPPY_MIN_INTERVAL > 0 and time.monotonic() - _hapuppy_last_attempt < HAPUPPY_MIN_INTERVAL:
+            trail.append(f"Hapuppy `{HAPUPPY_MODEL}` : ⏭ skipped (RPM throttle)")
         else:
-            ok = False
-            try:
-                _hapuppy_last_attempt = time.monotonic()
-                r = httpx.post(
-                    HAPUPPY_URL,
-                    headers={"Authorization": f"Bearer {hapuppy_key}", "Content-Type": "application/json"},
-                    json={**payload_base, "model": HAPUPPY_MODEL},
-                    timeout=timeout,
-                )
-                if r.status_code == 200:
-                    ok = True
-                    result = r.json()
-                    u = result.get("usage", {})
-                    _log_usage(HAPUPPY_MODEL, u.get("prompt_tokens", 0), u.get("completion_tokens", 0))
-                    if is_probe or _hapuppy_fail_count > 0:
-                        _hapuppy_fail_count = 0
-                        _hapuppy_freeze_until = None
-                        if is_probe:
-                            trail.append(f"Hapuppy `{HAPUPPY_MODEL}` : ✓ (probe — réactivé)")
-                            _send_cascade_notif("hapuppy_dsk_back", trail)
-                    result["_llm_source"] = "hapuppy"
-                    _last_llm_source = "hapuppy"
-                    trail.append(f"Hapuppy `{HAPUPPY_MODEL}` : ✓")
-                    _send_cascade_notif(groq_reason, trail)
-                    return result
-                else:
-                    trail.append(f"Hapuppy `{HAPUPPY_MODEL}` : ✗ {r.status_code}")
-            except Exception:
-                trail.append(f"Hapuppy `{HAPUPPY_MODEL}` : ✗ timeout/connexion")
-
-            if not ok:
-                if is_probe:
-                    _hapuppy_freeze_until = time.monotonic() + HAPUPPY_FREEZE_SECONDS
-                    _send_cascade_notif("hapuppy_dsk_still_down", trail)
-                else:
-                    _hapuppy_fail_count += 1
-                    if _hapuppy_fail_count >= HAPUPPY_FAIL_THRESHOLD:
-                        _hapuppy_freeze_until = time.monotonic() + HAPUPPY_FREEZE_SECONDS
-                        _send_cascade_notif("hapuppy_dsk_frozen", trail)
+            for attempt in range(3):
+                try:
+                    _hapuppy_last_attempt = time.monotonic()
+                    r = httpx.post(
+                        HAPUPPY_URL,
+                        headers={"Authorization": f"Bearer {hapuppy_key}", "Content-Type": "application/json"},
+                        json={**payload_base, "model": HAPUPPY_MODEL},
+                        timeout=timeout,
+                    )
+                    if r.status_code == 200:
+                        result = r.json()
+                        u = result.get("usage", {})
+                        _log_usage(HAPUPPY_MODEL, u.get("prompt_tokens", 0), u.get("completion_tokens", 0))
+                        result["_llm_source"] = "hapuppy"
+                        _last_llm_source = "hapuppy"
+                        trail.append(f"Hapuppy `{HAPUPPY_MODEL}` : ✓")
+                        _send_cascade_notif(groq_reason, trail)
+                        return result
+                    elif r.status_code == 429:
+                        _hapuppy_quota_skip_until = time.monotonic() + HAPUPPY_QUOTA_FREEZE_SECONDS
+                        trail.append(f"Hapuppy `{HAPUPPY_MODEL}` : ✗ 429 quota épuisé")
+                        _send_cascade_notif("hapuppy_quota", trail)
+                        break
+                    else:
+                        trail.append(f"Hapuppy `{HAPUPPY_MODEL}` : ✗ {r.status_code} (attempt {attempt + 1}/3)")
+                        if attempt < 2:
+                            time.sleep(2 ** attempt)
+                        continue
+                except Exception:
+                    trail.append(f"Hapuppy `{HAPUPPY_MODEL}` : ✗ timeout/connexion (attempt {attempt + 1}/3)")
+                    if attempt < 2:
+                        time.sleep(2 ** attempt)
+                    continue
+                break
 
         groq_reason = "hapuppy_down"
 

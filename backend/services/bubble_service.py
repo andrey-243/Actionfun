@@ -99,7 +99,7 @@ def get_event_news(ticker: str, date: str, change_pct: float = 0.0) -> dict:
         if cause:
             return {"date": date, "articles": cached["articles"], "cause": cause}
 
-    # Lire article_archive (merge Finn+Yahoo) pour la fenêtre T-3→T+3
+    # Lire articles_merged_finn_yahoo (merge Finn+Yahoo) pour la fenêtre T-3→T+3
     dt = datetime.fromisoformat(date[:10])
     from_dt = dt - timedelta(days=3)
     to_dt   = dt + timedelta(days=3)
@@ -115,7 +115,7 @@ def get_event_news(ticker: str, date: str, change_pct: float = 0.0) -> dict:
 
     raw_articles: list[dict] = []
     for ym in sorted(year_months):
-        r = supa.table("article_archive") \
+        r = supa.table("articles_merged_finn_yahoo") \
             .select("articles") \
             .eq("ticker", ticker) \
             .eq("year_month", ym) \

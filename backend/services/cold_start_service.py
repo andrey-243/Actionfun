@@ -56,7 +56,7 @@ def is_initialized(ticker: str) -> bool:
 def needs_cold_start(ticker: str) -> bool:
     """True si le ticker n'a aucune donnée — ni archive historique ni cache news."""
     supa = _supa()
-    archive = supa.table("article_archive").select("ticker").eq("ticker", ticker).limit(1).execute()
+    archive = supa.table("articles_merged_finn_yahoo").select("ticker").eq("ticker", ticker).limit(1).execute()
     if archive and archive.data:
         return False
     cache = supa.table("stock_news_cache").select("ticker").eq("ticker", ticker).limit(1).execute()
@@ -197,14 +197,14 @@ def _store_articles(ticker: str, articles: list[dict]):
         by_month.setdefault(ym, []).append(a)
 
     for ym, month_articles in by_month.items():
-        row = supa.table("article_archive").select("articles").eq("ticker", ticker).eq("year_month", ym).limit(1).execute()
+        row = supa.table("articles_merged_finn_yahoo").select("articles").eq("ticker", ticker).eq("year_month", ym).limit(1).execute()
         existing = row.data[0]["articles"] if row.data else []
         existing_urls = {a.get("url") for a in existing}
         new_ones = [a for a in month_articles if a.get("url") not in existing_urls]
         if not new_ones and existing:
             continue
         merged = sorted(existing + new_ones, key=lambda a: a.get("datetime", 0), reverse=True)[:50]
-        supa.table("article_archive").upsert({
+        supa.table("articles_merged_finn_yahoo").upsert({
             "ticker": ticker,
             "year_month": ym,
             "articles": merged,
@@ -218,7 +218,7 @@ def _condense(ticker: str, phase: str):
     os.environ["BATCH_MODE"] = "1"
     os.environ["LLM_LANG"] = "en"
 
-    from services.period_articles_service import (
+    from services.breakers_articles_service import (
         _get_supabase as _pas_supa, _week_num, _week_label, _month_label,
         _normalize_finnhub, _llm_call,
         WEEK_CONDENSE_PROMPT_EN, MONTH_CONDENSE_PROMPT_EN,
@@ -233,7 +233,7 @@ def _condense(ticker: str, phase: str):
 
     # Weeklies pour chaque mois couvert
     for ym in months_to_condense:
-        archive = supa.table("article_archive").select("articles").eq("ticker", ticker).eq("year_month", ym).maybe_single().execute()
+        archive = supa.table("articles_merged_finn_yahoo").select("articles").eq("ticker", ticker).eq("year_month", ym).maybe_single().execute()
         if not archive or not archive.data:
             continue
         articles = archive.data.get("articles") or []

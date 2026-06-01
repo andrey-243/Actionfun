@@ -150,8 +150,8 @@ export default function VideoModal({ article, onClose }: Props) {
                 {article.title}
               </h3>
 
-              {/* AI Brutalised */}
-              {article.brutalised && (
+              {/* AI Dumb */}
+              {(article.dumb_en || article.dumb_fr) && (
                 <div
                   style={{
                     background: "var(--color-accent-light)",
@@ -165,7 +165,7 @@ export default function VideoModal({ article, onClose }: Props) {
                     AI Analysis
                   </span>
                   <p style={{ fontSize: "13px", color: "var(--color-text-primary)", lineHeight: 1.6, margin: 0 }}>
-                    {article.brutalised}
+                    {article.dumb_en || article.dumb_fr}
                   </p>
                 </div>
               )}

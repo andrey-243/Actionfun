@@ -9,7 +9,7 @@ async def period_articles(
     period: str = Query(..., regex="^(1mo|6mo|1y|all|max)$"),
 ):
     try:
-        from services.period_articles_service import get_period_articles, get_all_available
+        from services.breakers_articles_service import get_period_articles, get_all_available
         if period in ("all", "max"):
             return get_all_available(ticker.upper())
         return get_period_articles(ticker.upper(), period)

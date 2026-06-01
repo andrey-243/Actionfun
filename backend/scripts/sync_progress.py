@@ -50,8 +50,8 @@ def _fetch_all(supa, table: str, select: str, page_size: int = 1000) -> list[dic
 
 
 def build_scrape_state(supa) -> set[str]:
-    """Tickers with at least one row in article_archive (source of truth for all regions)."""
-    rows = _fetch_all(supa, "article_archive", "ticker")
+    """Tickers with at least one row in articles_merged_finn_yahoo (source of truth for all regions)."""
+    rows = _fetch_all(supa, "articles_merged_finn_yahoo", "ticker")
     return {r["ticker"] for r in rows}
 
 

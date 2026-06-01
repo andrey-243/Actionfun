@@ -13,6 +13,24 @@ from routers import stock, news, search, events, digest, articles, cold_start
 logger = logging.getLogger(__name__)
 
 
+def _tg(msg: str):
+    import httpx
+    from datetime import datetime, timezone
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
+    if not token or not chat_id:
+        return
+    now = datetime.now(timezone.utc).strftime("%H:%M UTC")
+    try:
+        httpx.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": f"{msg} · _{now}_", "parse_mode": "Markdown"},
+            timeout=5,
+        )
+    except Exception:
+        pass
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     scheduler = BackgroundScheduler(timezone="Europe/Paris")
@@ -104,98 +122,155 @@ async def lifespan(app: FastAPI):
 
 
 def _run_digest_generation():
+    import time
     from services.digest_service import run_eod_digest_generation
+    _tg("▶ *EOD Digest — génération* (18h00)")
+    t = time.time()
     try:
         run_eod_digest_generation()
+        _tg(f"✅ *EOD Digest — génération terminée* ({int(time.time()-t)}s)")
     except Exception as e:
         logger.error(f"EOD digest generation failed: {e}")
+        _tg(f"❌ *EOD Digest — génération* : `{e}`")
 
 
 def _run_digest_email():
+    import time
     from services.digest_service import run_eod_digest_email
+    _tg("▶ *EOD Digest — envoi email* (18h30)")
+    t = time.time()
     try:
         run_eod_digest_email()
+        _tg(f"✅ *EOD Digest — email envoyé* ({int(time.time()-t)}s)")
     except Exception as e:
         logger.error(f"EOD digest email failed: {e}")
+        _tg(f"❌ *EOD Digest — email* : `{e}`")
 
 
 def _run_weekly_condensation():
-    from services.period_articles_service import run_weekly_condensation
+    import time
+    from services.breakers_articles_service import run_weekly_condensation
+    _tg("▶ *Weekly condensation* (lun 3h30)")
+    t = time.time()
     try:
         run_weekly_condensation()
+        _tg(f"✅ *Weekly condensation terminée* ({int(time.time()-t)}s)")
     except Exception as e:
         logger.error(f"Weekly condensation failed: {e}")
+        _tg(f"❌ *Weekly condensation* : `{e}`")
 
 
 def _run_monthly_condensation():
-    from services.period_articles_service import run_monthly_condensation
+    import time
+    from services.breakers_articles_service import run_monthly_condensation
+    _tg("▶ *Monthly condensation* (1er du mois 4h)")
+    t = time.time()
     try:
         run_monthly_condensation()
+        _tg(f"✅ *Monthly condensation terminée* ({int(time.time()-t)}s)")
     except Exception as e:
         logger.error(f"Monthly condensation failed: {e}")
+        _tg(f"❌ *Monthly condensation* : `{e}`")
 
 
 def _run_yearly_condensation():
-    from services.period_articles_service import run_yearly_condensation
+    import time
+    from services.breakers_articles_service import run_yearly_condensation
+    _tg("▶ *Yearly condensation* (1er jan 5h)")
+    t = time.time()
     try:
         run_yearly_condensation()
+        _tg(f"✅ *Yearly condensation terminée* ({int(time.time()-t)}s)")
     except Exception as e:
         logger.error(f"Yearly condensation failed: {e}")
+        _tg(f"❌ *Yearly condensation* : `{e}`")
 
 
 def _run_yahoo_accumulation():
-    from services.period_articles_service import run_yahoo_accumulation
+    import time
+    from services.breakers_articles_service import run_yahoo_accumulation
+    _tg("▶ *Yahoo accumulation* (*/6h)")
+    t = time.time()
     try:
-        run_yahoo_accumulation()
+        results = run_yahoo_accumulation()
+        detail = " · ".join(f"{tk} +{n}" for tk, n in sorted(results.items())) if results else "0 nouveaux articles"
+        _tg(f"✅ *Yahoo accumulation terminée* ({int(time.time()-t)}s)\n{detail}")
     except Exception as e:
         logger.error(f"Yahoo accumulation failed: {e}")
+        _tg(f"❌ *Yahoo accumulation* : `{e}`")
 
 
 def _run_finnhub_refresh():
-    from services.period_articles_service import run_finnhub_refresh
+    import time
+    from services.breakers_articles_service import run_finnhub_refresh
+    _tg("▶ *Finnhub refresh* (*/12h)")
+    t = time.time()
     try:
-        run_finnhub_refresh()
+        results = run_finnhub_refresh()
+        detail = " · ".join(f"{tk} {n}" for tk, n in sorted(results.items())) if results else "aucun ticker"
+        _tg(f"✅ *Finnhub refresh terminé* ({int(time.time()-t)}s)\n{detail}")
     except Exception as e:
         logger.error(f"Finnhub refresh failed: {e}")
+        _tg(f"❌ *Finnhub refresh* : `{e}`")
 
 
 def _run_reenrich():
+    import time
     from services.reenrich_service import run_reenrich
+    _tg("▶ *Re-enrich Groq→FreeTheAI* (22h30)")
+    t = time.time()
     try:
         run_reenrich()
+        _tg(f"✅ *Re-enrich terminé* ({int(time.time()-t)}s)")
     except Exception as e:
         logger.error(f"Re-enrich failed: {e}")
+        _tg(f"❌ *Re-enrich* : `{e}`")
 
 
 def _run_hourly_news_refresh():
     from services.overview_service import run_hourly_news_refresh
     try:
-        run_hourly_news_refresh()
+        refreshed = run_hourly_news_refresh()
+        if refreshed:
+            _tg(f"✅ *News refresh* — {' · '.join(sorted(refreshed))} sortis du pool no\\_news")
     except Exception as e:
         logger.error(f"Hourly news refresh failed: {e}")
+        _tg(f"❌ *Hourly news refresh* (:15) : `{e}`")
 
 
 def _run_cold_start_translate_fr():
+    import time
     from services.cold_start_service import translate_pending_fr
+    _tg("▶ *Cold start translate FR* (19h)")
+    t = time.time()
     try:
         translate_pending_fr()
+        _tg(f"✅ *Cold start translate FR terminé* ({int(time.time()-t)}s)")
     except Exception as e:
         logger.error(f"Cold start translate_fr failed: {e}")
+        _tg(f"❌ *Cold start translate FR* : `{e}`")
 
 
 def _purge_old_digests():
+    import time
     from supabase import create_client
     from datetime import date, timedelta
+    _tg("▶ *Purge DB* (lun 3h)")
+    t = time.time()
     try:
         supa = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
         cutoff_30d = (date.today() - timedelta(days=30)).isoformat()
         r1 = supa.table("daily_digest").delete().lt("date", cutoff_30d).execute()
-        logger.info(f"Purge digests > 30J : {len(r1.data or [])} rows supprimées")
+        n1 = len(r1.data or [])
+        logger.info(f"Purge digests > 30J : {n1} rows supprimées")
         cutoff_1y = (date.today() - timedelta(days=365)).isoformat()
         r2 = supa.table("event_causes").delete().lt("date", cutoff_1y).execute()
-        logger.info(f"Purge event_causes > 1 an : {len(r2.data or [])} rows supprimées")
+        n2 = len(r2.data or [])
+        logger.info(f"Purge event_causes > 1 an : {n2} rows supprimées")
+        _tg(f"✅ *Purge DB terminée* ({int(time.time()-t)}s)\ndigests: {n1} · event_causes: {n2}")
     except Exception as e:
         logger.error(f"Purge failed: {e}")
+        _tg(f"❌ *Purge DB* : `{e}`")
 
 
 app = FastAPI(title="StockVibe API", lifespan=lifespan)

@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import httpx
-from services.period_articles_service import _fetch_finnhub_month, _dedup_by_headline, _get_supabase
+from services.breakers_articles_service import _fetch_finnhub_month, _dedup_by_headline, _get_supabase
 
 
 def _tg(msg: str):
@@ -49,7 +49,7 @@ def main():
     cutoff_ym = f"{months_ago.year:04d}-{months_ago.month:02d}"
 
     # Charger tous les rows finnhub dans la fenêtre
-    rows = supa.table("article_archive") \
+    rows = supa.table("articles_merged_finn_yahoo") \
         .select("ticker, year_month, source") \
         .eq("source", "finnhub") \
         .gte("year_month", cutoff_ym) \
@@ -83,7 +83,7 @@ def main():
         try:
             raw = _fetch_finnhub_month(ticker, ym)
             articles = _dedup_by_headline(raw)  # merge extra_sources, pas de doublons en DB
-            supa.table("article_archive").upsert({
+            supa.table("articles_merged_finn_yahoo").upsert({
                 "ticker":     ticker,
                 "year_month": ym,
                 "articles":   articles,

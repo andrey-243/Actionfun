@@ -64,7 +64,7 @@ def _reenrich_news_cache(supa) -> bool:
     """Re-enrichit stock_news_cache. Retourne False si FreeTheAI quota atteint."""
     rows = (
         supa.table("stock_news_cache")
-        .select("ticker, news_raw, generated_by_fr, generated_by_en")
+        .select("ticker, generated_by_fr, generated_by_en")
         .or_("generated_by_fr.eq.groq,generated_by_en.eq.groq,ai_summary_en.is.null")
         .limit(50)
         .execute()
@@ -105,7 +105,7 @@ def _reenrich_weekly(supa) -> bool:
 
     logger.info(f"[reenrich] weekly: {len(rows.data)} semaines à re-enrichir (Groq ou EN manquant)")
 
-    from services.period_articles_service import (
+    from services.breakers_articles_service import (
         _llm_call, WEEK_CONDENSE_PROMPT_EN, _week_label, _summary_col,
     )
 
@@ -151,7 +151,7 @@ def _reenrich_monthly(supa) -> bool:
 
     logger.info(f"[reenrich] monthly: {len(rows.data)} mois Groq à re-enrichir")
 
-    from services.period_articles_service import (
+    from services.breakers_articles_service import (
         _llm_call, MONTH_CONDENSE_PROMPT_EN, _month_label, _summary_col,
     )
 
