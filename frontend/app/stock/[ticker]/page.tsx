@@ -75,6 +75,7 @@ interface NewsData {
   sentiment_reason_24h: string;
   no_24h_news: boolean;
   cached_at: string;
+  is_refreshing?: boolean;
 }
 
 function fmt(n: number | null, digits = 2): string {
@@ -335,6 +336,17 @@ export default function StockPage() {
   }, [ticker]);
 
   useEffect(() => {
+    if (!news?.is_refreshing || !ticker) return;
+    const timer = setTimeout(() => {
+      fetch(`${API}/api/news/${ticker.toUpperCase()}`)
+        .then((r) => r.json())
+        .then((d) => setNews(d))
+        .catch(() => {});
+    }, 20_000);
+    return () => clearTimeout(timer);
+  }, [news?.is_refreshing]);
+
+  useEffect(() => {
     if (!ticker || !stock) return;
     setChartLoading(true);
     fetch(`${API}/api/stock/${ticker.toUpperCase()}?period=${chartPeriod}`)
@@ -556,8 +568,9 @@ export default function StockPage() {
     const DAY = 86_400_000;
 
     if (chartPeriod === "1d") {
-      // 24H : tous les articles dans les 24h
-      return all.filter(a => a.pub_date && now - new Date(a.pub_date).getTime() < DAY);
+      const todayMidnight = new Date();
+      todayMidnight.setUTCHours(0, 0, 0, 0);
+      return all.filter(a => a.pub_date && new Date(a.pub_date).getTime() >= todayMidnight.getTime());
     }
     if (chartPeriod === "5d") {
       // 1W : bucket par jour, max 3/jour, tri par longueur brutalised
@@ -784,7 +797,16 @@ export default function StockPage() {
               const activeSummary = is24h ? news.summary_24h : news.summary;
               const activeSentiment = is24h ? news.sentiment_24h : news.sentiment;
               const activeReason = is24h ? news.sentiment_reason_24h : news.sentiment_reason;
-              if (!activeSummary) return null;
+              if (!activeSummary && !news.is_refreshing) return null;
+              if (!activeSummary && news.is_refreshing) return (
+                <div style={{
+                  background: "var(--color-surface)", border: "1px solid var(--color-border)",
+                  borderRadius: "8px", padding: "22px 24px", marginBottom: "12px",
+                  display: "flex", justifyContent: "center",
+                }}>
+                  <DogLoader />
+                </div>
+              );
               return (
                 <div style={{
                   background: "var(--color-surface)", border: "1px solid var(--color-border)",
@@ -802,6 +824,15 @@ export default function StockPage() {
                           fontFamily: "var(--font-mono)", letterSpacing: "0.05em",
                         }}>
                           AUCUNE NEWS 24H
+                        </span>
+                      )}
+                      {news.is_refreshing && (
+                        <span style={{
+                          fontSize: "10px", padding: "2px 7px", borderRadius: "4px",
+                          background: "rgba(255,255,255,0.04)", color: "var(--color-text-muted)",
+                          fontFamily: "var(--font-mono)", letterSpacing: "0.05em",
+                        }}>
+                          ↻ mise à jour...
                         </span>
                       )}
                     </div>

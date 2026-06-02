@@ -21,8 +21,13 @@ def get_stock_data(ticker: str, period: str = "6mo") -> dict:
     if hist.empty:
         raise ValueError(f"Ticker {ticker} not found")
 
+    def _fmt(idx):
+        if period == "1d":
+            return idx.strftime("%H:%M")
+        return str(idx.date())
+
     chart_data = [
-        {"date": str(idx.date()), "close": round(row["Close"], 2), "volume": int(row["Volume"])}
+        {"date": _fmt(idx), "close": round(row["Close"], 2), "volume": int(row["Volume"])}
         for idx, row in hist.iterrows()
     ]
 

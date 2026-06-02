@@ -38,7 +38,7 @@ Si une feature bypass `articles_merged_finn_yahoo` c'est un bug architectural à
 | Events chart | Finnhub company-news (free, 1 an d'historique) + Groq cause IA |
 | Email digest | Resend (3 000 emails/mois gratuit) — clé configurée, sandbox actif |
 | Logos | Logo.dev free (500k req/mois, attribution requise) — domaine depuis yfinance `t.info["website"]`, stocké dans `stock_news_cache.website` · `NEXT_PUBLIC_LOGODEV_TOKEN` dans `frontend/.env.local` |
-| Cron | APScheduler intégré dans FastAPI — digest gen 18h00 · email 18h30 · cold_start FR 19h · re-enrich 22h30 · weekly lun 3h30 · monthly 1er 4h · yearly 1er jan 5h · **yahoo */6h** (tous pinnés ≥3, merge articles_merged_finn_yahoo) · **finnhub */12h** (current month, merge) · **hourly_news_refresh :15** (pinned + visités récemment avec no_24h_news) · **purge DB** lun 3h (daily_digest >30J + event_causes >1 an). TG: tous les crons 1x/j envoient ▶ start + ✅ end avec durée. Yahoo/Finnhub: ✅ avec résumé par ticker (Yahoo: `AAPL +5 · AMZN +3` · Finnhub: `AAPL 45 · AMZN 23`). Hourly: TG uniquement si des tickers sortent du pool no_24h_news (`✅ News refresh — AAPL · AMZN sortis du pool`). |
+| Cron | APScheduler intégré dans FastAPI — digest gen 18h00 · email 18h30 · cold_start FR 19h · re-enrich 22h30 · weekly lun 3h30 · monthly 1er 4h · yearly 1er jan 5h · **yahoo */6h** (tous pinnés ≥3, merge articles_merged_finn_yahoo + trigger OW si nouveaux articles) · **finnhub */12h** (current month, merge + trigger OW si nouveaux articles) · **hourly_news_refresh :15** (pinned + visités récemment avec no_24h_news → `force_24h=True`) · **purge DB** lun 3h (daily_digest >30J + event_causes >1 an). TG: tous les crons 1x/j envoient ▶ start + ✅ end avec durée. Yahoo/Finnhub: ✅ avec résumé par ticker (Yahoo: `AAPL +5 · AMZN +3` · Finnhub: `AAPL 45 · AMZN 23`). Hourly: TG uniquement si des tickers sortent du pool no_24h_news (`✅ News refresh — AAPL · AMZN sortis du pool`). |
 | Git | github.com/andrey-243/Actionfun — repo privé |
 | Déploiement | local → Railway/Render (backend) · Vercel (frontend) · Supabase (DB) |
 
@@ -131,21 +131,24 @@ Tous les appels LLM passent par `services/llm_service.py` qui gère la cascade a
 ```
 FreeTheAI: bbl/gpt-4.1      → primary
   ✗ 502/503/timeout          → try secondary
-  ✗ 429 (RPM)                → break, skip FreeTheAI 6s
-  ✗ 403/checkin              → break, skip FreeTheAI jusqu'à minuit UTC
-  ✗ daily_limit              → break, skip FreeTheAI jusqu'à minuit UTC
+  ✗ 429 (RPM) ×3 consécutifs → freeze 3h (FREETHEAI_429_FREEZE_SECONDS=10800)
+  ✗ 403/checkin              → break, skip jusqu'à minuit UTC
+  ✗ daily_limit              → break, skip jusqu'à minuit UTC
+  Concurrence : Semaphore(FREETHEAI_CONCURRENCY=1) non-bloquant — 1 seul appel simultané,
+                les autres sautent directement à Hapuppy
 
 FreeTheAI: bbl/gpt-5.4-mini → secondary (seulement si primary = 502/503/timeout)
   mêmes règles d'erreur
   → 3 rounds échoués consécutifs (502/503/timeout) → circuit breaker 30min → probe auto
   → reset sur succès · 429/checkin/daily ne comptent pas comme "round échoué"
 
-Hapuppy: gpt-4.1-mini       → 3 retries (backoff 1s/2s) avant de passer à Groq
-                               freeze uniquement sur 429 quota épuisé (~4h rolling window, HAPUPPY_QUOTA_FREEZE_SECONDS=14400)
-                               timeout/502/connexion → skip ce round, retry au prochain appel (pas de circuit breaker)
-                               HAPUPPY_MIN_INTERVAL=0 (pas de throttle — 100 RPM Hapuppy)
+Hapuppy: gpt-4.1-mini       → 3 retries avant de passer à Groq
+                               429 quota : freeze ~4h (HAPUPPY_QUOTA_FREEZE_SECONDS=14400) — body keywords ("quota","credit","budget"...)
+                               429 rate-limit : sleep 5s local + retry dans le même thread (pas de freeze global) — max 3 tentatives
+                               timeout/502/connexion → backoff 1s/2s, retry
+                               Concurrence : Semaphore(HAPUPPY_CONCURRENCY=3) — max 3 appels httpx simultanés
 
-Groq: voir tableau ci-dessous → fallback final
+Groq: voir tableau ci-dessous → fallback final (uniquement si Hapuppy quota épuisé ou down)
                                 ⚠️ TODO PROD : désactiver en BATCH_MODE=1 pour préserver le quota site
 ```
 deepseek-v3.2 retiré — timeouts constants (endpoint deprecated chez Hapuppy).
@@ -153,13 +156,16 @@ AgentRouter (`agentrouter.org`) retiré — clé `unauthorized_client`.
 
 **Comportement erreurs FreeTheAI :**
 - **403 / checkin manquant** : faire `/checkin` sur le Discord FreeTheAI pour débloquer
-- **Daily limit** (`"daily successful request limit exceeded"`) : reset automatique à minuit UTC
-- **429 (RPM)** : skip vers étape suivante, retry FreeTheAI après 6s (10 RPM)
-- **3 rounds échoués consécutifs** (502/503/timeout sur primary+secondary) : circuit breaker 30min, probe auto après
+- **Daily limit** : reset automatique à minuit UTC
+- **429 × 3 consécutifs** : freeze 3h — typique en batch concurrent (10 RPM limit, 1 concurrent)
+- **3 rounds échoués consécutifs** (502/503/timeout) : circuit breaker 30min, probe auto après
+- **Semaphore(1) non-bloquant** : si FreeTheAI occupé, le thread saute à Hapuppy sans attendre
 
 **Comportement erreurs Hapuppy :**
-- **timeout/502/connexion** : 3 retries avec backoff (1s, 2s), puis Groq — pas de circuit breaker
-- **429 quota épuisé** : freeze ~4h (rolling window Hapuppy), notif TG `hapuppy_quota`
+- **timeout/502/connexion** : backoff 1s/2s, 3 retries, puis Groq
+- **429 quota épuisé** (body contient "quota"/"credit"/"budget"...) : freeze ~4h, notif TG `hapuppy_quota`
+- **429 rate-limit** (body sans keyword quota) : sleep 5s local + retry Hapuppy dans le même thread — pas de freeze global, Groq non déclenché
+- **Unfreeze manuel** : `POST /admin/hapuppy/unfreeze` — reset freeze dans le process FastAPI (⚠ n'affecte pas un batch standalone)
 
 **Notifs Telegram — trail complet de la cascade :**
 ```
@@ -173,6 +179,7 @@ Groq `llama-3.1-8b-instant` : ✓
 - Une notif par raison primaire, throttle 30min — `_send_cascade_notif(reason, trail)`
 - Trail buildé au fil de la cascade dans `llm_call`, envoyé quand un non-primary répond (✓ ou ✗)
 - Si tous les LLM échouent → notif `🔴 Tous les LLM en échec` avec trail complet
+- Chaque notif TG porte un label source en footer : `📍 llm_service` · `📍 translation_service` · `📍 cron` · `📍 batch_fill_db`
 
 **FreeTheAI — quotas journaliers (rôle Discord) :**
 | Rôle | Requêtes/jour | Images/jour |
@@ -256,8 +263,10 @@ YANDEX_SECRET_KEY=...              # Yandex Translate — clé secrète (configu
 ```
 stock_news_cache           — cache OW live (ticker PK, ai_summary, ai_summary_24h, ai_summary_en, ai_summary_24h_en,
                              ai_sentiment, ai_sentiment_24h, cached_at, ow7d_cached_at, website, generated_by_en,
-                             generated_by_fr, no_24h_news, articles_hash) — TTL 3h (24H) / 24h (7J). EN served first.
-                             Zéro articles stockés ici.
+                             generated_by_fr, no_24h_news, articles_hash, exchange) — TTL 3h (24H) / 24h (7J). EN served first.
+                             Zéro articles stockés ici. `exchange` = code yfinance (NMS, NYQ, KSC…) — peuplé à la 1ère
+                             visite via trigger dans `get_news_stale()`. One-shot initial : `scripts/populate_exchange.py`.
+                             Lignes sans `cached_at` (exchange-only) traitées comme cache absent → appel bloquant.
 user_preferences           — préférences (user_id PK, currency, notify_email, notify_weekly, digest_tickers text[])
 pinned_stocks              — watchlist (user_id, ticker, company_name, pinned_at) — unique(user_id, ticker)
 daily_digest               — digest EOD (ticker, date, summary, summary_en, sentiment) — purge auto 30J
@@ -378,9 +387,9 @@ Lundi 3h    : weekly summary → purge si > 5 weeklies
 - Finnhub retourne des articles → `source: "finnhub"` → bootstrap immédiat 12 mois
 - Finnhub retourne 0 articles → `source: "yahoo"` → accumulation daily via cron
 
-**Cron Yahoo */6h** : fetch `get_news(count=100)` → `_dedup_by_headline` merge → `source: "mixed"` si Finnhub déjà présent
+**Cron Yahoo */6h** : fetch `get_news(count=100)` → `_dedup_by_headline` merge → `source: "mixed"` si Finnhub déjà présent → si nouveaux articles : `get_news(ticker, force_24h=True)` (dumb + OW 24H régénérés)
 
-**Cron Finnhub */12h** : `_get_or_fetch_month()` → merge Finnhub + existant Yahoo → `ACTIVE_MONTH_TTL_HOURS = 12`
+**Cron Finnhub */12h** : `_get_or_fetch_month()` → merge Finnhub + existant Yahoo → `ACTIVE_MONTH_TTL_HOURS = 12` → si nouveaux articles : `get_news(ticker, force_24h=True)`
 
 ---
 
@@ -389,11 +398,17 @@ Lundi 3h    : weekly summary → purge si > 5 weeklies
 - **Source** : `yfinance.Ticker(ticker).get_news(count=100)` · filtre summaries < 80 chars
 - **Filtre pertinence** : le LLM marque les articles hors-sujet "SKIP" → exclus du cache. Si **tous** sont SKIP → fallback articles bruts sans abrutis.
 - **2 TTL indépendants — `overview_service.py` :**
-  - **Call 1 — OW 24H + OW 7J (TTL 3h)** : fetch Yahoo → LLM2 : skip si hash IDs inchangé → brutalise nouveaux articles → OW 24H depuis abrutis <24h → LLM4 : stocke aussi `ai_summary_en` (7J) depuis BRUTALIZE → `ow7d_cached_at = now`. Si `articles_24h` vide → fallback "No news 24h" + `_bench_context_line()` + OW 7J existant.
+  - **Call 1 — OW 24H + OW 7J (TTL 3h)** : fetch Yahoo → LLM2 : skip si hash IDs inchangé → brutalise nouveaux articles → OW 24H depuis abrutis **depuis minuit UTC** → LLM4 : stocke aussi `ai_summary_en` (7J) depuis BRUTALIZE → `ow7d_cached_at = now`. Si `articles_24h` vide → fallback "No news 24h" + `_bench_context_line()` + OW 7J existant.
   - **Call 2 — OW 7J (BATCH_MODE=1 uniquement)** : lit abrutis en DB → `_ow7d_from_abrutis()`. Inactif en mode site.
   - **Cold start** : Call 1 seul → BRUTALIZE → stocke dumb_en/dumb_fr + OW 24H + OW 7J en un call.
-- **AI Overview affiché selon la période** : 24H → `summary_24h` (+ badge `AUCUNE NEWS 24H` si `no_24h_news`) · 1W → `summary` (7J) · 1M+ → pas d'overview Yahoo
-- **Hourly refresh** (cron :15) : pinned + tickers visités 6h avec `no_24h_news=True` → fetch Yahoo sans LLM → si ≥1 article 24h trouvé → `get_news()` complet
+- **Stale-while-revalidate** : `GET /api/news/{ticker}` retourne le cache immédiatement (même stale) + flag `is_refreshing: true` → background task `get_news()`. Premier load (aucun cache ou `cached_at` NULL) = appel bloquant. Re-fetch frontend auto après 20s si `is_refreshing: true`. Implémenté via `get_news_stale()` + FastAPI `BackgroundTasks` dans `routers/news.py`.
+- **`force_24h=True`** : param de `get_news()` pour bypasser le TTL et forcer un refresh (utilisé par les crons et le hourly_news_refresh).
+- **`_get_stock_context()` dédupliqué** : calculé une seule fois dans `get_news()` avant les deux calls, passé en paramètre — évite 4 appels yfinance redondants.
+- **Cron trigger OW** : Yahoo (*/6h) et Finnhub (*/12h) appellent `get_news(ticker, force_24h=True)` après chaque ticker avec nouveaux articles → `no_24h_news` stale flag corrigé immédiatement.
+- **Cutoff articles 24H** : minuit UTC (pas fenêtre roulante 24h) — frontend `getDisplayedArticles()` + backend `_filter_24h()`.
+- **AI Overview affiché selon la période** : 24H → `summary_24h` (+ badge `AUCUNE NEWS 24H` si `no_24h_news` · badge `↻ mise à jour...` si `is_refreshing`) · 1W → `summary` (7J) · 1M+ → pas d'overview Yahoo.
+- **Hourly refresh** (cron :15) : pinned + tickers visités 6h avec `no_24h_news=True` → fetch Yahoo sans LLM → si ≥1 article depuis minuit UTC trouvé → `get_news(force_24h=True)`
+- **`exchange` dans `stock_news_cache`** : code yfinance (NMS, NYQ, KSC…). Peuplé à la 1ère visite via trigger dans `get_news_stale()`. One-shot initial : `scripts/populate_exchange.py` (source `articles_merged_finn_yahoo`). Prévu pour gate market-hours dans `run_hourly_news_refresh()`.
 
 ---
 
@@ -406,7 +421,7 @@ Quand l'user clique un dot → `EventDrawer` → `GET /api/events/{ticker}?date=
 Ticker : AAPL | Date : 2026-04-15 | Mouvement : ▼ -4.2%
 
 Prix T-5 → T+3 (daily) + benchmark (S&P 500) même période
-Headlines Finnhub T-3 → T+3 : [12 max]
+Headlines Finnhub T-3 → T+3 : [12 max, fallback T-6 → T+6 si 0 articles]
 ```
 
 **Benchmark par exchange :**
@@ -423,6 +438,8 @@ Headlines Finnhub T-3 → T+3 : [12 max]
 ---
 
 ### Chart — Périodes & intervalles yfinance
+
+Labels X : période `1d` → `HH:MM` (bougies 5-min). Autres périodes → `YYYY-MM-DD`.
 
 | Bouton | period | interval | Dots events |
 |---|---|---|---|
@@ -481,6 +498,16 @@ Threshold bubbles_done = 8 causes non-null.
 
 **Pool `bubbles_no_data`** : tickers avec 0 articles dans `articles_merged_finn_yahoo` (détecté phase bubbles) → skipper dans les runs suivants, ne pas compter dans `bubbles_done`. Clé `bubbles_no_data` dans le progress file.
 
+**Fenêtre articles bubbles** : `bubble_service.py` cherche d'abord T-3→T+3. Si 0 articles → fallback T-6→T+6 (year_months supplémentaires seulement). S'applique batch + live (`/api/events`).
+
+**Re-process tickers skippés** : retirer le ticker de `bubbles_done` dans le progress file → sera re-traité au prochain run avec le fallback ±6j.
+
+**Concurrence phase bubbles** : `ThreadPoolExecutor(BUBBLES_WORKERS=3)` — 3 tickers en parallèle. Semaphore Hapuppy (3) dans `llm_service.py` limite les appels HTTP concurrents. Progress mis à jour dans le thread principal via `as_completed` (thread-safe sans Lock). Ctrl+C propre : `os._exit(0)` après sauvegarde progress.
+
+**Save throttle** : `save_progress()` n'écrit sur disque que tous les `BATCH_SAVE_EVERY=5` appels. `force=True` aux checkpoints TG → perte max 5 tickers en cas de crash.
+
+**Notifs TG batch** : `parse_mode: HTML` (Markdown v1 causait des 400 sur les underscores/accents). Conversion `*bold*` → `<b>bold</b>` et `_italic_` → `<i>italic</i>` dans `_telegram()`.
+
 **Script one-shot websites** : `backend/scripts/populate_websites.py`
 ```bash
 python scripts/populate_websites.py            # tous les tickers en stock_news_cache
@@ -534,7 +561,8 @@ python scripts/populate_websites.py --ticker AMZN
 | Architecture DB — refacto | ✅ | `stock_news_cache` zéro articles. DUMB dans `articles_merged_finn_yahoo`. Migration one-shot : 4 148 `dumb_en` copiés. |
 | **Batch DB filler (717 tickers)** | 🔄 | Voir séquence ci-dessous |
 | Reddit sentiment | ⬜ | À venir |
-| Refresh proactif (cron) | ⬜ | Pour tickers populaires/pinnés |
+| Refresh proactif OW (crons) | ✅ | Yahoo/Finnhub trigger `get_news(force_24h=True)` si nouveaux articles |
+| Stale-while-revalidate OW | ✅ | Cache retourné immédiatement + background refresh + badge `↻ mise à jour...` |
 
 ---
 
@@ -542,7 +570,7 @@ python scripts/populate_websites.py --ticker AMZN
 
 | # | Phase | Région | Statut |
 |---|---|---|---|
-| 1 | Bubbles 6M+1Y | US | 🔄 en cours — 98/260 done EN · 160 restants |
+| 1 | Bubbles 6M+1Y | US | 🔄 en cours — 137 todo restants après sync (73 done EN en DB · 2026-06-01) |
 | 2 | Bubbles 6M+1Y | EU | ⏳ |
 | 3 | Bubbles 6M+1Y | ASIA | ⏳ |
 | 4 | Monthly summaries (breaks) | US+EU+ASIA | ⏳ après bubbles |
@@ -572,8 +600,15 @@ python scripts/populate_websites.py --ticker AMZN
 | **DB4** | Purge `event_causes > 1 an` dans cron Monday 3h | `main.py` |
 | **LLM2** | `_articles_hash()` — skip brutalise si IDs inchangés. Stocke `articles_hash` | `overview_service.py` |
 | **LLM4** | BRUTALIZE retourne `summary` (7J) → stocké directement comme `ai_summary` + `ow7d_cached_at`. Call 2 actif uniquement en `BATCH_MODE=1` | `overview_service.py` |
+| **LLM5** | `_get_stock_context()` dédupliqué — calculé une fois dans `get_news()`, passé aux deux calls (4→2 appels yfinance) | `overview_service.py` |
+| **Chart1** | Labels 24H en `HH:MM` au lieu de `YYYY-MM-DD` — bougies 5-min tracées correctement | `yfinance_service.py` |
+| **Perf1** | Stale-while-revalidate sur `GET /api/news/` — `get_news_stale()` + `BackgroundTasks`. Premier load bloquant uniquement. | `routers/news.py`, `overview_service.py` |
+| **Cron1** | Yahoo + Finnhub crons triggèrent `get_news(force_24h=True)` après nouveaux articles — corrige `no_24h_news` stale | `breakers_articles_service.py` |
 | **Weekly Pool 1** | `_maybe_regen_weekly()` dans cron hourly | `overview_service.py` |
 | **Weekly Pool 2** | `run_weekly_condensation` (lundi 3h30) | `breakers_articles_service.py` |
+| **Perf2** | Re-fetch frontend auto 20s après `is_refreshing: true` — spinner disparaît sans reload manuel | `page.tsx` |
+| **DB5** | Colonne `exchange` dans `stock_news_cache` — peuplée au trigger visite + one-shot `populate_exchange.py`. Prévu pour gate market-hours cron. | `overview_service.py` |
+| **OW1** | Cutoff 24H = minuit UTC (était fenêtre roulante 24h) — frontend + `_filter_24h()` backend | `page.tsx`, `overview_service.py` |
 
 ---
 

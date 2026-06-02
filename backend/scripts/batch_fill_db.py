@@ -17,6 +17,8 @@ import os
 import sys
 import time
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timezone, timedelta
 from pathlib import Path
 
@@ -55,10 +57,15 @@ def _telegram(msg: str):
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
     if not token or not chat_id:
         return
+    # Convertir *bold* → <b>bold</b> et _italic_ → <i>italic</i> pour HTML
+    import re
+    html = re.sub(r'\*([^*]+)\*', r'<b>\1</b>', msg)
+    html = re.sub(r'(?<!\w)_([^_]+)_(?!\w)', r'<i>\1</i>', html)
+    html += "\n📍 <i>batch_fill_db</i>"
     try:
         httpx.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"},
+            json={"chat_id": chat_id, "text": html, "parse_mode": "HTML"},
             timeout=8,
         )
     except Exception:
@@ -121,8 +128,14 @@ def load_progress() -> dict:
     return {"scraped": [], "enriched": [], "failed_scrape": [], "failed_enrich": []}
 
 
-def save_progress(p: dict):
-    PROGRESS_FILE.write_text(json.dumps(p, indent=2))
+SAVE_EVERY = int(os.environ.get("BATCH_SAVE_EVERY", "5"))
+_save_call_count = 0
+
+def save_progress(p: dict, force: bool = False):
+    global _save_call_count
+    _save_call_count += 1
+    if force or _save_call_count % SAVE_EVERY == 0:
+        PROGRESS_FILE.write_text(json.dumps(p, indent=2))
 
 
 # ─── Finnhub fetch ────────────────────────────────────────────────────────────
@@ -298,6 +311,7 @@ def phase_scrape(tickers: list[str], region: str = "all"):
         save_progress(progress)
 
         if i % NOTIFY_EVERY == 0:
+            save_progress(progress, force=True)
             _notify_checkpoint("scrape", i, total, region, batch_errors, [], batch_articles, start_time)
             batch_errors = []
             batch_articles = 0
@@ -396,6 +410,7 @@ def phase_enrich(tickers: list[str], region: str = "all"):
         save_progress(progress)
 
         if i % NOTIFY_EVERY == 0:
+            save_progress(progress, force=True)
             _notify_checkpoint("enrich", i, total, region, batch_errors, [], 0, start_time, batch_llm_sources)
             batch_errors = []
             batch_llm_sources = {}
@@ -463,73 +478,88 @@ def phase_bubbles(tickers: list[str], region: str = "all"):
     batch_skipped = 0          # bubbles sans articles au niveau batch
     batch_skipped_tickers: list[str] = []  # "TICKER×N" pour le TG
 
-    for i, ticker in enumerate(todo, 1):
-        logger.info(f"[{i}/{total}] {ticker} — bubbles 6M+1Y")
-        ticker_events = 0  # bubbles avec cause LLM réelle
-        ticker_total = 0   # bubbles tentées (exclut no-articles)
-        ticker_skipped: list[str] = []  # dates sans articles
-        try:
-            for period, interval, window, max_dots in PERIODS:
-                try:
-                    hist = yf.Ticker(ticker).history(period=period, interval=interval)
-                    if len(hist) < window * 2 + 1:
-                        continue
+    BUBBLES_WORKERS = int(os.environ.get("BUBBLES_WORKERS", "3"))
 
-                    closes = hist["Close"].tolist()
-                    dates  = [d.strftime("%Y-%m-%d") for d in hist.index]
+    def _process_ticker(ticker: str) -> dict:
+        t_events, t_total, t_skipped = 0, 0, []
+        for period, interval, window, max_dots in PERIODS:
+            try:
+                hist = yf.Ticker(ticker).history(period=period, interval=interval)
+                if len(hist) < window * 2 + 1:
+                    continue
+                closes = hist["Close"].tolist()
+                dates  = [d.strftime("%Y-%m-%d") for d in hist.index]
+                for idx, _ in _detect_peaks_valleys(closes, window, max_dots):
+                    dt = dates[idx]
+                    change_pct = (closes[idx] - closes[idx - 1]) / closes[idx - 1] * 100 if idx > 0 else 0.0
+                    try:
+                        res = get_event_news(ticker, dt, round(change_pct, 2))
+                        if not res.get("articles"):
+                            t_skipped.append(dt)
+                            continue
+                        t_total += 1
+                        if res.get("cause"):
+                            t_events += 1
+                        else:
+                            logger.warning(f"  bubble {ticker} {dt}: cause=null (LLM failed)")
+                        time.sleep(0.5)
+                    except Exception as e:
+                        logger.warning(f"  bubble {ticker} {dt}: {e}")
+            except Exception as e:
+                logger.warning(f"  period {period} {ticker}: {e}")
+        return {"ticker": ticker, "events": t_events, "total": t_total, "skipped": t_skipped}
 
-                    events = _detect_peaks_valleys(closes, window, max_dots)
-                    for idx, _ in events:
-                        date = dates[idx]
-                        # change_pct = variation jour J vs J-1
-                        change_pct = (closes[idx] - closes[idx - 1]) / closes[idx - 1] * 100 if idx > 0 else 0.0
-                        try:
-                            result = get_event_news(ticker, date, round(change_pct, 2))
-                            if not result.get("articles"):
-                                ticker_skipped.append(date)
-                                continue  # pas d'articles → pas de LLM, ne compte pas dans ticker_total
-                            ticker_total += 1
-                            if result.get("cause"):
-                                ticker_events += 1
-                            else:
-                                logger.warning(f"  bubble {ticker} {date}: cause=null (LLM failed)")
-                            time.sleep(0.5)  # éviter burst Groq
-                        except Exception as e:
-                            logger.warning(f"  bubble {ticker} {date}: {e}")
+    executor = ThreadPoolExecutor(max_workers=BUBBLES_WORKERS)
+    futures = {executor.submit(_process_ticker, ticker): ticker for ticker in todo}
+    try:
+        for i, future in enumerate(as_completed(futures), 1):
+            ticker = futures[future]
+            logger.info(f"[{i}/{total}] {ticker} — résultat reçu")
+            try:
+                r = future.result()
+                ticker_events, ticker_total = r["events"], r["total"]
+                ticker_skipped = r["skipped"]
 
-                except Exception as e:
-                    logger.warning(f"  period {period} {ticker}: {e}")
+                total_events += ticker_events
+                null_count = ticker_total - ticker_events
 
-            total_events += ticker_events
-            null_count = ticker_total - ticker_events
+                if ticker_skipped:
+                    batch_skipped += len(ticker_skipped)
+                    batch_skipped_tickers.append(f"{ticker}×{len(ticker_skipped)}")
+                    logger.info(f"  ⏭ {ticker} — {len(ticker_skipped)} dates sans articles")
 
-            if ticker_skipped:
-                batch_skipped += len(ticker_skipped)
-                batch_skipped_tickers.append(f"{ticker}×{len(ticker_skipped)}")
-                logger.info(f"  ⏭ {ticker} — {len(ticker_skipped)} dates sans articles: {', '.join(ticker_skipped)}")
+                if ticker_total == 0:
+                    logger.info(f"  ⏭ {ticker} — 0 bubbles avec articles → bubbles_no_data")
+                    progress.setdefault("bubbles_no_data", []).append(ticker)
+                elif null_count == 0:
+                    logger.info(f"  ✓ {ticker} — {ticker_events} bubbles avec cause")
+                    progress.setdefault("bubbles_done", []).append(ticker)
+                else:
+                    logger.warning(f"  ⚠ {ticker} — {ticker_events} avec cause, {null_count} cause=null")
 
-            if ticker_total == 0:
-                logger.info(f"  ⏭ {ticker} — 0 bubbles avec articles → bubbles_no_data")
-                progress.setdefault("bubbles_no_data", []).append(ticker)
-            elif null_count == 0:
-                logger.info(f"  ✓ {ticker} — {ticker_events} bubbles avec cause")
-                progress.setdefault("bubbles_done", []).append(ticker)
-            else:
-                logger.warning(f"  ⚠ {ticker} — {ticker_events} avec cause, {null_count} cause=null (LLM down) → pas marqué done")
+            except Exception as e:
+                logger.error(f"  ✗ {ticker}: {e}")
+                batch_errors.append(ticker)
 
-        except Exception as e:
-            logger.error(f"  ✗ {ticker}: {e}")
-            batch_errors.append(ticker)
+            save_progress(progress)
 
-        save_progress(progress)
+            if i % NOTIFY_EVERY == 0:
+                save_progress(progress, force=True)
+                skip_info = f"{batch_skipped} bubbles — {', '.join(batch_skipped_tickers)}" if batch_skipped else ""
+                _notify_checkpoint("bubbles", i, total, region, batch_errors, [], 0, start_time,
+                                   skipped_info=skip_info)
+                batch_errors = []
+                batch_skipped = 0
+                batch_skipped_tickers = []
 
-        if i % NOTIFY_EVERY == 0:
-            skip_info = f"{batch_skipped} bubbles — {', '.join(batch_skipped_tickers)}" if batch_skipped else ""
-            _notify_checkpoint("bubbles", i, total, region, batch_errors, [], 0, start_time,
-                               skipped_info=skip_info)
-            batch_errors = []
-            batch_skipped = 0
-            batch_skipped_tickers = []
+    except KeyboardInterrupt:
+        logger.info("Interruption — annulation des tâches en attente...")
+        executor.shutdown(wait=False, cancel_futures=True)
+        save_progress(progress, force=True)
+        logger.info("Progress sauvegardé.")
+        os._exit(0)
+    finally:
+        executor.shutdown(wait=False)
 
     elapsed = int(time.time() - start_time)
     mins, secs = divmod(elapsed, 60)
@@ -684,6 +714,7 @@ def phase_translate_fr_dumb(tickers: list[str], region: str = "all"):
         save_progress(progress)
 
         if i % NOTIFY_EVERY == 0:
+            save_progress(progress, force=True)
             _notify_checkpoint("translate-fr-dumb", i, total, region, batch_errors, [], 0, start_time)
             batch_errors = []
 

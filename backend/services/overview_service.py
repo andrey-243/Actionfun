@@ -302,12 +302,13 @@ def _fetch_news(ticker: str) -> tuple[list[dict], str | None]:
 
 
 def _filter_24h(articles: list[dict]) -> list[dict]:
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+    now = datetime.now(timezone.utc)
+    today_midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
     result = []
     for a in articles:
         try:
             pub = datetime.fromisoformat(a["pub_date"].replace("Z", "+00:00"))
-            if pub >= cutoff:
+            if pub >= today_midnight:
                 result.append(a)
         except Exception:
             pass
@@ -439,7 +440,8 @@ def _write_dumb_to_archive(ticker: str, articles: list[dict], lang: str, supa) -
 # ─── Call 1 — DUMB + OW 24H (TTL 3h) ─────────────────────────────────────────
 
 def _call1_dumb_ow24h(ticker: str, fresh_articles: list[dict], row: dict | None,
-                      supa, website: str | None, lang: str, now: datetime) -> dict:
+                      supa, website: str | None, lang: str, now: datetime,
+                      ctx: dict | None = None) -> dict:
     dumb_field = "dumb_en" if lang == "en" else "dumb_fr"
 
     # LLM2: skip brutalise si les articles n'ont pas changé depuis le dernier run
@@ -458,7 +460,8 @@ def _call1_dumb_ow24h(ticker: str, fresh_articles: list[dict], row: dict | None,
     if not to_brutalise:
         to_brutalise = fresh_articles[:30]
 
-    ctx = _get_stock_context(ticker)
+    if ctx is None:
+        ctx = _get_stock_context(ticker)
     ctx_7d = _format_stock_context_7d(ctx)
     ctx_24h = _format_stock_context_24h(ctx)
 
@@ -533,11 +536,12 @@ def _call1_dumb_ow24h(ticker: str, fresh_articles: list[dict], row: dict | None,
 # ─── Call 2 — OW 7J (TTL 24h) ─────────────────────────────────────────────────
 
 def _call2_ow7d(ticker: str, fresh_articles: list[dict], row: dict | None,
-                supa, lang: str, now: datetime) -> dict:
+                supa, lang: str, now: datetime, ctx: dict | None = None) -> dict:
     dumb_field = "dumb_en" if lang == "en" else "dumb_fr"
     has_dumb = any(a.get(dumb_field) for a in fresh_articles)
 
-    ctx = _get_stock_context(ticker)
+    if ctx is None:
+        ctx = _get_stock_context(ticker)
     ctx_7d = _format_stock_context_7d(ctx)
 
     if has_dumb:
@@ -579,7 +583,41 @@ def _call2_ow7d(ticker: str, fresh_articles: list[dict], row: dict | None,
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
-def get_news(ticker: str, lang: str = None) -> dict:
+def get_news_stale(ticker: str, lang: str = None) -> tuple[dict | None, bool]:
+    """
+    Retourne (cached_result, needs_refresh) sans jamais appeler le LLM.
+    None si aucun cache — l'appelant doit faire un appel bloquant.
+    """
+    ticker = ticker.upper()
+    lang = lang or os.environ.get("LLM_LANG", "en")
+    batch_mode = os.environ.get("BATCH_MODE") == "1"
+    supa = _get_supabase()
+
+    cache = supa.table("stock_news_cache").select("*").eq("ticker", ticker).limit(1).execute()
+    row = cache.data[0] if cache.data else None
+
+    if row is None or not row.get("cached_at"):
+        return None, True
+
+    now = datetime.now(timezone.utc)
+    needs_refresh = (_needs_24h_refresh(row, now) and not batch_mode) or _needs_7d_refresh(row, now)
+
+    if not row.get("exchange"):
+        try:
+            exchange = yf.Ticker(ticker).fast_info.exchange or ""
+            if exchange:
+                supa.table("stock_news_cache").update({"exchange": exchange}).eq("ticker", ticker).execute()
+                row["exchange"] = exchange
+        except Exception:
+            pass
+
+    fresh_articles, _ = _fetch_news(ticker)
+    result = _build_response(ticker, fresh_articles, row)
+    result["is_refreshing"] = needs_refresh
+    return result, needs_refresh
+
+
+def get_news(ticker: str, lang: str = None, force_24h: bool = False) -> dict:
     ticker = ticker.upper()
     lang = lang or os.environ.get("LLM_LANG", "en")
     batch_mode = os.environ.get("BATCH_MODE") == "1"
@@ -589,7 +627,7 @@ def get_news(ticker: str, lang: str = None) -> dict:
     row = cache.data[0] if cache.data else None
 
     now = datetime.now(timezone.utc)
-    needs_24h = _needs_24h_refresh(row, now) and not batch_mode
+    needs_24h = (_needs_24h_refresh(row, now) or force_24h) and not batch_mode
     needs_7d  = _needs_7d_refresh(row, now)
 
     fresh_articles, website = _fetch_news(ticker)
@@ -606,11 +644,13 @@ def get_news(ticker: str, lang: str = None) -> dict:
             "summary_24h": "", "sentiment_24h": "NEUTRAL", "sentiment_reason_24h": "",
         }
 
+    ctx = _get_stock_context(ticker) if (needs_24h or needs_7d) else None
+
     if needs_24h:
-        row = _call1_dumb_ow24h(ticker, fresh_articles, row, supa, website, lang, now)
+        row = _call1_dumb_ow24h(ticker, fresh_articles, row, supa, website, lang, now, ctx=ctx)
 
     if needs_7d:
-        row = _call2_ow7d(ticker, fresh_articles, row, supa, lang, now)
+        row = _call2_ow7d(ticker, fresh_articles, row, supa, lang, now, ctx=ctx)
 
     return _build_response(ticker, fresh_articles, row)
 
@@ -700,7 +740,7 @@ def run_hourly_news_refresh() -> list[str]:
                 supa.table("stock_news_cache").update({"cached_at": now.isoformat()}).eq("ticker", ticker).execute()
                 logger.info(f"[hourly_refresh] {ticker} — toujours 0 news 24h")
                 continue
-            get_news(ticker)
+            get_news(ticker, force_24h=True)
             logger.info(f"[hourly_refresh] ✓ {ticker} — {len(articles_24h)} articles 24h")
             _maybe_regen_weekly(ticker, supa, logger)
             refreshed.append(ticker)

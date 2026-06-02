@@ -14,7 +14,7 @@ import services.llm_service as _lsvc
 from services.llm_service import (
     _freetheai_available, _next_utc_midnight, _notify_telegram, _log_usage,
     FREETHEAI_URL, FREETHEAI_SECONDARY,
-    HAPUPPY_URL, HAPUPPY_MODEL, HAPUPPY_FAIL_THRESHOLD, HAPUPPY_FREEZE_SECONDS,
+    HAPUPPY_URL, HAPUPPY_MODEL, HAPUPPY_QUOTA_FREEZE_SECONDS,
     GROQ_URL,
     _notif_sent_at, NOTIF_THROTTLE,
 )
@@ -47,7 +47,7 @@ def _send_translate_notif(reason: str, trail: list[str]) -> None:
         "all_down":        "🔴 *Traduction — tous les providers en échec*\nEN conservé en DB, retry au prochain batch.",
     }
     header = headers.get(reason, f"🟠 *Traduction — {reason}*")
-    _notify_telegram(f"{header}\n\n" + "\n".join(trail))
+    _notify_telegram(f"{header}\n\n" + "\n".join(trail) + "\n📍 _translation\\_service_")
 
 
 # ─── Public API ───────────────────────────────────────────────────────────────
@@ -128,56 +128,48 @@ def translate_to_fr(text: str) -> str:
     else:
         trail.append(f"FreeTheAI `{FREETHEAI_SECONDARY}` : ⏭ skipped (checkin/quota/RPM/circuit breaker)")
 
-    # 4. Hapuppy gpt-4.1-mini — partage le circuit breaker de llm_service
+    # 4. Hapuppy gpt-4.1-mini — partage le quota skip de llm_service
     hapuppy_key = os.environ.get("HAPUPPY_API_KEY", "")
     if hapuppy_key:
         now_mono = time.monotonic()
-        frozen = _lsvc._hapuppy_freeze_until is not None and now_mono < _lsvc._hapuppy_freeze_until
-        is_probe = _lsvc._hapuppy_freeze_until is not None and now_mono >= _lsvc._hapuppy_freeze_until
+        if _lsvc._hapuppy_quota_skip_until is not None:
+            if now_mono < _lsvc._hapuppy_quota_skip_until:
+                trail.append(f"Hapuppy `{HAPUPPY_MODEL}` : ⏭ frozen (quota épuisé)")
+                hapuppy_key = ""
+            else:
+                _lsvc._hapuppy_quota_skip_until = None
 
-        if frozen:
-            trail.append(f"Hapuppy `{HAPUPPY_MODEL}` : ⏭ frozen (circuit breaker)")
-        else:
-            ok = False
-            try:
-                _lsvc._hapuppy_last_attempt = time.monotonic()
-                r = httpx.post(
-                    HAPUPPY_URL,
-                    headers={"Authorization": f"Bearer {hapuppy_key}", "Content-Type": "application/json"},
-                    json={
-                        "model": HAPUPPY_MODEL,
-                        "messages": [{"role": "user", "content": TRANSLATE_PROMPT.format(text=text)}],
-                        "max_tokens": 1000,
-                        "temperature": 0.1,
-                    },
-                    timeout=30,
-                )
-                if r.status_code == 200:
-                    content = r.json()["choices"][0]["message"]["content"].strip()
-                    if content:
-                        ok = True
-                        if is_probe or _lsvc._hapuppy_fail_count > 0:
-                            _lsvc._hapuppy_fail_count = 0
-                            _lsvc._hapuppy_freeze_until = None
-                        u = r.json().get("usage", {})
-                        _log_usage(HAPUPPY_MODEL, u.get("prompt_tokens", 0), u.get("completion_tokens", 0))
-                        trail.append(f"Hapuppy `{HAPUPPY_MODEL}` : ✓")
-                        _send_translate_notif("hapuppy_used", trail)
-                        return content
-                else:
-                    trail.append(f"Hapuppy `{HAPUPPY_MODEL}` : ✗ {r.status_code}")
-            except Exception as e:
-                trail.append(f"Hapuppy `{HAPUPPY_MODEL}` : ✗ {e}")
-
-            if not ok:
-                if is_probe:
-                    _lsvc._hapuppy_freeze_until = time.monotonic() + HAPUPPY_FREEZE_SECONDS
-                else:
-                    _lsvc._hapuppy_fail_count += 1
-                    if _lsvc._hapuppy_fail_count >= HAPUPPY_FAIL_THRESHOLD:
-                        _lsvc._hapuppy_freeze_until = time.monotonic() + HAPUPPY_FREEZE_SECONDS
-                        _lsvc._hapuppy_fail_count = 0
+    if hapuppy_key:
+        try:
+            _lsvc._hapuppy_last_attempt = time.monotonic()
+            r = httpx.post(
+                HAPUPPY_URL,
+                headers={"Authorization": f"Bearer {hapuppy_key}", "Content-Type": "application/json"},
+                json={
+                    "model": HAPUPPY_MODEL,
+                    "messages": [{"role": "user", "content": TRANSLATE_PROMPT.format(text=text)}],
+                    "max_tokens": 1000,
+                    "temperature": 0.1,
+                },
+                timeout=30,
+            )
+            if r.status_code == 200:
+                content = r.json()["choices"][0]["message"]["content"].strip()
+                if content:
+                    u = r.json().get("usage", {})
+                    _log_usage(HAPUPPY_MODEL, u.get("prompt_tokens", 0), u.get("completion_tokens", 0))
+                    trail.append(f"Hapuppy `{HAPUPPY_MODEL}` : ✓")
+                    return content
+            elif r.status_code == 429:
+                _lsvc._hapuppy_quota_skip_until = time.monotonic() + HAPUPPY_QUOTA_FREEZE_SECONDS
+                trail.append(f"Hapuppy `{HAPUPPY_MODEL}` : ✗ 429 quota épuisé")
                 _send_translate_notif("hapuppy_down", trail)
+            else:
+                trail.append(f"Hapuppy `{HAPUPPY_MODEL}` : ✗ {r.status_code}")
+                _send_translate_notif("hapuppy_down", trail)
+        except Exception as e:
+            trail.append(f"Hapuppy `{HAPUPPY_MODEL}` : ✗ {e}")
+            _send_translate_notif("hapuppy_down", trail)
     else:
         trail.append(f"Hapuppy `{HAPUPPY_MODEL}` : ⏭ skipped (clé manquante)")
 

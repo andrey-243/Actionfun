@@ -136,6 +136,36 @@ def get_event_news(ticker: str, date: str, change_pct: float = 0.0) -> dict:
         for a in raw_articles
         if a.get("headline") and from_ts <= a.get("datetime", 0) <= to_ts
     ]
+
+    # Fallback ±6j si rien dans ±3j
+    if not articles:
+        from_ts6 = int((dt - timedelta(days=6)).replace(tzinfo=timezone.utc).timestamp())
+        to_ts6   = int((dt + timedelta(days=7)).replace(tzinfo=timezone.utc).timestamp())
+        year_months6: set[str] = set()
+        cursor = (dt - timedelta(days=6)).replace(day=1)
+        while cursor <= dt + timedelta(days=6):
+            year_months6.add(cursor.strftime("%Y-%m"))
+            cursor = (cursor.replace(day=28) + timedelta(days=4)).replace(day=1)
+        for ym in sorted(year_months6 - year_months):
+            r = supa.table("articles_merged_finn_yahoo") \
+                .select("articles") \
+                .eq("ticker", ticker) \
+                .eq("year_month", ym) \
+                .maybe_single() \
+                .execute()
+            if r and r.data and r.data.get("articles"):
+                raw_articles.extend(r.data["articles"])
+        articles = [
+            {
+                "headline": a["headline"],
+                "source":   a.get("source", ""),
+                "url":      a.get("url", ""),
+                "datetime": a.get("datetime", 0),
+                "summary":  a.get("summary", ""),
+            }
+            for a in raw_articles
+            if a.get("headline") and from_ts6 <= a.get("datetime", 0) <= to_ts6
+        ]
     event_ts = int(dt.replace(tzinfo=timezone.utc).timestamp())
     articles.sort(key=lambda a: abs(a["datetime"] - event_ts))
     articles = articles[:12]

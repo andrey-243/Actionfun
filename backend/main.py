@@ -24,7 +24,7 @@ def _tg(msg: str):
     try:
         httpx.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat_id, "text": f"{msg} · _{now}_", "parse_mode": "Markdown"},
+            json={"chat_id": chat_id, "text": f"{msg} · _{now}_ · 📍 _cron_", "parse_mode": "Markdown"},
             timeout=5,
         )
     except Exception:
@@ -232,7 +232,9 @@ def _run_hourly_news_refresh():
     try:
         refreshed = run_hourly_news_refresh()
         if refreshed:
-            _tg(f"✅ *News refresh* — {' · '.join(sorted(refreshed))} sortis du pool no\\_news")
+            from datetime import datetime, timezone
+            now_utc = datetime.now(timezone.utc).strftime("%H:%M UTC")
+            _tg(f"✅ *News refresh* — {' · '.join(sorted(refreshed))} sortis du pool no\\_news · {now_utc} · 📍 cron `hourly_news_refresh` (:15)")
     except Exception as e:
         logger.error(f"Hourly news refresh failed: {e}")
         _tg(f"❌ *Hourly news refresh* (:15) : `{e}`")
@@ -295,3 +297,11 @@ app.include_router(cold_start.router, prefix="/api")
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.post("/admin/hapuppy/unfreeze")
+def hapuppy_unfreeze():
+    import services.llm_service as _llm
+    was_frozen = _llm._hapuppy_quota_skip_until is not None
+    _llm._hapuppy_quota_skip_until = None
+    return {"unfrozen": was_frozen}

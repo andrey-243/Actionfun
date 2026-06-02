@@ -827,6 +827,12 @@ def run_yahoo_accumulation() -> dict[str, int]:
             added = _accumulate_yahoo(ticker, current_ym, supa)
             if added > 0:
                 results[ticker] = added
+                try:
+                    from services.overview_service import get_news
+                    get_news(ticker, force_24h=True)
+                    logger.info(f"  OW refresh triggered {ticker} (+{added} articles)")
+                except Exception as ow_err:
+                    logger.warning(f"  OW refresh failed {ticker}: {ow_err}")
         except Exception as e:
             logger.error(f"  ✗ Yahoo accumulation {ticker}: {e}")
 
@@ -910,14 +916,34 @@ def run_finnhub_refresh() -> dict[str, int]:
     results: dict[str, int] = {}
     for ticker in eligible:
         try:
+            articles_before = _current_article_count(ticker, current_ym, supa)
             articles, source = _get_or_fetch_month(ticker, current_ym, supa)
+            added = len(articles) - articles_before
             logger.info(f"  ✓ Finnhub {ticker}: {len(articles)} articles (source={source})")
             if articles:
                 results[ticker] = len(articles)
+            if added > 0:
+                try:
+                    from services.overview_service import get_news
+                    get_news(ticker, force_24h=True)
+                    logger.info(f"  OW refresh triggered {ticker} (+{added} articles)")
+                except Exception as ow_err:
+                    logger.warning(f"  OW refresh failed {ticker}: {ow_err}")
         except Exception as e:
             logger.error(f"  ✗ Finnhub refresh {ticker}: {e}")
 
     return results
+
+
+def _current_article_count(ticker: str, year_month: str, supa) -> int:
+    row = supa.table("articles_merged_finn_yahoo") \
+        .select("articles") \
+        .eq("ticker", ticker) \
+        .eq("year_month", year_month) \
+        .limit(1) \
+        .execute()
+    arts = (row.data[0].get("articles") or []) if row.data else []
+    return len(arts)
 
 
 def _get_eligible_tickers(supa, min_users: int = 3) -> set[str]:

@@ -193,6 +193,24 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON public.pinned_stocks TO anon;
 
 ---
 
+## 2026-06-01 · Graphique 24H vide — `idx.date()` supprime l'heure
+
+**Symptôme** : Le graphique en vue 24H est complètement vide pour toutes les actions.
+
+**Cause** : `yfinance_service.py` formattait chaque point comme `str(idx.date())` pour toutes les périodes. Pour `1d` (bougies 5-min), `idx` est un datetime avec heure, mais `.date()` le tronque → tous les ~78 points du jour obtiennent la même label `"2026-06-01"` → Chart.js ne peut pas tracer de courbe avec des labels identiques.
+
+**Fix** : Formater en `HH:MM` pour `1d`, garder `YYYY-MM-DD` pour les autres périodes :
+```python
+def _fmt(idx):
+    if period == "1d":
+        return idx.strftime("%H:%M")
+    return str(idx.date())
+```
+
+**Règle** : Pour les périodes intraday (interval < 1j), toujours inclure l'heure dans le label, sinon tous les points se superposent.
+
+---
+
 ## 2026-05-31 · Nouveau champ upsert Supabase — colonne manquante en DB
 
 **Symptôme** : `PGRST204 — Could not find the 'articles_hash' column of 'stock_news_cache' in the schema cache` → 500 sur `/api/news/{ticker}` → "Failed to fetch" côté frontend.

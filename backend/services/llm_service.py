@@ -13,6 +13,7 @@ import httpx
 import time
 import os
 import json
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -39,14 +40,18 @@ def _log_usage(model: str, tokens_in: int, tokens_out: int) -> None:
 
 
 def _notify_telegram(message: str) -> None:
+    import re
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
     if not token or not chat_id:
         return
+    html = re.sub(r'\*([^*]+)\*', r'<b>\1</b>', message)
+    html = re.sub(r'`([^`]+)`', r'<code>\1</code>', html)
+    html = re.sub(r'(?<!\w)_([^_\n]+)_(?!\w)', r'<i>\1</i>', html)
     try:
         httpx.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat_id, "text": message, "parse_mode": "Markdown"},
+            json={"chat_id": chat_id, "text": html, "parse_mode": "HTML"},
             timeout=5,
         )
     except Exception:
@@ -60,22 +65,38 @@ FREETHEAI_PRIMARY = "bbl/gpt-4.1"
 FREETHEAI_SECONDARY = "bbl/gpt-5.4-mini"
 HAPUPPY_MODEL = "gpt-4.1-mini"
 
-# Désactive FreeTheAI jusqu'au prochain minuit UTC quand checkin manquant
+# Désactive FreeTheAI jusqu'au prochain minuit UTC quand checkin/quota daily
 _freetheai_skip_until: datetime | None = None
-_freetheai_last_attempt: float = 0.0
-FREETHEAI_MIN_INTERVAL = float(os.environ.get("FREETHEAI_MIN_INTERVAL", "6.0"))  # 10 RPM → 6s min
 
 # Circuit breaker FreeTheAI 502/503/timeout — par round (pas par tentative modèle)
 _freetheai_fail_count: int = 0
 _freetheai_fail_freeze_until: float | None = None  # monotonic timestamp
-FREETHEAI_FAIL_THRESHOLD = 3       # rounds échoués consécutifs avant freeze
+FREETHEAI_FAIL_THRESHOLD = 3
 FREETHEAI_FAIL_FREEZE_SECONDS = 1800  # 30 min
 
-# Hapuppy — freeze uniquement sur 429 quota épuisé (rolling window ~4h)
+# Freeze 3h après 3 × 429 consécutifs (RPM saturé)
+_freetheai_429_count: int = 0
+FREETHEAI_429_THRESHOLD = 3
+FREETHEAI_429_FREEZE_SECONDS = int(os.environ.get("FREETHEAI_429_FREEZE_SECONDS", str(3 * 3600)))
+_freetheai_429_freeze_until: float | None = None
+
+# 2 concurrents FreeTheAI — non-bloquant → ~7 RPM via latence naturelle (~17s/call)
+# MIN_INTERVAL supprimé : semaphore + compteur 429 suffisent
+FREETHEAI_CONCURRENCY = int(os.environ.get("FREETHEAI_CONCURRENCY", "1"))
+_freetheai_semaphore = threading.Semaphore(FREETHEAI_CONCURRENCY)
+
+# Hapuppy — concurrence limitée (semaphore partagé entre threads)
+HAPUPPY_CONCURRENCY = int(os.environ.get("HAPUPPY_CONCURRENCY", "3"))
+_hapuppy_semaphore = threading.Semaphore(HAPUPPY_CONCURRENCY)
+
+# Hapuppy — freeze quota (4h) vs rate-limit (2min)
 HAPUPPY_QUOTA_FREEZE_SECONDS = int(os.environ.get("HAPUPPY_QUOTA_FREEZE_SECONDS", str(4 * 3600)))
+HAPUPPY_RATELIMIT_FREEZE_SECONDS = int(os.environ.get("HAPUPPY_RATELIMIT_FREEZE_SECONDS", "10"))
 _hapuppy_quota_skip_until: float | None = None  # monotonic timestamp
 _hapuppy_last_attempt: float = 0.0
 HAPUPPY_MIN_INTERVAL = float(os.environ.get("HAPUPPY_MIN_INTERVAL", "0.0"))  # pas de throttle par défaut
+
+_HAPUPPY_QUOTA_KEYWORDS = ("quota", "credit", "budget", "exhausted", "daily limit")
 
 # Throttle notifs Groq/Hapuppy — 1 ping par raison toutes les 30 min max
 _notif_sent_at: dict[str, float] = {}
@@ -113,27 +134,33 @@ def _send_cascade_notif(reason: str, trail: list[str]) -> None:
         return
     _notif_sent_at[key] = now
     header = _CASCADE_HEADERS.get(reason, f"🟠 *Cascade LLM — {reason}*")
-    _notify_telegram(f"{header}\n\n" + "\n".join(trail))
+    _notify_telegram(f"{header}\n\n" + "\n".join(trail) + "\n📍 <i>llm_service</i>")
 
 
 def _freetheai_available() -> bool:
-    global _freetheai_skip_until, _freetheai_last_attempt, _freetheai_fail_freeze_until, _freetheai_fail_count
+    global _freetheai_skip_until, _freetheai_fail_freeze_until, _freetheai_fail_count
+    global _freetheai_429_count, _freetheai_429_freeze_until
+    now_mono = time.monotonic()
+    # Checkin / quota daily → minuit UTC
     if _freetheai_skip_until is not None:
         if datetime.now(timezone.utc) >= _freetheai_skip_until:
             _freetheai_skip_until = None
         else:
             return False
-    # Circuit breaker 502/503/timeout : freeze 30min après 3 rounds échoués
+    # Circuit breaker 502/503/timeout → 30min
     if _freetheai_fail_freeze_until is not None:
-        now_mono = time.monotonic()
         if now_mono < _freetheai_fail_freeze_until:
             return False
-        else:
-            # Probe : reset freeze, on retente
-            _freetheai_fail_freeze_until = None
-            _freetheai_fail_count = 0
-    # Respecter le RPM : si dernier appel < 6s → skip sans sleep (Groq prend le relais)
-    if time.monotonic() - _freetheai_last_attempt < FREETHEAI_MIN_INTERVAL:
+        _freetheai_fail_freeze_until = None
+        _freetheai_fail_count = 0
+    # 429 × 3 → freeze 3h
+    if _freetheai_429_freeze_until is not None:
+        if now_mono < _freetheai_429_freeze_until:
+            return False
+        _freetheai_429_freeze_until = None
+        _freetheai_429_count = 0
+    # Semaphore non-bloquant : max FREETHEAI_CONCURRENCY=2 calls simultanés
+    if not _freetheai_semaphore.acquire(blocking=False):
         return False
     return True
 
@@ -192,54 +219,65 @@ def llm_call(
     global _last_llm_source
 
     # ── FreeTheAI ──────────────────────────────────────────────────────────────
+    # _freetheai_available() acquiert _freetheai_semaphore(1) si dispo — relâché en fin de bloc
     if freetheai_key and _freetheai_available():
         global _freetheai_fail_count, _freetheai_fail_freeze_until
-        _round_failed = False  # True si primary+secondary échouent (502/503/timeout)
-        for model in [FREETHEAI_PRIMARY, FREETHEAI_SECONDARY]:
-            try:
-                _freetheai_last_attempt = time.monotonic()
-                r = httpx.post(
-                    FREETHEAI_URL,
-                    headers={"Authorization": f"Bearer {freetheai_key}", "Content-Type": "application/json"},
-                    json={**payload_base, "model": model},
-                    timeout=timeout,
-                )
+        global _freetheai_429_count, _freetheai_429_freeze_until
+        _round_failed = False
+        try:
+            for model in [FREETHEAI_PRIMARY, FREETHEAI_SECONDARY]:
+                try:
+                    r = httpx.post(
+                        FREETHEAI_URL,
+                        headers={"Authorization": f"Bearer {freetheai_key}", "Content-Type": "application/json"},
+                        json={**payload_base, "model": model},
+                        timeout=timeout,
+                    )
 
-                if r.status_code == 403 or _is_checkin_error(r):
-                    _freetheai_skip_until = _next_utc_midnight()
-                    groq_reason = "checkin"
-                    trail.append(f"FreeTheAI `{model}` : ✗ checkin manquant")
-                    break
+                    if r.status_code == 403 or _is_checkin_error(r):
+                        _freetheai_skip_until = _next_utc_midnight()
+                        groq_reason = "checkin"
+                        trail.append(f"FreeTheAI `{model}` : ✗ checkin manquant")
+                        break
 
-                if _is_daily_limit_error(r):
-                    _freetheai_skip_until = _next_utc_midnight()
-                    groq_reason = "daily_limit"
-                    trail.append(f"FreeTheAI `{model}` : ✗ quota journalier épuisé")
-                    break
+                    if _is_daily_limit_error(r):
+                        _freetheai_skip_until = _next_utc_midnight()
+                        groq_reason = "daily_limit"
+                        trail.append(f"FreeTheAI `{model}` : ✗ quota journalier épuisé")
+                        break
 
-                if r.status_code == 200:
-                    _freetheai_fail_count = 0  # reset sur succès
-                    result = r.json()
-                    result["_llm_source"] = "freetheai"
-                    _last_llm_source = "freetheai"
-                    u = result.get("usage", {})
-                    _log_usage(model, u.get("prompt_tokens", 0), u.get("completion_tokens", 0))
-                    return result
+                    if r.status_code == 200:
+                        _freetheai_fail_count = 0
+                        _freetheai_429_count = 0
+                        result = r.json()
+                        result["_llm_source"] = "freetheai"
+                        _last_llm_source = "freetheai"
+                        u = result.get("usage", {})
+                        _log_usage(model, u.get("prompt_tokens", 0), u.get("completion_tokens", 0))
+                        return result
 
-                if r.status_code == 429:
-                    groq_reason = "rpm_429"
-                    trail.append(f"FreeTheAI `{model}` : ✗ rate limit (429)")
-                    break
+                    if r.status_code == 429:
+                        _freetheai_429_count += 1
+                        groq_reason = "rpm_429"
+                        trail.append(f"FreeTheAI `{model}` : ✗ 429 ({_freetheai_429_count}/{FREETHEAI_429_THRESHOLD})")
+                        if _freetheai_429_count >= FREETHEAI_429_THRESHOLD:
+                            _freetheai_429_freeze_until = time.monotonic() + FREETHEAI_429_FREEZE_SECONDS
+                            _freetheai_429_count = 0
+                            trail.append(f"FreeTheAI : freeze {FREETHEAI_429_FREEZE_SECONDS//3600}h (429 × {FREETHEAI_429_THRESHOLD})")
+                            _send_cascade_notif("freetheai_down_frozen", trail)
+                        break
 
-                # 502 / 503 → essai sur le secondary puis marque round échoué
-                trail.append(f"FreeTheAI `{model}` : ✗ {r.status_code}")
-                _round_failed = True
-                continue
+                    # 502 / 503 → essai sur le secondary puis marque round échoué
+                    trail.append(f"FreeTheAI `{model}` : ✗ {r.status_code}")
+                    _round_failed = True
+                    continue
 
-            except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError):
-                trail.append(f"FreeTheAI `{model}` : ✗ timeout/connexion")
-                _round_failed = True
-                continue
+                except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError):
+                    trail.append(f"FreeTheAI `{model}` : ✗ timeout/connexion")
+                    _round_failed = True
+                    continue
+        finally:
+            _freetheai_semaphore.release()
 
         # Circuit breaker : 3 rounds échoués → freeze 30min
         if _round_failed:
@@ -272,12 +310,13 @@ def llm_call(
             for attempt in range(3):
                 try:
                     _hapuppy_last_attempt = time.monotonic()
-                    r = httpx.post(
-                        HAPUPPY_URL,
-                        headers={"Authorization": f"Bearer {hapuppy_key}", "Content-Type": "application/json"},
-                        json={**payload_base, "model": HAPUPPY_MODEL},
-                        timeout=timeout,
-                    )
+                    with _hapuppy_semaphore:
+                        r = httpx.post(
+                            HAPUPPY_URL,
+                            headers={"Authorization": f"Bearer {hapuppy_key}", "Content-Type": "application/json"},
+                            json={**payload_base, "model": HAPUPPY_MODEL},
+                            timeout=timeout,
+                        )
                     if r.status_code == 200:
                         result = r.json()
                         u = result.get("usage", {})
@@ -288,10 +327,22 @@ def llm_call(
                         _send_cascade_notif(groq_reason, trail)
                         return result
                     elif r.status_code == 429:
-                        _hapuppy_quota_skip_until = time.monotonic() + HAPUPPY_QUOTA_FREEZE_SECONDS
-                        trail.append(f"Hapuppy `{HAPUPPY_MODEL}` : ✗ 429 quota épuisé")
-                        _send_cascade_notif("hapuppy_quota", trail)
-                        break
+                        try:
+                            body_text = r.text.lower()
+                        except Exception:
+                            body_text = ""
+                        is_quota = any(k in body_text for k in _HAPUPPY_QUOTA_KEYWORDS)
+                        if is_quota:
+                            _hapuppy_quota_skip_until = time.monotonic() + HAPUPPY_QUOTA_FREEZE_SECONDS
+                            trail.append(f"Hapuppy `{HAPUPPY_MODEL}` : ✗ 429 quota épuisé")
+                            _send_cascade_notif("hapuppy_quota", trail)
+                            break
+                        else:
+                            # Rate-limit : sleep local + retry dans ce thread, pas de freeze global
+                            trail.append(f"Hapuppy `{HAPUPPY_MODEL}` : ✗ 429 rate-limit (attempt {attempt + 1}/3, retry 5s)")
+                            if attempt < 2:
+                                time.sleep(5)
+                            continue
                     else:
                         trail.append(f"Hapuppy `{HAPUPPY_MODEL}` : ✗ {r.status_code} (attempt {attempt + 1}/3)")
                         if attempt < 2:
