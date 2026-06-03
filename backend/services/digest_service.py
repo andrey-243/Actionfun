@@ -1,3 +1,13 @@
+"""
+EOD Digest — génère et envoie le digest email 18h30.
+
+run_eod_digest_email() :
+  - Lit user_preferences (notify_email=True, digest_tickers non vide)
+  - Pour chaque ticker : stock_news_cache (ai_summary_24h_en + sentiment)
+                       + articles_merged_finn_yahoo (articles 24h)
+  - Construit le HTML via email_service et envoie via Resend
+  - Zéro appel LLM — tout lu depuis le cache existant
+"""
 import httpx
 import os
 import logging

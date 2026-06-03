@@ -1,3 +1,10 @@
+"""
+Email — construction HTML et envoi via Resend SDK.
+
+send_digest_email(to, digests) : formate les DigestCard en HTML et envoie.
+Sandbox : RESEND_FROM_EMAIL=onboarding@resend.dev (livraison uniquement vers l'adresse du compte).
+Prod : vérifier un domaine dans Resend dashboard et changer RESEND_FROM_EMAIL.
+"""
 import os
 from datetime import date
 import resend

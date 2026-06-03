@@ -1,3 +1,10 @@
+"""
+GET  /api/ticker/{ticker}/init-status  → statut cold start (phase, eta, label)
+POST /api/ticker/{ticker}/init         → déclenche le cold start si nécessaire
+
+Cold start = scrape progressif pour les tickers rares (hors top 250) :
+  1m → 6m → 1y, chaque phase trigger en background depuis cold_start_service.
+"""
 from fastapi import APIRouter, BackgroundTasks
 from services.cold_start_service import (
     get_init_status, needs_cold_start, trigger_cold_start,

@@ -1,3 +1,11 @@
+"""
+Données boursières via yfinance (+ curl_cffi pour bypass Yahoo rate limit).
+
+get_stock_data(ticker, period) :
+  - Prix courant, previous_close, change_pct, market_cap, PE, 52W high/low
+  - Série chart (date → close) selon période/intervalle
+  - Labels 24H en HH:MM (bougies 5-min), autres périodes en YYYY-MM-DD
+"""
 import yfinance as yf
 from datetime import datetime, timezone
 

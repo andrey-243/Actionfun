@@ -1,3 +1,12 @@
+"""
+BUB — cause IA des événements chart (dots peaks/valleys).
+
+get_event_news(ticker, date, change_pct) :
+  - Cherche articles Finnhub T-3→T+3 (fallback T-6→T+6 si 0 articles)
+  - Envoie au LLM : prix T-5→T+3 + benchmark (S&P/CAC/DAX/FTSE selon exchange) + headlines
+  - Cache permanent dans event_causes (cause_en + cause_fr)
+  - Benchmark déterminé depuis stock_news_cache.exchange
+"""
 import yfinance as yf
 import os
 from datetime import datetime, timedelta, timezone

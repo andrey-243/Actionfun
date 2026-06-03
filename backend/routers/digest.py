@@ -1,3 +1,12 @@
+"""
+GET /api/weekly/{ticker}  → weekly summary + articles 7j pour la page "Mes news"
+
+Lit depuis :
+  - article_week_summaries (résumé AI hebdo si disponible)
+  - articles_merged_finn_yahoo (articles 7j bruts, normalisés)
+  - stock_news_cache (website pour logo)
+Zéro appel LLM à la volée.
+"""
 from fastapi import APIRouter, HTTPException
 from supabase import create_client
 from datetime import datetime, timezone, timedelta

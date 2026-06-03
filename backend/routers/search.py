@@ -1,3 +1,9 @@
+"""
+GET /api/search?q=
+
+Recherche de tickers via l'API Finnhub symbol search.
+Filtre sur types EQUITY, ETF, CRYPTOCURRENCY. Retourne ticker + description.
+"""
 from fastapi import APIRouter, HTTPException, Query
 import httpx
 

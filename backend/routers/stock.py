@@ -1,3 +1,9 @@
+"""
+GET /api/stock/{ticker}?period=
+
+Prix courant, stats (market cap, PE, 52W high/low) et données chart via yfinance.
+Délègue à yfinance_service.get_stock_data. Périodes valides : 1d 5d 1mo 6mo 1y 5y max.
+"""
 from fastapi import APIRouter, HTTPException, Query
 from services.yfinance_service import get_stock_data
 

@@ -47,3 +47,4 @@ Thumbs.db
 # Supabase local
 supabase/.branches/
 supabase/.temp/
+backend/scripts/refresh_breakers_*.json

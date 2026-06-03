@@ -1,3 +1,18 @@
+"""
+Point d'entrée FastAPI.
+
+Enregistre tous les routers (/api/stock, /api/news, /api/search, /api/events,
+/api/articles, /api/weekly, /api/ticker) et démarre APScheduler avec les crons :
+  - yahoo */3h      : merge articles + trigger OW si nouveaux articles
+  - finnhub */6h    : idem côté Finnhub
+  - hourly :15      : refresh OW pour tickers no_24h_news
+  - email 18h30     : EOD digest Resend
+  - weekly lun 3h30 : condensation weekly summaries
+  - monthly 1er 4h  : condensation monthly calendaire
+  - yearly 1er jan  : condensation yearly summaries
+  - re-enrich 22h30 : re-process records Groq → FreeTheAI
+  - purge lun 3h    : event_causes > 1 an
+"""
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager

@@ -1,3 +1,13 @@
+"""
+GET /api/articles/{ticker}?period=
+
+Retourne les sections articles + résumés AI (Breaks) selon la période :
+  1mo  → semaines W1-W4 (article_week_summaries + articles bruts)
+  6mo  → mois (article_month_summaries + articles bruts)
+  1y   → mois (article_month_summaries + articles bruts)
+  all  → 5Y mois par mois : breaker si dispo, sinon articles bruts
+         Source : breakers_articles_service.get_period_articles / get_all_available
+"""
 from fastapi import APIRouter, HTTPException, Query
 
 router = APIRouter()

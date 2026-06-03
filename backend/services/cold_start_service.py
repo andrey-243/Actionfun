@@ -269,8 +269,6 @@ def _condense(ticker: str, phase: str):
             except Exception as e:
                 logger.warning(f"[cold_start] weekly {ticker} {ym} W{wnum}: {e}")
 
-        _purge_excess_weeklies(ticker, supa, max_weeks=5)
-
     # Monthlies à partir de 6M
     if phase in ("6m", "1y"):
         for ym in months_to_condense:
@@ -292,6 +290,9 @@ def _condense(ticker: str, phase: str):
                 }).execute()
             except Exception as e:
                 logger.warning(f"[cold_start] monthly {ticker} {ym}: {e}")
+
+    # Purge après W→M (garder 5 semaines récentes pour la vue 1M)
+    _purge_excess_weeklies(ticker, supa, max_weeks=5)
 
 
 def _months_in_range(start: date, end: date) -> list[str]:

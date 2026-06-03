@@ -1,3 +1,9 @@
+"""
+GET /api/events/{ticker}?date=&change_pct=
+
+Retourne la cause IA d'un événement chart (BUB) pour une date donnée.
+Cache permanent dans event_causes. Délègue à bubble_service.get_event_news.
+"""
 from fastapi import APIRouter, HTTPException, Query
 from services.bubble_service import get_event_news
 
