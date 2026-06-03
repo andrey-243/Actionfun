@@ -1,3 +1,19 @@
+"""
+Breaks — articles par période et condensation IA (weekly / monthly / yearly).
+
+Fonctions principales :
+  get_period_articles(ticker, period)  → 1mo/6mo/1y : sections W1-W4 ou mois, résumé AI si dispo
+  get_all_available(ticker)            → 5Y : mois par mois, breaker si dispo sinon articles bruts
+
+Crons de condensation (appelés depuis main.py) :
+  run_weekly_condensation()    → lundi 3h30 : weekly summaries → article_week_summaries
+  run_monthly_calendaire()     → 1er du mois 4h : monthly depuis weeklies → article_month_summaries
+  run_yearly_condensation()    → 1er jan 5h : yearly depuis monthlies → article_year_summaries
+  run_yahoo_accumulation()     → */3h : merge Yahoo → articles_merged_finn_yahoo + trigger OW
+  run_finnhub_refresh()        → */6h : merge Finnhub → articles_merged_finn_yahoo + trigger OW
+
+Source de vérité articles : articles_merged_finn_yahoo (jamais article_archive).
+"""
 import httpx
 import os
 import logging
@@ -81,6 +97,26 @@ def _month_label(year_month: str) -> str:
 
 
 # ─── Normalisation articles ────────────────────────────────────────────────────
+
+def _article_text(a: dict) -> str:
+    """Texte enrichi pour les prompts LLM : dumb > summary > headline seul."""
+    headline = a.get("headline", "") or a.get("title", "")
+    dumb = (a.get("dumb_en") or a.get("dumb_fr") or "").strip()
+    if dumb:
+        return f"- {headline}\n  {dumb}"
+    summary = (a.get("summary") or "").strip()
+    if summary:
+        return f"- {headline}\n  {summary}"
+    return f"- {headline}"
+
+
+def _is_ticker_related(a: dict, ticker: str) -> bool:
+    """Vrai si l'article mentionne le ticker dans le headline — filtre les articles génériques."""
+    if a.get("dumb_en") or a.get("dumb_fr"):
+        return True
+    headline = (a.get("headline") or a.get("title") or "").lower()
+    return ticker.lower() in headline
+
 
 def _normalize_finnhub(a: dict) -> dict:
     ts = a.get("datetime", 0)
@@ -226,7 +262,7 @@ def get_period_articles(ticker: str, period: str) -> dict:
 
     # 6mo / 1y : récupérer month summaries AI (optionnel)
     month_rows = supa.table("article_month_summaries") \
-        .select("year_month, ai_summary, article_count") \
+        .select("year_month, ai_summary, ai_summary_en, ai_summary_fr, article_count") \
         .eq("ticker", ticker) \
         .in_("year_month", year_months) \
         .execute()
@@ -249,7 +285,7 @@ def get_period_articles(ticker: str, period: str) -> dict:
         # Filtrer : dans la fenêtre globale ET dans les bornes réelles du mois + dedup
         ym_start, ym_end = _ym_bounds(ym)
         raw = _dedup_by_headline(raw)
-        filtered = [a for a in raw if a.get("datetime", 0) >= cutoff_ts and ym_start <= a.get("datetime", 0) <= ym_end]
+        filtered = [a for a in raw if a.get("datetime", 0) >= cutoff_ts and ym_start <= a.get("datetime", 0) <= ym_end and _is_ticker_related(a, ticker)]
         filtered.sort(key=lambda a: a.get("datetime", 0), reverse=True)
         top = [_normalize_finnhub(a) for a in filtered[:MAX_PER_MONTH]]
 
@@ -260,7 +296,7 @@ def get_period_articles(ticker: str, period: str) -> dict:
             "type":          "month",
             "year_month":    ym,
             "label":         _month_label(ym),
-            "ai_summary":    ai["ai_summary"] if ai else None,
+            "ai_summary":    (ai.get(_summary_col()) or ai.get("ai_summary")) if ai else None,
             "article_count": len(filtered),
             "top_articles":  top,
         })
@@ -353,7 +389,7 @@ def _get_monthly_with_weeks(ticker: str, year_months: list[str], supa) -> dict:
             for w in range(1, 5):
                 all_articles.extend(by_week[w])
             all_articles.sort(key=lambda a: a.get("datetime", 0), reverse=True)
-            top = [_normalize_finnhub(a) for a in all_articles[:15]]
+            top = [_normalize_finnhub(a) for a in all_articles if _is_ticker_related(a, ticker)][:15]
             if top:
                 first_w = min(weeks_with_articles) if weeks_with_articles else 1
                 last_w = max(weeks_with_articles) if weeks_with_articles else 4
@@ -375,14 +411,14 @@ def _get_monthly_with_weeks(ticker: str, year_months: list[str], supa) -> dict:
                 if not articles and not ai:
                     continue
                 articles.sort(key=lambda a: a.get("datetime", 0), reverse=True)
-                top = [_normalize_finnhub(a) for a in articles[:10]]
+                top = [_normalize_finnhub(a) for a in articles if _is_ticker_related(a, ticker)][:10]
                 summaries.append({
                     "type":          "week",
                     "year_month":    ym,
                     "week_num":      wnum,
                     "label":         _week_label(ym, wnum),
                     "skewed":        False,
-                    "ai_summary":    (ai.get("ai_summary_fr") or ai.get("ai_summary_en") or ai.get("ai_summary")) if ai else None,
+                    "ai_summary":    (ai.get(_summary_col()) or ai.get("ai_summary")) if ai else None,
                     "article_count": len(articles),
                     "top_articles":  top,
                 })
@@ -396,67 +432,77 @@ def _get_monthly_with_weeks(ticker: str, year_months: list[str], supa) -> dict:
     }
 
 
+def _n_months_ago_ym(n: int) -> str:
+    today = date.today()
+    month = today.month - n
+    year = today.year
+    while month <= 0:
+        month += 12
+        year -= 1
+    return f"{year:04d}-{month:02d}"
+
+
 def get_all_available(ticker: str) -> dict:
     """
-    ALL : year summaries → month summaries → raw articles récents.
-    Density 3/mois pour les raw.
+    5Y : Y breakers + M breakers uniquement — pas d'articles bruts.
+    Header année avec yearly summary, puis mois avec monthly summary.
+    Mois sans M breaker : ignorés (pas de fallback articles).
     """
     ticker = ticker.upper()
     supa = _get_supabase()
 
+    month_rows = supa.table("article_month_summaries") \
+        .select("year_month, ai_summary, ai_summary_en, ai_summary_fr, article_count") \
+        .eq("ticker", ticker) \
+        .order("year_month", desc=True) \
+        .execute()
+    month_summary_map = {r["year_month"]: r for r in (month_rows.data or [])}
+
     year_rows = supa.table("article_year_summaries") \
-        .select("year, ai_summary, ai_summary_en, ai_summary_fr, condensed_at") \
+        .select("year, ai_summary, ai_summary_en, ai_summary_fr") \
         .eq("ticker", ticker) \
         .order("year", desc=True) \
         .execute()
+    year_summary_map = {r["year"]: r for r in (year_rows.data or [])}
 
-    month_rows = supa.table("article_month_summaries") \
-        .select("year_month, ai_summary, ai_summary_en, ai_summary_fr, article_count, condensed_at") \
-        .eq("ticker", ticker) \
-        .order("year_month", desc=True) \
-        .execute()
+    five_years_ago = _n_months_ago_ym(60)
+    all_ym = sorted(
+        [ym for ym in month_summary_map.keys() if ym >= five_years_ago],
+        reverse=True,
+    )
 
-    raw_rows = supa.table("articles_merged_finn_yahoo") \
-        .select("year_month, articles, source, cached_at") \
-        .eq("ticker", ticker) \
-        .order("year_month", desc=True) \
-        .execute()
+    summaries = []
+    seen_years: set[str] = set()
 
-    # Mois avec month summary → pas de raw
-    month_summary_set = {r["year_month"] for r in (month_rows.data or [])}
+    for ym in all_ym:
+        year = ym[:4]
+        if year not in seen_years:
+            seen_years.add(year)
+            yr = year_summary_map.get(year)
+            summaries.append({
+                "type":         "year",
+                "year":         year,
+                "label":        year,
+                "ai_summary":   (yr.get(_summary_col()) or yr.get("ai_summary")) if yr else None,
+                "top_articles": [],
+            })
 
-    all_raw = []
-    for row in (raw_rows.data or []):
-        if row["year_month"] in month_summary_set:
-            continue
-        selected = _apply_density(row["articles"], slot_days=30, max_per_slot=3)
-        all_raw.extend([_normalize_finnhub(a) for a in selected])
-
-    all_raw.sort(key=lambda a: a.get("pub_date", ""), reverse=True)
-
-    year_summaries = [
-        {"type": "year", "year": r["year"], "label": r["year"], "ai_summary": r.get("ai_summary_fr") or r.get("ai_summary_en") or r.get("ai_summary", "")}
-        for r in (year_rows.data or [])
-    ]
-    month_summaries = [
-        {
+        r = month_summary_map[ym]
+        summaries.append({
             "type":          "month",
-            "year_month":    r["year_month"],
-            "label":         _month_label(r["year_month"]),
-            "ai_summary":    r.get("ai_summary_fr") or r.get("ai_summary_en") or r.get("ai_summary", ""),
-            "article_count": r["article_count"],
-        }
-        for r in (month_rows.data or [])
-    ]
-
-    summaries = year_summaries + month_summaries
+            "year_month":    ym,
+            "label":         _month_label(ym),
+            "ai_summary":    r.get(_summary_col()) or r.get("ai_summary"),
+            "article_count": r.get("article_count", 0),
+            "top_articles":  [],
+        })
 
     return {
         "ticker":    ticker,
         "period":    "all",
-        "articles":  all_raw,
+        "articles":  [],
         "summaries": summaries,
-        "condensed": [{"year_month": s.get("year_month", s.get("year", "")), "summary": s.get("ai_summary_fr") or s.get("ai_summary_en") or s.get("ai_summary", ""), "article_count": s.get("article_count", 0)} for s in month_summaries],
+        "condensed": [],
     }
 
 
@@ -600,7 +646,7 @@ def run_weekly_condensation():
 
         try:
             label = _week_label(target_ym, target_wnum)
-            articles_text = "\n".join(f"- {a['headline']}" for a in week_articles[:30])
+            articles_text = "\n".join(_article_text(a) for a in week_articles[:30])
             summary = _llm_call(_pick(WEEK_CONDENSE_PROMPT, WEEK_CONDENSE_PROMPT_EN).format(
                 ticker=ticker,
                 label=label,
@@ -716,7 +762,7 @@ def run_monthly_condensation():
                     continue
                 raw = row.data["articles"]
                 article_count = len(raw)
-                articles_text = "\n".join(f"- {a['headline']}" for a in raw[:40])
+                articles_text = "\n".join(_article_text(a) for a in raw[:40])
                 summary = _llm_call(month_prompt.format(
                     ticker=ticker,
                     label=_month_label(target_ym),

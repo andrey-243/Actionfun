@@ -155,7 +155,7 @@ function MiniSourceBadge({ name }: { name: string }) {
   );
 }
 
-function CompactArticleRow({ article, onClick }: { article: Article; onClick: () => void }) {
+function CompactArticleRow({ article, onClick, directLink }: { article: Article; onClick: () => void; directLink?: boolean }) {
   const [hovered, setHovered] = useState(false);
   const ago = article.pub_date
     ? (() => {
@@ -166,9 +166,50 @@ function CompactArticleRow({ article, onClick }: { article: Article; onClick: ()
         return `${Math.floor(h / 24)}d`;
       })()
     : "";
+
+  const handleClick = directLink && article.url
+    ? () => window.open(article.url, "_blank", "noopener,noreferrer")
+    : onClick;
+
+  if (directLink) {
+    return (
+      <div
+        onClick={handleClick}
+        onMouseEnter={() => setHovered(true)}
+        onMouseLeave={() => setHovered(false)}
+        style={{
+          display: "flex", alignItems: "center", gap: "10px",
+          padding: "8px 12px",
+          cursor: "pointer",
+          borderBottom: "1px solid var(--color-border)",
+          background: hovered ? "var(--color-surface-2)" : "transparent",
+          transition: "background 0.1s",
+        }}
+      >
+        {article.thumbnail && (
+          <img
+            src={article.thumbnail}
+            alt=""
+            style={{ width: "52px", height: "36px", objectFit: "cover", borderRadius: "4px", flexShrink: 0 }}
+          />
+        )}
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <span style={{ fontSize: "11px", fontWeight: 500, color: "var(--color-text-primary)", lineHeight: 1.3 }}>
+            {article.title}
+          </span>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: "4px", flexShrink: 0 }}>
+          <MiniSourceBadge name={article.source} />
+          {(article.extra_sources || []).slice(0, 2).map((s, i) => <MiniSourceBadge key={i} name={s.name} />)}
+          {ago && <span style={{ fontSize: "10px", color: "var(--color-text-muted)", marginLeft: "4px" }}>{ago}</span>}
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div
-      onClick={onClick}
+      onClick={handleClick}
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
       style={{
@@ -907,7 +948,7 @@ export default function StockPage() {
                             {sectionArticles.length > 0 && (
                               <div style={{ background: "var(--color-surface)", border: "1px solid var(--color-border)", borderRadius: "8px", overflow: "hidden" }}>
                                 {sectionArticles.map((article) => (
-                                  <CompactArticleRow key={article.id} article={article} onClick={() => handleArticleClick(article)} />
+                                  <CompactArticleRow key={article.id} article={article} onClick={() => handleArticleClick(article)} directLink={["6mo", "1y"].includes(chartPeriod)} />
                                 ))}
                               </div>
                             )}
@@ -929,7 +970,7 @@ export default function StockPage() {
                             {sectionArticles.length > 0 && (
                               <div style={{ background: "var(--color-surface)", border: "1px solid var(--color-border)", borderRadius: "8px", overflow: "hidden" }}>
                                 {sectionArticles.map((article) => (
-                                  <CompactArticleRow key={article.id} article={article} onClick={() => handleArticleClick(article)} />
+                                  <CompactArticleRow key={article.id} article={article} onClick={() => handleArticleClick(article)} directLink={["6mo", "1y"].includes(chartPeriod)} />
                                 ))}
                               </div>
                             )}

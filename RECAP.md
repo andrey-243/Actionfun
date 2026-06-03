@@ -308,19 +308,30 @@ RLS activé sur toutes les tables. `service_role` a GRANT ALL explicite.
 
 | Période | OW | DUMB | BUB | Breaks |
 |---|---|---|---|---|
-| 1D | `stock_news_cache` (summary_24h) | `articles_merged_finn_yahoo[].dumb_en` | — | — |
-| 1W | `stock_news_cache` (summary 7J) | `articles_merged_finn_yahoo[].dumb_en` | on-demand | — |
-| 1M | — | — | on-demand | Weekly breaks `article_week_summaries` (W1/W2/W3/W4) |
-| 6M | — | — | pre-cache `event_causes` | Monthly breaks `article_month_summaries` |
-| 1Y | — | — | pre-cache `event_causes` | Monthly breaks `article_month_summaries` |
-| 5Y | — | — | — | `article_year_summaries` |
+| 1D | `stock_news_cache` (summary_24h) | `articles_merged_finn_yahoo[].dumb_en/fr` — filtre : affiché si dumb présent | — | — |
+| 1W | `stock_news_cache` (summary 7J) | idem | on-demand | — |
+| 1M | — | affiché en sidebar au click | on-demand | Weekly `article_week_summaries` (W1/W2/W3/W4) |
+| 6M | — | — | pre-cache `event_causes` | Monthly `article_month_summaries` |
+| 1Y | — | — | pre-cache `event_causes` | Monthly `article_month_summaries` |
+| 5Y | — | — | — | Year headers `article_year_summaries` + Monthly `article_month_summaries` — pas d'articles bruts |
 
-**Source articles par période :**
-| Période | Source |
-|---|---|
-| 1D/1W | `articles_merged_finn_yahoo` (7 derniers jours) |
-| 1M/6M/1Y | `articles_merged_finn_yahoo` · sections W1-W4 ou mois. Si skewed → merged + warning |
-| 5Y | `article_year_summaries` |
+**Source articles & display par période :**
+| Période | Source articles | Click article |
+|---|---|---|
+| 1D/1W | `articles_merged_finn_yahoo` 7j (Finn+Yahoo) — filtre `dumb_en\|dumb_fr` | sidebar : title · source · summary brut · dumb |
+| 1M | `articles_merged_finn_yahoo` — sections W1-W4. Si skewed → merged + warning | sidebar : title · source · summary brut · dumb |
+| 6M/1Y | `articles_merged_finn_yahoo` — sections par mois | direct URL + image (no sidebar) |
+| 5Y | `article_year_summaries` (headers) + `article_month_summaries` (M breakers) — zéro article brut | — |
+
+**Chaîne de condensation — inputs LLM :**
+```
+Weekly  : dumb_en/dumb_fr de chaque article  (fallback : headline + summary brut si pas de dumb)
+Monthly : textes W1+W2+W3+W4                 (fallback < 3 weeklies : dumb + headline + summary brut)
+Yearly  : textes M1→M12
+```
+
+**Condensation enrichie ✅** : `_article_text()` → dumb > summary > headline. Appliqué W prompt + fallback M.
+**Display filter 1M+ ✅** : `_is_ticker_related()` → passe si dumb présent OU ticker dans headline.
 
 **Semaines fixes intra-mois :** W1 = jours 1–7 · W2 = jours 8–14 · W3 = jours 15–21 · W4 = jours 22–fin du mois
 
@@ -333,6 +344,17 @@ python scripts/break_view_resume.py AAPL --months 6  # weeklies + monthlies
 python scripts/break_view_resume.py AAPL --weekly    # weeklies seulement
 ```
 ⚠ Inutilisable pour générer des weekly summaries fiables tant que Finnhub clustère les dates en W4.
+
+**Script batch refresh breakers :** `backend/scripts/refresh_breakers.py`
+```bash
+python scripts/refresh_breakers.py --region US --lang en           # run normal (resume auto)
+python scripts/refresh_breakers.py --region US --lang en --no-resume  # repart de zéro
+python scripts/refresh_breakers.py --region US --lang en --re-enrich-legacy  # re-traite les tickers legacy
+```
+Checkpoint JSON : `scripts/refresh_breakers_{region}_{lang}.json` — champs `done` + `legacy`.
+`legacy` = tickers traités **avant** l'enrichissement dumb+summary (`_article_text()`) — prompts générés avec headlines seuls.
+Au premier run post-enrichissement, les tickers `done` existants sont auto-marqués `legacy`.
+`--re-enrich-legacy` pour les re-passer avec la nouvelle logique dumb+summary.
 
 ---
 
@@ -347,7 +369,7 @@ Finnhub indexe le même article depuis plusieurs outlets. Contenu identique à 1
 **Affichage multi-source :**
 - Badges colorés par source (Yahoo=violet, Bloomberg=noir, Reuters=orange...) dans `NewsCard` et `CompactArticleRow`
 - `ArticleDrawer` : un bouton "Read" par source disponible
-- **Scope** : uniquement 1M/6M/1Y. 24H/1W utilise `stock_news_cache` (Yahoo) — pas de badges multi-source.
+- **Scope** : 1M/6M/1Y. 1D/1W utilise `articles_merged_finn_yahoo` (Finn+Yahoo) — multi-source possible mais pas de badges supplémentaires dans ce mode.
 
 **Script refetch :** `backend/scripts/refetch_finnhub.py`
 ```bash
@@ -361,14 +383,19 @@ python scripts/refetch_finnhub.py --dry-run    # liste les rows sans fetch
 
 ```
 articles_merged_finn_yahoo (raw bodies)
-  → supprimé après weekly condensation ✅
+  → source de vérité unique — article_archive supprimé ✅ (code + DB)
+  → JAMAIS purgé automatiquement · 4 478 rows · 687 tickers · 122 121 articles (juin 2026)
+  → cappé à 50 articles par (ticker, year_month)
+  → TODO lifecycle : strip champ "summary" sur articles > 35 jours (sidebar plus affichée) via cron nettoyage
+  → TODO lifecycle : delete rows entières après ~13 mois (aucune vue n'affiche des articles > 1Y) via même cron
+  → TODO lifecycle : supprimer le cap 50 une fois la purge 13 mois en place
 
 article_week_summaries
   → max 5 weeklies stockés par ticker (purge auto à chaque nouveau weekly)
   → supprimé le 1er du mois suivant (après monthly calendaire généré)
 
 article_month_summaries (calendaire : S1+S2+S3+S4 dans l'ordre)
-  → gardé 12 mois — source pour vues 6M / 1Y (premium)
+  → gardé 12 mois — source pour vues 6M / 1Y
   → supprimé le 1er janvier après génération du yearly
 
 article_year_summaries
@@ -520,6 +547,8 @@ python scripts/refresh_breakers.py --region US   --lang en --no-resume     # ign
    - sinon → gen depuis raw articles
 5. Checkpoint JSON après chaque ticker
 
+**Filtrage pertinence (prompts)** : les prompts weekly et monthly demandent explicitement au LLM d'ignorer les articles génériques (top marchés, classements) non spécifiques au ticker. Pas de filtre DUMB/SKIP (90% des articles historiques n'ont pas de `dumb_en`) — le filtre est dans l'instruction prompt.
+
 **Checkpoints** — `backend/scripts/refresh_breakers_{region}_{lang}.json` (un par combo région+langue)
 
 **Notifs TG** — départ · checkpoint tous les 30 tickers (%, ETA, +articles, W/M générés, skewed, erreurs) · fin
@@ -659,6 +688,8 @@ python scripts/populate_websites.py --ticker AMZN
 | **DB6** | `daily_digest` supprimée — my-news lit `/api/news/{ticker}` · email EOD lit `stock_news_cache` directement, zéro LLM | `digest_service.py`, `main.py`, `my-news/page.tsx` |
 | **UX1** | Weekly freshness dot dans `WeeklyCard` (my-news) — vert <6h · orange <7j · rouge >7j. Badge `↻ mise à jour...` visible (vert + spin). Bug "None" dans fallback no-news corrigé. | `my-news/page.tsx`, `globals.css`, `overview_service.py` |
 | **LLM6** | DUMB découplé de l'OW — `brutalise_new_articles(ticker)` standalone. Appelé par crons Yahoo/Finnhub avant `get_news(force_24h=True)`. `_call1_dumb_ow24h` : si tous les articles ont déjà leur dumb → `_ow7d_from_abrutis()` au lieu de re-brutaliser (suppression fallback `to_brutalise = fresh_articles[:30]`). | `overview_service.py`, `breakers_articles_service.py` |
+| **Breaks1** | **Bug cold_start purge prématurée** — `_purge_excess_weeklies(max_weeks=5)` était appelé à l'intérieur de la boucle weeklies (après chaque mois), avant la boucle monthlies. Les weeklies des vieux mois étaient purgés avant d'être utilisés pour générer les monthly summaries → `len(week_rows.data) < 2` → aucun monthly généré pour les mois anciens. Fix : purge déplacée après les deux boucles (W → M → purge). | `cold_start_service.py` |
+| **Breaks2** | **Bug lang hardcodé FR-first dans `get_period_articles`** — 4 appels `ai.get("ai_summary_fr") or ai.get("ai_summary_en")` ignoraient `LLM_LANG`. Remplacés par `ai.get(_summary_col())` qui respecte `LLM_LANG`. Affecte vues 1M/6M/1Y/5Y (weeks, months, years). | `breakers_articles_service.py` |
 
 ---
 

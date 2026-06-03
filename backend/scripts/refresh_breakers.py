@@ -99,17 +99,24 @@ def _checkpoint_path(region: str, lang: str) -> Path:
     return SCRIPTS_DIR / f"refresh_breakers_{region.lower()}_{lang}.json"
 
 
-def _load_checkpoint(path: Path) -> set[str]:
+def _load_checkpoint(path: Path) -> tuple[set[str], set[str]]:
+    """Retourne (done, legacy) — legacy = traités avant enrichissement dumb+summary."""
     if path.exists():
         try:
-            return set(json.loads(path.read_text()).get("done", []))
+            data = json.loads(path.read_text())
+            done = set(data.get("done", []))
+            legacy = set(data.get("legacy", []))
+            return done, legacy
         except Exception:
             pass
-    return set()
+    return set(), set()
 
 
-def _save_checkpoint(path: Path, done: set[str]):
-    path.write_text(json.dumps({"done": sorted(done)}, indent=2))
+def _save_checkpoint(path: Path, done: set[str], legacy: set[str]):
+    path.write_text(json.dumps({
+        "done":   sorted(done),
+        "legacy": sorted(legacy),
+    }, indent=2))
 
 
 # ─── Helpers date ─────────────────────────────────────────────────────────────
@@ -356,12 +363,14 @@ def _week_prompt(ticker: str, label: str, articles_text: str) -> str:
     if os.environ.get("LLM_LANG") == "en":
         return (
             f"You are a senior financial analyst. Here are articles about {ticker} for {label}.\n"
-            f"Write a concise weekly recap (3-5 sentences) covering the main news and their market impact.\n\n"
+            f"Write a concise weekly recap (3-5 sentences) covering the main news and their market impact.\n"
+            f"Ignore generic market roundups or articles not specifically about {ticker}.\n\n"
             f"{articles_text}"
         )
     return (
         f"Tu es un analyste financier senior. Voici des articles sur {ticker} pour {label}.\n"
-        f"Rédige un récap hebdomadaire concis (3-5 phrases) couvrant les principales nouvelles et leur impact marché.\n\n"
+        f"Rédige un récap hebdomadaire concis (3-5 phrases) couvrant les principales nouvelles et leur impact marché.\n"
+        f"Ignore les articles génériques (top marchés, classements) non spécifiques à {ticker}.\n\n"
         f"{articles_text}"
     )
 
@@ -370,12 +379,14 @@ def _month_prompt(ticker: str, label: str, content: str) -> str:
     if os.environ.get("LLM_LANG") == "en":
         return (
             f"You are a senior financial analyst. Here is the news summary for {ticker} — {label}.\n"
-            f"Write a concise monthly recap (4-6 sentences) synthesizing the key themes and market impact.\n\n"
+            f"Write a concise monthly recap (4-6 sentences) synthesizing the key themes and market impact.\n"
+            f"Ignore generic market roundups or articles not specifically about {ticker}.\n\n"
             f"{content}"
         )
     return (
         f"Tu es un analyste financier senior. Voici l'actualité de {ticker} pour {label}.\n"
-        f"Rédige un récap mensuel concis (4-6 phrases) synthétisant les thèmes clés et l'impact marché.\n\n"
+        f"Rédige un récap mensuel concis (4-6 phrases) synthétisant les thèmes clés et l'impact marché.\n"
+        f"Ignore les articles génériques (top marchés, classements) non spécifiques à {ticker}.\n\n"
         f"{content}"
     )
 
@@ -603,6 +614,7 @@ def main():
     parser.add_argument("--lang", required=True, choices=["en", "fr"])
     parser.add_argument("--ticker", default=None, help="Ticker unique (debug)")
     parser.add_argument("--no-resume", action="store_true", help="Ignore le checkpoint")
+    parser.add_argument("--re-enrich-legacy", action="store_true", help="Re-traite les tickers legacy (pré-dumb enrichment)")
     args = parser.parse_args()
 
     os.environ["LLM_LANG"] = args.lang
@@ -611,8 +623,22 @@ def main():
     tickers = [args.ticker.upper()] if args.ticker else get_by_region(args.region)
 
     cp_path = _checkpoint_path(args.region, args.lang)
-    done = set() if args.no_resume else _load_checkpoint(cp_path)
-    todo = [t for t in tickers if t not in done]
+    if args.no_resume:
+        done, legacy = set(), set()
+    else:
+        done, legacy = _load_checkpoint(cp_path)
+
+    # Tickers traités avant l'enrichissement dumb+summary → marquer comme legacy
+    if done and not legacy:
+        legacy = set(done)
+        _save_checkpoint(cp_path, done, legacy)
+        logger.info(f"{len(legacy)} tickers marqués legacy (pré-dumb enrichment)")
+
+    if args.re_enrich_legacy:
+        todo = [t for t in tickers if t in legacy]
+        logger.info(f"Re-enrich legacy : {len(todo)} tickers")
+    else:
+        todo = [t for t in tickers if t not in done]
     total = len(todo)
 
     now = datetime.now(timezone.utc)
@@ -650,7 +676,8 @@ def main():
         total_months_gen += res["monthlies"]
 
         done.add(ticker)
-        _save_checkpoint(cp_path, done)
+        legacy.discard(ticker)
+        _save_checkpoint(cp_path, done, legacy)
 
         if i % NOTIFY_EVERY == 0:
             elapsed = int(time.time() - start_time)
