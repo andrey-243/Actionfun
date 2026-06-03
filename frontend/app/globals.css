@@ -32,6 +32,45 @@
   --radius-xl: 10px;
 }
 
+@keyframes slow-blink {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.25; }
+}
+.ow-date-blink {
+  animation: slow-blink 2.8s ease-in-out infinite;
+}
+
+@keyframes spin-cw {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+.refreshing-icon {
+  display: inline-block;
+  animation: spin-cw 1s linear infinite;
+}
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%       { opacity: 0.35; transform: scale(0.7); }
+}
+.freshness-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.freshness-dot.fresh {
+  background: #4CAF82;
+  animation: pulse-dot 2.4s ease-in-out infinite;
+}
+.freshness-dot.medium {
+  background: #C8960C;
+}
+.freshness-dot.stale {
+  background: #E05C4B;
+}
+
 @keyframes nb-spin {
   from { transform: rotate(0deg); }
   to   { transform: rotate(-360deg); }

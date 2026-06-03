@@ -15,7 +15,7 @@ async def news(ticker: str, background_tasks: BackgroundTasks):
             return get_news(t)
 
         if needs_refresh:
-            background_tasks.add_task(get_news, t)
+            background_tasks.add_task(get_news, t, None, True)
 
         return cached
     except Exception as e:

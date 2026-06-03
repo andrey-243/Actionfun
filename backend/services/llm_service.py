@@ -13,6 +13,7 @@ import httpx
 import time
 import os
 import json
+import random
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -89,10 +90,11 @@ _freetheai_semaphore = threading.Semaphore(FREETHEAI_CONCURRENCY)
 HAPUPPY_CONCURRENCY = int(os.environ.get("HAPUPPY_CONCURRENCY", "3"))
 _hapuppy_semaphore = threading.Semaphore(HAPUPPY_CONCURRENCY)
 
-# Hapuppy — freeze quota (4h) vs rate-limit (2min)
+# Hapuppy — freeze quota (4h) vs rate-limit (backoff global partagé entre threads)
 HAPUPPY_QUOTA_FREEZE_SECONDS = int(os.environ.get("HAPUPPY_QUOTA_FREEZE_SECONDS", str(4 * 3600)))
-HAPUPPY_RATELIMIT_FREEZE_SECONDS = int(os.environ.get("HAPUPPY_RATELIMIT_FREEZE_SECONDS", "10"))
+HAPUPPY_RATELIMIT_BACKOFF_SECONDS = int(os.environ.get("HAPUPPY_RATELIMIT_BACKOFF_SECONDS", "12"))
 _hapuppy_quota_skip_until: float | None = None  # monotonic timestamp
+_hapuppy_ratelimit_until: float = 0.0            # backoff global partagé entre threads
 _hapuppy_last_attempt: float = 0.0
 HAPUPPY_MIN_INTERVAL = float(os.environ.get("HAPUPPY_MIN_INTERVAL", "0.0"))  # pas de throttle par défaut
 
@@ -304,11 +306,18 @@ def llm_call(
                 hapuppy_key = ""
 
     if hapuppy_key:
+        global _hapuppy_ratelimit_until
         if HAPUPPY_MIN_INTERVAL > 0 and time.monotonic() - _hapuppy_last_attempt < HAPUPPY_MIN_INTERVAL:
             trail.append(f"Hapuppy `{HAPUPPY_MODEL}` : ⏭ skipped (RPM throttle)")
         else:
             for attempt in range(3):
                 try:
+                    # Backoff global partagé : si un autre thread a eu un rate-limit récemment,
+                    # attendre la fin de la fenêtre + jitter pour éviter le thundering herd
+                    wait = _hapuppy_ratelimit_until - time.monotonic()
+                    if wait > 0:
+                        time.sleep(wait + random.uniform(0, 2))
+
                     _hapuppy_last_attempt = time.monotonic()
                     with _hapuppy_semaphore:
                         r = httpx.post(
@@ -338,10 +347,13 @@ def llm_call(
                             _send_cascade_notif("hapuppy_quota", trail)
                             break
                         else:
-                            # Rate-limit : sleep local + retry dans ce thread, pas de freeze global
-                            trail.append(f"Hapuppy `{HAPUPPY_MODEL}` : ✗ 429 rate-limit (attempt {attempt + 1}/3, retry 5s)")
+                            # Rate-limit : backoff global partagé → tous les threads attendent,
+                            # puis repartent à des moments décalés via le jitter
+                            backoff = HAPUPPY_RATELIMIT_BACKOFF_SECONDS * (attempt + 1)
+                            _hapuppy_ratelimit_until = time.monotonic() + backoff
+                            trail.append(f"Hapuppy `{HAPUPPY_MODEL}` : ✗ 429 rate-limit (attempt {attempt + 1}/3, backoff {backoff}s)")
                             if attempt < 2:
-                                time.sleep(5)
+                                time.sleep(backoff + random.uniform(0, 3))
                             continue
                     else:
                         trail.append(f"Hapuppy `{HAPUPPY_MODEL}` : ✗ {r.status_code} (attempt {attempt + 1}/3)")

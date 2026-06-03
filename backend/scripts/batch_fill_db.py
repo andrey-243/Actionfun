@@ -590,7 +590,7 @@ def phase_translate_fr(tickers: list[str], region: str = "all"):
         .select("ticker, date, cause_en") \
         .in_("ticker", tickers) \
         .not_.is_("cause_en", "null") \
-        .is_("cause", "null") \
+        .is_("cause_fr", "null") \
         .execute()
 
     # Grouper par ticker pour le progress tracking
@@ -602,40 +602,76 @@ def phase_translate_fr(tickers: list[str], region: str = "all"):
     total_bub = sum(len(v) for v in causes_by_ticker.values())
     logger.info(f"TRANSLATE-FR BUBBLES: {total_bub} event_causes sur {len(causes_by_ticker)} tickers")
 
-    if not causes_by_ticker:
-        logger.info("Rien à traduire.")
-        return
+    if causes_by_ticker:
+        _telegram(f"🌐 *Batch TRANSLATE-FR BUBBLES démarré — {region}*\n{total_bub} events sur {len(causes_by_ticker)} tickers")
 
-    _telegram(f"🌐 *Batch TRANSLATE-FR BUBBLES démarré — {region}*\n{total_bub} events sur {len(causes_by_ticker)} tickers")
+        start_time = time.time()
+        bub_errors = []
+        bub_done = 0
+        for ticker, events in causes_by_ticker.items():
+            ticker_ok = True
+            for ev in events:
+                try:
+                    cause_fr = translate_to_fr(ev["cause_en"])
+                    supa.table("event_causes").update({"cause_fr": cause_fr}) \
+                        .eq("ticker", ticker).eq("date", ev["date"]).execute()
+                    bub_done += 1
+                    logger.info(f"  ✓ {ticker} {ev['date']}")
+                except Exception as e:
+                    logger.error(f"  ✗ {ticker} {ev['date']}: {e}")
+                    bub_errors.append(f"{ticker}:{ev['date']}")
+                    ticker_ok = False
 
-    start_time = time.time()
-    bub_errors = []
-    bub_done = 0
-    for ticker, events in causes_by_ticker.items():
-        ticker_ok = True
-        for ev in events:
+            if ticker_ok:
+                progress.setdefault("translated_fr_bubbles", []).append(ticker)
+            save_progress(progress)
+
+        elapsed = int(time.time() - start_time)
+        mins, secs = divmod(elapsed, 60)
+        _telegram(
+            f"✅ *Batch TRANSLATE-FR BUBBLES terminé — {region}*\n"
+            f"{bub_done} events · {len(bub_errors)} erreurs\n"
+            f"⏱ {mins}m{secs:02d}s"
+        )
+    else:
+        logger.info("TRANSLATE-FR BUBBLES: rien à traduire.")
+
+    # ── BREAKS (week / month / year summaries) ────────────────────────────────
+    from services.translation_service import translate_batch_to_fr
+
+    for table, pk_fields, en_field in [
+        ("article_week_summaries",  ["year_month", "week_num"], "ai_summary"),
+        ("article_month_summaries", ["year_month"],             "ai_summary"),
+        ("article_year_summaries",  ["year"],                   "ai_summary"),
+    ]:
+        rows = supa.table(table) \
+            .select(", ".join(["ticker"] + pk_fields + [en_field])) \
+            .in_("ticker", tickers) \
+            .not_.is_(en_field, "null") \
+            .is_("ai_summary_fr", "null") \
+            .execute()
+        todo_breaks = rows.data or []
+        logger.info(f"TRANSLATE-FR {table}: {len(todo_breaks)} lignes à traduire")
+        if not todo_breaks:
+            continue
+
+        texts = [r[en_field] for r in todo_breaks]
+        try:
+            translations = translate_batch_to_fr(texts)
+        except Exception as e:
+            logger.error(f"  ✗ batch translate {table}: {e}")
+            continue
+
+        for r, fr in zip(todo_breaks, translations):
             try:
-                cause_fr = translate_to_fr(ev["cause_en"])
-                supa.table("event_causes").update({"cause": cause_fr}) \
-                    .eq("ticker", ticker).eq("date", ev["date"]).execute()
-                bub_done += 1
-                logger.info(f"  ✓ {ticker} {ev['date']}")
+                q = supa.table(table).update({"ai_summary_fr": fr})
+                for pk in pk_fields:
+                    q = q.eq(pk, r[pk])
+                q.eq("ticker", r["ticker"]).execute()
             except Exception as e:
-                logger.error(f"  ✗ {ticker} {ev['date']}: {e}")
-                bub_errors.append(f"{ticker}:{ev['date']}")
-                ticker_ok = False
+                logger.error(f"  ✗ {table} {r}: {e}")
 
-        if ticker_ok:
-            progress.setdefault("translated_fr_bubbles", []).append(ticker)
-        save_progress(progress)
-
-    elapsed = int(time.time() - start_time)
-    mins, secs = divmod(elapsed, 60)
-    _telegram(
-        f"✅ *Batch TRANSLATE-FR BUBBLES terminé — {region}*\n"
-        f"{bub_done} events · {len(bub_errors)} erreurs\n"
-        f"⏱ {mins}m{secs:02d}s"
-    )
+        logger.info(f"  ✓ {table} — {len(todo_breaks)} lignes traduites")
 
 
 # ─── Phase translate-fr-dumb ──────────────────────────────────────────────────

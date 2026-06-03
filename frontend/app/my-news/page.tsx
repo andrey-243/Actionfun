@@ -7,23 +7,20 @@ import { sourceStyle } from "../components/ArticleDrawer";
 import { NavBrand, BackButton, HEADER_STYLE, HEADER_INNER } from "../components/Navbar";
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
-const STALE_THRESHOLD_MS = 3 * 60 * 60 * 1000; // 3h
-
 interface DigestArticle {
-  headline: string;
+  title: string;
   source: string;
   url: string;
-  datetime: number;
+  pub_date: string;
 }
 
 interface Digest {
   ticker: string;
-  date: string;
-  summary: string;
-  sentiment: string;
+  summary_24h: string;
+  sentiment_24h: string;
   articles?: DigestArticle[];
   website?: string | null;
-  generated_at?: string | null;
+  cached_at?: string | null;
 }
 
 interface WeeklyArticle {
@@ -109,13 +106,17 @@ function TickerLogo({ ticker, website, onLogoClick }: { ticker?: string | null; 
 function DigestCard({ digest }: { digest: Digest }) {
   const router = useRouter();
   const [expanded, setExpanded] = useState(false);
-  const s = SENTIMENT_STYLE[digest.sentiment] ?? SENTIMENT_STYLE.NEUTRAL;
-  const articles = digest.articles ?? [];
-  const hasArticles = articles.length > 0;
+  const s = SENTIMENT_STYLE[digest.sentiment_24h] ?? SENTIMENT_STYLE.NEUTRAL;
 
-  const latestArticleAge = hasArticles
-    ? formatAge(new Date(Math.max(...articles.map((a) => a.datetime * 1000))).toISOString())
-    : null;
+  const cutoff24h = Date.now() - 24 * 3600 * 1000;
+  const articles24h = (digest.articles ?? []).filter((a) => {
+    try { return new Date(a.pub_date).getTime() >= cutoff24h; } catch { return false; }
+  });
+  const hasArticles = articles24h.length > 0;
+
+  const owAgeMs = digest.cached_at ? Date.now() - new Date(digest.cached_at).getTime() : Infinity;
+  const owAgeLabel = formatAge(digest.cached_at);
+  const dotClass = owAgeMs < 6 * 3600000 ? "fresh" : owAgeMs < 24 * 3600000 ? "medium" : "stale";
 
   return (
     <div style={{
@@ -141,21 +142,22 @@ function DigestCard({ digest }: { digest: Digest }) {
               fontFamily: "var(--font-mono)", letterSpacing: "0.06em",
               background: s.bg, color: s.color,
             }}>
-              {digest.sentiment}
+              {digest.sentiment_24h}
             </span>
             {hasArticles && (
               <span style={{ fontSize: "11px", color: "var(--color-text-muted)", fontFamily: "var(--font-mono)" }}>
-                {articles.length} article{articles.length > 1 ? "s" : ""}
+                {articles24h.length} article{articles24h.length > 1 ? "s" : ""} 24h
               </span>
             )}
-            {latestArticleAge && (
-              <span style={{ fontSize: "11px", color: "var(--color-text-muted)", marginLeft: "auto" }}>
-                {latestArticleAge}
+            {owAgeLabel && (
+              <span style={{ display: "flex", alignItems: "center", gap: "5px", marginLeft: "auto" }}>
+                <span className={`freshness-dot ${dotClass}`} />
+                <span style={{ fontSize: "11px", color: "var(--color-text-muted)" }}>{owAgeLabel}</span>
               </span>
             )}
           </div>
           <p style={{ fontSize: "13px", color: "var(--color-text-secondary)", lineHeight: 1.6, margin: 0 }}>
-            {digest.summary || "Pas de résumé disponible."}
+            {digest.summary_24h || "Pas de résumé disponible."}
           </p>
         </div>
         {hasArticles && (
@@ -171,7 +173,7 @@ function DigestCard({ digest }: { digest: Digest }) {
 
       {expanded && hasArticles && (
         <div style={{ borderTop: "1px solid var(--color-border)" }}>
-          {(digest.articles ?? []).map((a, i) => (
+          {articles24h.map((a, i) => (
             <a
               key={i}
               href={a.url}
@@ -179,13 +181,13 @@ function DigestCard({ digest }: { digest: Digest }) {
               rel="noopener noreferrer"
               style={{
                 display: "block", padding: "11px 18px", textDecoration: "none",
-                borderBottom: i < (digest.articles ?? []).length - 1 ? "1px solid var(--color-border)" : "none",
+                borderBottom: i < articles24h.length - 1 ? "1px solid var(--color-border)" : "none",
               }}
               onMouseEnter={(e) => (e.currentTarget.style.background = "var(--color-surface-2)")}
               onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
             >
               <div style={{ fontSize: "13px", color: "var(--color-text-primary)", fontWeight: 500, marginBottom: "3px" }}>
-                {a.headline}
+                {a.title}
               </div>
               <div style={{ display: "flex", alignItems: "center", gap: "6px", marginTop: "3px" }}>
                 {a.source && (() => { const st = sourceStyle(a.source); return (
@@ -194,7 +196,7 @@ function DigestCard({ digest }: { digest: Digest }) {
                   </span>
                 ); })()}
                 <span style={{ fontSize: "11px", color: "var(--color-text-muted)" }}>
-                  {new Date(a.datetime * 1000).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" })}
+                  {new Date(a.pub_date).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" })}
                 </span>
               </div>
             </a>
@@ -242,11 +244,17 @@ function WeeklyCard({ weekly }: { weekly: Weekly }) {
                 {label}
               </span>
             )}
-            {weekly.condensed_at && (
-              <span style={{ fontSize: "11px", color: "var(--color-text-muted)", marginLeft: "auto" }}>
-                {new Date(weekly.condensed_at).toLocaleDateString("fr-FR", { day: "numeric", month: "short" })}
-              </span>
-            )}
+            {weekly.condensed_at && (() => {
+              const ageMs = Date.now() - new Date(weekly.condensed_at).getTime();
+              const dot = ageMs < 6 * 3600000 ? "fresh" : ageMs < 7 * 86400000 ? "medium" : "stale";
+              const label = formatAge(weekly.condensed_at);
+              return (
+                <span style={{ display: "flex", alignItems: "center", gap: "5px", marginLeft: "auto" }}>
+                  <span className={`freshness-dot ${dot}`} />
+                  <span style={{ fontSize: "11px", color: "var(--color-text-muted)" }}>{label}</span>
+                </span>
+              );
+            })()}
           </div>
           {weekly.generating ? (
             <p style={{ fontSize: "13px", color: "var(--color-text-muted)", lineHeight: 1.6, margin: 0, fontStyle: "italic" }}>
@@ -321,7 +329,6 @@ export default function MyNewsPage() {
   const [loadingWeekly, setLoadingWeekly] = useState(false);
   const [weeklyFetched, setWeeklyFetched] = useState(false);
   const [authed, setAuthed] = useState<boolean | null>(null);
-  const [digestAge, setDigestAge] = useState<string | null>(null);
 
   useEffect(() => {
     const supa = createClient();
@@ -344,35 +351,13 @@ export default function MyNewsPage() {
 
       const results = await Promise.all(
         tickers.map((t) =>
-          fetch(`${API}/api/digest/${t}`)
+          fetch(`${API}/api/news/${t}`)
             .then((r) => r.json())
             .catch(() => null)
         )
       );
-      const valid = results.filter((d): d is Digest => d !== null && !!d.ticker && d.summary !== "");
-
-      // Auto-refresh if any digest is stale (> 3h) — fallback to original if refresh returns nothing
-      const now = Date.now();
-      const stale = valid.some((d) => d.generated_at && now - new Date(d.generated_at).getTime() > STALE_THRESHOLD_MS);
-      let final = valid;
-      if (stale) {
-        const refreshed = await Promise.all(
-          tickers.map((t) =>
-            fetch(`${API}/api/digest/${t}?force=1`)
-              .then((r) => r.json())
-              .catch(() => null)
-          )
-        );
-        const refreshedValid = refreshed.filter((d): d is Digest => d !== null && !!d.ticker && d.summary !== "");
-        if (refreshedValid.length > 0) final = refreshedValid;
-      }
-      setDigests(final);
-      const oldest = final.reduce<string | null>((acc, d) => {
-        if (!d.generated_at) return acc;
-        if (!acc || d.generated_at < acc) return d.generated_at;
-        return acc;
-      }, null);
-      setDigestAge(formatAge(oldest));
+      const valid = results.filter((d): d is Digest => d !== null && !!d.ticker && !!d.summary_24h);
+      setDigests(valid);
 
       setLoadingDaily(false);
     });
@@ -448,7 +433,7 @@ export default function MyNewsPage() {
         </div>
       </header>
 
-      <main style={{ maxWidth: "720px", margin: "0 auto", padding: "24px 20px 80px" }}>
+      <main style={{ maxWidth: "880px", margin: "0 auto", padding: "24px 20px 80px" }}>
         {authed === false ? (
           <div style={{ textAlign: "center", padding: "60px 0" }}>
             <p style={{ fontSize: "14px", color: "var(--color-text-secondary)", marginBottom: "16px" }}>
@@ -492,16 +477,9 @@ export default function MyNewsPage() {
                     background: "rgba(255,180,0,0.10)", color: "#C8960C",
                   }}>Premium</span>
                 </div>
-                <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
-                  {digestAge && (
-                    <span style={{ fontSize: "11px", color: "var(--color-text-muted)", fontFamily: "var(--font-mono)" }}>
-                      {digestAge}
-                    </span>
-                  )}
-                  <span style={{ fontSize: "11px", color: "var(--color-text-muted)", fontFamily: "var(--font-mono)" }}>
-                    {new Date().toLocaleDateString("fr-FR", { weekday: "long", day: "numeric", month: "long" })}
-                  </span>
-                </div>
+                <span style={{ fontSize: "11px", color: "var(--color-text-muted)", fontFamily: "var(--font-mono)" }}>
+                  {new Date().toLocaleDateString("fr-FR", { weekday: "long", day: "numeric", month: "long" })}
+                </span>
               </div>
               {digests.map((d, i) => <DigestCard key={d.ticker ?? i} digest={d} />)}
             </>

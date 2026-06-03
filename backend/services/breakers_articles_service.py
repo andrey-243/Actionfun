@@ -382,7 +382,7 @@ def _get_monthly_with_weeks(ticker: str, year_months: list[str], supa) -> dict:
                     "week_num":      wnum,
                     "label":         _week_label(ym, wnum),
                     "skewed":        False,
-                    "ai_summary":    ai["ai_summary"] if ai else None,
+                    "ai_summary":    (ai.get("ai_summary_fr") or ai.get("ai_summary_en") or ai.get("ai_summary")) if ai else None,
                     "article_count": len(articles),
                     "top_articles":  top,
                 })
@@ -405,13 +405,13 @@ def get_all_available(ticker: str) -> dict:
     supa = _get_supabase()
 
     year_rows = supa.table("article_year_summaries") \
-        .select("year, ai_summary, condensed_at") \
+        .select("year, ai_summary, ai_summary_en, ai_summary_fr, condensed_at") \
         .eq("ticker", ticker) \
         .order("year", desc=True) \
         .execute()
 
     month_rows = supa.table("article_month_summaries") \
-        .select("year_month, ai_summary, article_count, condensed_at") \
+        .select("year_month, ai_summary, ai_summary_en, ai_summary_fr, article_count, condensed_at") \
         .eq("ticker", ticker) \
         .order("year_month", desc=True) \
         .execute()
@@ -435,7 +435,7 @@ def get_all_available(ticker: str) -> dict:
     all_raw.sort(key=lambda a: a.get("pub_date", ""), reverse=True)
 
     year_summaries = [
-        {"type": "year", "year": r["year"], "label": r["year"], "ai_summary": r["ai_summary"]}
+        {"type": "year", "year": r["year"], "label": r["year"], "ai_summary": r.get("ai_summary_fr") or r.get("ai_summary_en") or r.get("ai_summary", "")}
         for r in (year_rows.data or [])
     ]
     month_summaries = [
@@ -443,7 +443,7 @@ def get_all_available(ticker: str) -> dict:
             "type":          "month",
             "year_month":    r["year_month"],
             "label":         _month_label(r["year_month"]),
-            "ai_summary":    r["ai_summary"],
+            "ai_summary":    r.get("ai_summary_fr") or r.get("ai_summary_en") or r.get("ai_summary", ""),
             "article_count": r["article_count"],
         }
         for r in (month_rows.data or [])
@@ -456,7 +456,7 @@ def get_all_available(ticker: str) -> dict:
         "period":    "all",
         "articles":  all_raw,
         "summaries": summaries,
-        "condensed": [{"year_month": s.get("year_month", s.get("year", "")), "summary": s["ai_summary"], "article_count": s.get("article_count", 0)} for s in month_summaries],
+        "condensed": [{"year_month": s.get("year_month", s.get("year", "")), "summary": s.get("ai_summary_fr") or s.get("ai_summary_en") or s.get("ai_summary", ""), "article_count": s.get("article_count", 0)} for s in month_summaries],
     }
 
 
@@ -517,7 +517,7 @@ def _pick(fr_prompt: str, en_prompt: str) -> str:
 
 
 def _summary_col() -> str:
-    return "ai_summary_en" if _lang() == "en" else "ai_summary"
+    return "ai_summary_en" if _lang() == "en" else "ai_summary_fr"
 
 
 def _llm_call(prompt: str, max_tokens: int = 400, allow_groq: bool = True) -> str:
@@ -685,7 +685,7 @@ def run_monthly_condensation():
         try:
             # Essayer depuis les weekly summaries d'abord
             week_rows = supa.table("article_week_summaries") \
-                .select("week_num, ai_summary, article_count") \
+                .select("week_num, ai_summary, ai_summary_en, ai_summary_fr, article_count") \
                 .eq("ticker", ticker) \
                 .eq("year_month", target_ym) \
                 .order("week_num") \
@@ -694,9 +694,9 @@ def run_monthly_condensation():
             month_prompt = _pick(MONTH_CONDENSE_PROMPT, MONTH_CONDENSE_PROMPT_EN)
             sc = _summary_col()
             if week_rows.data and len(week_rows.data) >= 3:
-                src_col = "ai_summary_en" if _lang() == "en" else "ai_summary"
+                src_col = "ai_summary_en" if _lang() == "en" else "ai_summary_fr"
                 weeks_text = "\n".join(
-                    f"W{r['week_num']}: {r.get(src_col) or r.get('ai_summary', '')}"
+                    f"W{r['week_num']}: {r.get(src_col) or r.get('ai_summary_fr') or r.get('ai_summary', '')}"
                     for r in week_rows.data
                 )
                 article_count = sum(r["article_count"] for r in week_rows.data)
@@ -762,7 +762,7 @@ def run_yearly_condensation():
             continue
 
         month_rows = supa.table("article_month_summaries") \
-            .select("year_month, ai_summary") \
+            .select("year_month, ai_summary, ai_summary_en, ai_summary_fr") \
             .eq("ticker", ticker) \
             .like("year_month", f"{target_year}-%") \
             .order("year_month") \
@@ -772,9 +772,9 @@ def run_yearly_condensation():
             continue  # Pas assez de data pour une année complète
 
         try:
-            src_col = "ai_summary_en" if _lang() == "en" else "ai_summary"
+            src_col = "ai_summary_en" if _lang() == "en" else "ai_summary_fr"
             months_text = "\n".join(
-                f"{_month_label(r['year_month'])}: {r.get(src_col) or r.get('ai_summary', '')}"
+                f"{_month_label(r['year_month'])}: {r.get(src_col) or r.get('ai_summary_fr') or r.get('ai_summary', '')}"
                 for r in month_rows.data
             )
             summary = _llm_call(_pick(YEAR_CONDENSE_PROMPT, YEAR_CONDENSE_PROMPT_EN).format(
@@ -828,11 +828,13 @@ def run_yahoo_accumulation() -> dict[str, int]:
             if added > 0:
                 results[ticker] = added
                 try:
-                    from services.overview_service import get_news
+                    from services.overview_service import brutalise_new_articles, get_news
+                    n = brutalise_new_articles(ticker)
+                    logger.info(f"  DUMB gen {ticker} ({n} articles brutalised)")
                     get_news(ticker, force_24h=True)
                     logger.info(f"  OW refresh triggered {ticker} (+{added} articles)")
                 except Exception as ow_err:
-                    logger.warning(f"  OW refresh failed {ticker}: {ow_err}")
+                    logger.warning(f"  DUMB+OW refresh failed {ticker}: {ow_err}")
         except Exception as e:
             logger.error(f"  ✗ Yahoo accumulation {ticker}: {e}")
 
@@ -924,11 +926,13 @@ def run_finnhub_refresh() -> dict[str, int]:
                 results[ticker] = len(articles)
             if added > 0:
                 try:
-                    from services.overview_service import get_news
+                    from services.overview_service import brutalise_new_articles, get_news
+                    n = brutalise_new_articles(ticker)
+                    logger.info(f"  DUMB gen {ticker} ({n} articles brutalised)")
                     get_news(ticker, force_24h=True)
                     logger.info(f"  OW refresh triggered {ticker} (+{added} articles)")
                 except Exception as ow_err:
-                    logger.warning(f"  OW refresh failed {ticker}: {ow_err}")
+                    logger.warning(f"  DUMB+OW refresh failed {ticker}: {ow_err}")
         except Exception as e:
             logger.error(f"  ✗ Finnhub refresh {ticker}: {e}")
 
@@ -1030,7 +1034,7 @@ def run_monthly_calendaire(tickers: list[str] | None = None):
             continue
 
         week_rows = supa.table("article_week_summaries") \
-            .select("week_num, ai_summary, article_count") \
+            .select("week_num, ai_summary, ai_summary_en, ai_summary_fr, article_count") \
             .eq("ticker", ticker) \
             .eq("year_month", target_ym) \
             .order("week_num") \
@@ -1040,9 +1044,9 @@ def run_monthly_calendaire(tickers: list[str] | None = None):
             continue
 
         try:
-            src_col = "ai_summary_en" if _lang() == "en" else "ai_summary"
+            src_col = "ai_summary_en" if _lang() == "en" else "ai_summary_fr"
             weeks_text = "\n".join(
-                f"S{r['week_num']}: {r.get(src_col) or r.get('ai_summary', '')}" for r in week_rows.data
+                f"S{r['week_num']}: {r.get(src_col) or r.get('ai_summary_fr') or r.get('ai_summary', '')}" for r in week_rows.data
             )
             article_count = sum(r["article_count"] for r in week_rows.data)
             summary = _llm_call(_pick(MONTH_CONDENSE_PROMPT, MONTH_CONDENSE_PROMPT_EN).format(
@@ -1132,7 +1136,7 @@ def get_monthly_ondemand(ticker: str) -> str | None:
     supa = _get_supabase()
 
     rows = supa.table("article_week_summaries") \
-        .select("year_month, week_num, ai_summary") \
+        .select("year_month, week_num, ai_summary, ai_summary_en, ai_summary_fr") \
         .eq("ticker", ticker) \
         .order("year_month", desc=True) \
         .order("week_num", desc=True) \
@@ -1143,10 +1147,10 @@ def get_monthly_ondemand(ticker: str) -> str | None:
     if not weeks:
         return None
 
-    src_col = "ai_summary_en" if _lang() == "en" else "ai_summary"
+    src_col = "ai_summary_en" if _lang() == "en" else "ai_summary_fr"
     label = "the last 4 weeks" if _lang() == "en" else "ces 4 dernières semaines"
     weeks_text = "\n".join(
-        f"S{w['week_num']} {w['year_month']}: {w.get(src_col) or w.get('ai_summary', '')}"
+        f"S{w['week_num']} {w['year_month']}: {w.get(src_col) or w.get('ai_summary_fr') or w.get('ai_summary', '')}"
         for w in reversed(weeks)
     )
 

@@ -1,4 +1,5 @@
 import os
+from datetime import date
 import resend
 
 SENTIMENT_EMOJI = {"BULLISH": "📈", "BEARISH": "📉", "NEUTRAL": "➡️"}
@@ -32,7 +33,7 @@ def _build_html(digests: list[dict]) -> str:
   <div style="max-width:600px;margin:0 auto;">
     <div style="margin-bottom:28px;">
       <span style="font-family:monospace;font-weight:800;font-size:20px;color:#E8E5DF;">StockVibe</span>
-      <span style="margin-left:8px;font-size:12px;color:#9E9B95;">Digest du {digests[0]['date']}</span>
+      <span style="margin-left:8px;font-size:12px;color:#9E9B95;">Digest du {date.today().strftime("%d/%m/%Y")}</span>
     </div>
     {''.join(sections)}
     <p style="color:#5C5A56;font-size:11px;margin-top:24px;">
@@ -55,6 +56,6 @@ def send_digest_email(to_email: str, digests: list[dict]) -> None:
     resend.Emails.send({
         "from": os.environ.get("RESEND_FROM_EMAIL", "digest@stockvibe.app"),
         "to": [to_email],
-        "subject": f"StockVibe · Digest {digests[0]['date']} — {tickers}",
+        "subject": f"StockVibe · Digest {date.today().strftime('%d/%m/%Y')} — {tickers}",
         "html": _build_html(digests),
     })

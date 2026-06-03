@@ -262,7 +262,7 @@ export default function HomePage() {
       <Navbar user={user} onSignIn={() => setShowAuth(true)} onSignOut={handleSignOut} />
 
       {/* Main */}
-      <main style={{ maxWidth: "720px", margin: "0 auto", padding: "32px 20px 64px" }}>
+      <main style={{ maxWidth: "880px", margin: "0 auto", padding: "32px 20px 64px" }}>
 
         {/* Hero */}
         <div style={{ marginBottom: "28px" }}>

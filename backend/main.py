@@ -35,26 +35,11 @@ def _tg(msg: str):
 async def lifespan(app: FastAPI):
     scheduler = BackgroundScheduler(timezone="Europe/Paris")
     scheduler.add_job(
-        _run_digest_generation,
-        trigger="cron",
-        hour=18,
-        minute=0,
-        id="eod_digest_generation",
-    )
-    scheduler.add_job(
         _run_digest_email,
         trigger="cron",
         hour=18,
         minute=30,
         id="eod_digest_email",
-    )
-    scheduler.add_job(
-        _purge_old_digests,
-        trigger="cron",
-        day_of_week="mon",
-        hour=3,
-        minute=0,
-        id="purge_digests",
     )
     scheduler.add_job(
         _run_weekly_condensation,
@@ -84,14 +69,14 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(
         _run_yahoo_accumulation,
         trigger="cron",
-        hour="*/6",
+        hour="*/3",
         minute=0,
         id="yahoo_accumulation",
     )
     scheduler.add_job(
         _run_finnhub_refresh,
         trigger="cron",
-        hour="*/12",
+        hour="*/6",
         minute=30,
         id="finnhub_refresh",
     )
@@ -116,22 +101,9 @@ async def lifespan(app: FastAPI):
         id="reenrich_groq_to_freetheai",
     )
     scheduler.start()
-    logger.info("Crons démarrés — digest gen 18h + email 18h30, weekly lun 3h30, monthly 1er 4h, yearly 1er jan 5h, yahoo */6h, finnhub */12h, cold_start FR 19h, re-enrich 22h30, hourly_news :15")
+    logger.info("Crons démarrés — email 18h30, weekly lun 3h30, monthly 1er 4h, yearly 1er jan 5h, yahoo */3h, finnhub */6h, cold_start FR 19h, re-enrich 22h30, hourly_news :15")
     yield
     scheduler.shutdown()
-
-
-def _run_digest_generation():
-    import time
-    from services.digest_service import run_eod_digest_generation
-    _tg("▶ *EOD Digest — génération* (18h00)")
-    t = time.time()
-    try:
-        run_eod_digest_generation()
-        _tg(f"✅ *EOD Digest — génération terminée* ({int(time.time()-t)}s)")
-    except Exception as e:
-        logger.error(f"EOD digest generation failed: {e}")
-        _tg(f"❌ *EOD Digest — génération* : `{e}`")
 
 
 def _run_digest_email():
@@ -189,7 +161,7 @@ def _run_yearly_condensation():
 def _run_yahoo_accumulation():
     import time
     from services.breakers_articles_service import run_yahoo_accumulation
-    _tg("▶ *Yahoo accumulation* (*/6h)")
+    _tg("▶ *Yahoo accumulation* (*/3h)")
     t = time.time()
     try:
         results = run_yahoo_accumulation()
@@ -203,7 +175,7 @@ def _run_yahoo_accumulation():
 def _run_finnhub_refresh():
     import time
     from services.breakers_articles_service import run_finnhub_refresh
-    _tg("▶ *Finnhub refresh* (*/12h)")
+    _tg("▶ *Finnhub refresh* (*/6h)")
     t = time.time()
     try:
         results = run_finnhub_refresh()
@@ -261,15 +233,11 @@ def _purge_old_digests():
     t = time.time()
     try:
         supa = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
-        cutoff_30d = (date.today() - timedelta(days=30)).isoformat()
-        r1 = supa.table("daily_digest").delete().lt("date", cutoff_30d).execute()
-        n1 = len(r1.data or [])
-        logger.info(f"Purge digests > 30J : {n1} rows supprimées")
         cutoff_1y = (date.today() - timedelta(days=365)).isoformat()
         r2 = supa.table("event_causes").delete().lt("date", cutoff_1y).execute()
         n2 = len(r2.data or [])
         logger.info(f"Purge event_causes > 1 an : {n2} rows supprimées")
-        _tg(f"✅ *Purge DB terminée* ({int(time.time()-t)}s)\ndigests: {n1} · event_causes: {n2}")
+        _tg(f"✅ *Purge DB terminée* ({int(time.time()-t)}s)\nevent_causes: {n2}")
     except Exception as e:
         logger.error(f"Purge failed: {e}")
         _tg(f"❌ *Purge DB* : `{e}`")

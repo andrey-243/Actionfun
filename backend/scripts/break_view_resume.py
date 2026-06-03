@@ -19,7 +19,7 @@ os.environ["BATCH_MODE"] = "1"
 
 from services.breakers_articles_service import (
     _get_supabase, _week_num, _week_label, _month_label,
-    _normalize_finnhub, _llm_call,
+    _normalize_finnhub, _llm_call, _summary_col,
     WEEK_CONDENSE_PROMPT, MONTH_CONDENSE_PROMPT,
     _purge_excess_weeklies,
 )
@@ -74,7 +74,7 @@ def condense_weeks_for_month(ticker: str, year_month: str, supa) -> int:
                 "ticker":        ticker,
                 "year_month":    year_month,
                 "week_num":      wnum,
-                "ai_summary":    summary,
+                _summary_col():  summary,
                 "top_articles":  top_articles,
                 "article_count": len(week_articles),
                 "condensed_at":  datetime.now(timezone.utc).isoformat(),
@@ -101,7 +101,7 @@ def condense_month(ticker: str, year_month: str, supa) -> bool:
         return False
 
     week_rows = supa.table("article_week_summaries") \
-        .select("week_num, ai_summary, article_count") \
+        .select("week_num, ai_summary, ai_summary_en, ai_summary_fr, article_count") \
         .eq("ticker", ticker) \
         .eq("year_month", year_month) \
         .order("week_num") \
@@ -111,7 +111,8 @@ def condense_month(ticker: str, year_month: str, supa) -> bool:
         print(f"  Monthly {year_month} : pas assez de weeklies ({len(week_rows.data or [])})")
         return False
 
-    weeks_text = "\n".join(f"W{r['week_num']}: {r['ai_summary']}" for r in week_rows.data)
+    sc = _summary_col()
+    weeks_text = "\n".join(f"W{r['week_num']}: {r.get(sc) or r.get('ai_summary_fr') or r.get('ai_summary', '')}" for r in week_rows.data)
     article_count = sum(r["article_count"] for r in week_rows.data)
     print(f"  Condensation monthly {year_month} ({article_count} articles, {len(week_rows.data)} semaines)…", end=" ", flush=True)
     try:
@@ -121,7 +122,7 @@ def condense_month(ticker: str, year_month: str, supa) -> bool:
         supa.table("article_month_summaries").upsert({
             "ticker":        ticker,
             "year_month":    year_month,
-            "ai_summary":    summary,
+            _summary_col():  summary,
             "article_count": article_count,
             "condensed_at":  datetime.now(timezone.utc).isoformat(),
         }).execute()

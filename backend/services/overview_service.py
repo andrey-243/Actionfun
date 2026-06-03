@@ -1,10 +1,10 @@
 """
-Overview service — deux TTL indépendants :
+Overview service — refresh déclenché uniquement sur nouveaux articles :
 
-  Call 1 (TTL 6h)  : fetch Yahoo → DUMB nouveaux articles → OW 24H
-  Call 2 (TTL 24h) : lit abrutis en DB → OW 7J  (pas de re-fetch)
+  Call 1 : fetch articles_merged_finn_yahoo → si nouveaux → DUMB + OW 24H + OW 7J
+  Call 2 : lit dumb en DB → OW 7J  (BATCH_MODE=1 uniquement)
 
-  BATCH_MODE=1 : Call 1 skippé (OW 24H expire vite), Call 2 seulement.
+  Pas de TTL — refresh uniquement via force_24h=True (crons Yahoo/Finnhub) ou cache absent.
 """
 import hashlib
 import yfinance as yf
@@ -19,9 +19,7 @@ from services.llm_service import llm_json
 GROQ_HEAVY = "meta-llama/llama-4-scout-17b-16e-instruct"
 GROQ_LIGHT  = "llama-3.1-8b-instant"
 
-CACHE_TTL_24H_HOURS = 3   # Call 1 — OW 24H
-CACHE_TTL_7D_HOURS  = 24  # Call 2 — OW 7J
-MIN_SUMMARY_CHARS   = 80
+MIN_SUMMARY_CHARS = 80
 
 
 # ─── Prompts ──────────────────────────────────────────────────────────────────
@@ -303,12 +301,12 @@ def _fetch_news(ticker: str) -> tuple[list[dict], str | None]:
 
 def _filter_24h(articles: list[dict]) -> list[dict]:
     now = datetime.now(timezone.utc)
-    today_midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    cutoff = now - timedelta(hours=26)
     result = []
     for a in articles:
         try:
             pub = datetime.fromisoformat(a["pub_date"].replace("Z", "+00:00"))
-            if pub >= today_midnight:
+            if pub >= cutoff:
                 result.append(a)
         except Exception:
             pass
@@ -374,29 +372,25 @@ def _articles_hash(articles: list[dict]) -> str:
 
 # ─── TTL checks ───────────────────────────────────────────────────────────────
 
-def _needs_24h_refresh(row: dict | None, now: datetime) -> bool:
+def _needs_24h_refresh(row: dict | None) -> bool:
     lang = os.environ.get("LLM_LANG", "en")
     col = "ai_summary_24h_en" if lang == "en" else "ai_summary_24h"
-    if not row or not row.get(col):
-        return True
-    try:
-        cached_at = datetime.fromisoformat(row["cached_at"].replace("Z", "+00:00"))
-        return (now - cached_at) >= timedelta(hours=CACHE_TTL_24H_HOURS)
-    except Exception:
-        return True
+    return not row or not row.get(col)
 
 
-def _needs_7d_refresh(row: dict | None, now: datetime) -> bool:
+def _needs_7d_refresh(row: dict | None) -> bool:
     lang = os.environ.get("LLM_LANG", "en")
     col = "ai_summary_en" if lang == "en" else "ai_summary"
-    if not row or not row.get(col):
-        return True
-    ow7d_str = row.get("ow7d_cached_at")
-    if not ow7d_str:
-        return True
+    return not row or not row.get(col)
+
+
+def _is_stale_6h(row: dict | None, now: datetime) -> bool:
+    """Filet de sécurité : si le cache n'a pas été mis à jour depuis 6h, une visite page déclenche un refresh."""
+    if not row or not row.get("cached_at"):
+        return False
     try:
-        ow7d_at = datetime.fromisoformat(ow7d_str.replace("Z", "+00:00"))
-        return (now - ow7d_at) >= timedelta(hours=CACHE_TTL_7D_HOURS)
+        cached_at = datetime.fromisoformat(row["cached_at"].replace("Z", "+00:00"))
+        return (now - cached_at) >= timedelta(hours=6)
     except Exception:
         return True
 
@@ -437,7 +431,39 @@ def _write_dumb_to_archive(ticker: str, articles: list[dict], lang: str, supa) -
                 .eq("ticker", ticker).eq("year_month", ym).execute()
 
 
-# ─── Call 1 — DUMB + OW 24H (TTL 3h) ─────────────────────────────────────────
+# ─── Brutalise standalone — appelé par les crons dès nouveaux articles ────────
+
+def brutalise_new_articles(ticker: str, lang: str = None) -> int:
+    """
+    Génère dumb_en/fr pour tous les articles sans DUMB dans articles_merged_finn_yahoo.
+    Appelé par les crons Yahoo/Finnhub immédiatement après détection de nouveaux articles,
+    indépendamment de la regen OW.
+    Retourne le nombre d'articles brutalised.
+    """
+    lang = lang or os.environ.get("LLM_LANG", "en")
+    dumb_field = "dumb_en" if lang == "en" else "dumb_fr"
+    supa = _get_supabase()
+
+    fresh_articles, _ = _fetch_news(ticker)
+    to_brutalise = [a for a in fresh_articles[:30] if not a.get(dumb_field)]
+    if not to_brutalise:
+        return 0
+
+    ctx = _get_stock_context(ticker)
+    ctx_7d = _format_stock_context_7d(ctx)
+    ai_result = _brutalise(ticker, to_brutalise, stock_context=ctx_7d, lang=lang)
+
+    brutalised_map = {item["id"]: item["brutalised"] for item in ai_result.get("articles", [])}
+    for i, a in enumerate(to_brutalise):
+        b = brutalised_map.get(i, "")
+        if b and b.strip().upper() != "SKIP":
+            a[dumb_field] = b
+
+    _write_dumb_to_archive(ticker, to_brutalise, lang, supa)
+    return len(to_brutalise)
+
+
+# ─── Call 1 — DUMB + OW 24H ───────────────────────────────────────────────────
 
 def _call1_dumb_ow24h(ticker: str, fresh_articles: list[dict], row: dict | None,
                       supa, website: str | None, lang: str, now: datetime,
@@ -447,7 +473,7 @@ def _call1_dumb_ow24h(ticker: str, fresh_articles: list[dict], row: dict | None,
     # LLM2: skip brutalise si les articles n'ont pas changé depuis le dernier run
     new_hash = _articles_hash(fresh_articles[:30])
     cached_hash = (row or {}).get("articles_hash", "")
-    has_summary = bool((row or {}).get("ai_summary_24h") or (row or {}).get("ai_summary_24h_en"))
+    has_summary = bool((row or {}).get("ai_summary_24h_fr") or (row or {}).get("ai_summary_24h_en"))
     if cached_hash and cached_hash == new_hash and has_summary:
         update = {"cached_at": now.isoformat()}
         if website and not (row or {}).get("website"):
@@ -455,31 +481,38 @@ def _call1_dumb_ow24h(ticker: str, fresh_articles: list[dict], row: dict | None,
         supa.table("stock_news_cache").update(update).eq("ticker", ticker).execute()
         return {**(row or {}), **update}
 
-    # Articles sans dumb → à brutaliser
-    to_brutalise = [a for a in fresh_articles[:30] if not a.get(dumb_field)]
-    if not to_brutalise:
-        to_brutalise = fresh_articles[:30]
-
     if ctx is None:
         ctx = _get_stock_context(ticker)
     ctx_7d = _format_stock_context_7d(ctx)
     ctx_24h = _format_stock_context_24h(ctx)
 
-    ai_result = _brutalise(ticker, to_brutalise, stock_context=ctx_7d, lang=lang)
-    llm_source = _llm_svc._last_llm_source
+    # Articles sans dumb → à brutaliser
+    to_brutalise = [a for a in fresh_articles[:30] if not a.get(dumb_field)]
+    if to_brutalise:
+        ai_result = _brutalise(ticker, to_brutalise, stock_context=ctx_7d, lang=lang)
+        llm_source = _llm_svc._last_llm_source
 
-    brutalised_map = {item["id"]: item["brutalised"] for item in ai_result.get("articles", [])}
-    for i, a in enumerate(to_brutalise):
-        b = brutalised_map.get(i, "")
-        if b and b.strip().upper() != "SKIP":
-            a[dumb_field] = b
+        brutalised_map = {item["id"]: item["brutalised"] for item in ai_result.get("articles", [])}
+        for i, a in enumerate(to_brutalise):
+            b = brutalised_map.get(i, "")
+            if b and b.strip().upper() != "SKIP":
+                a[dumb_field] = b
 
-    # Persister dumb_en/fr dans articles_merged_finn_yahoo
-    _write_dumb_to_archive(ticker, to_brutalise, lang, supa)
+        _write_dumb_to_archive(ticker, to_brutalise, lang, supa)
 
-    _inter_delay = float(os.environ.get("LLM_INTER_CALL_DELAY", "0"))
-    if _inter_delay > 0:
-        time.sleep(_inter_delay)
+        _inter_delay = float(os.environ.get("LLM_INTER_CALL_DELAY", "0"))
+        if _inter_delay > 0:
+            time.sleep(_inter_delay)
+    else:
+        # Tous les articles ont déjà leur DUMB — OW 7J depuis dumb existants, sans re-brutaliser
+        ow7d = _ow7d_from_abrutis(ticker, fresh_articles[:30], stock_context=ctx_7d, lang=lang)
+        llm_source = _llm_svc._last_llm_source
+        ai_result = {
+            "summary": ow7d.get("summary", ""),
+            "sentiment": ow7d.get("sentiment", "NEUTRAL"),
+            "sentiment_reason": ow7d.get("sentiment_reason", ""),
+            "articles": [],
+        }
 
     articles_24h = _filter_24h(fresh_articles)
     if articles_24h:
@@ -488,9 +521,9 @@ def _call1_dumb_ow24h(ticker: str, fresh_articles: list[dict], row: dict | None,
     else:
         bench_line = _bench_context_line(ctx, lang)
         no_news_note = "No news in the last 24 hours." if lang == "en" else "Aucune actualité dans les dernières 24 heures."
-        existing_7d = (row.get("ai_summary_en") if lang == "en" else row.get("ai_summary", "")) if row else ""
+        existing_7d = (row.get("ai_summary_en") or row.get("ai_summary_fr") or "") if row else ""
         result_24h = {
-            "summary": f"{no_news_note}{(' ' + bench_line) if bench_line else ''} {existing_7d}".strip(),
+            "summary": f"{no_news_note}{(' ' + bench_line) if bench_line else ''}{(' ' + existing_7d) if existing_7d else ''}".strip(),
             "sentiment": ai_result.get("sentiment", "NEUTRAL"),
             "sentiment_reason": ai_result.get("sentiment_reason", ""),
             "_no_24h_news": True,
@@ -516,7 +549,7 @@ def _call1_dumb_ow24h(ticker: str, fresh_articles: list[dict], row: dict | None,
     else:
         update = {
             "ticker": ticker,
-            "ai_summary_24h": result_24h.get("summary", ""),
+            "ai_summary_24h_fr": result_24h.get("summary", ""),
             "ai_sentiment_24h": result_24h.get("sentiment", "NEUTRAL"),
             "ai_sentiment_reason_24h": result_24h.get("sentiment_reason", ""),
             "no_24h_news": no_24h,
@@ -524,7 +557,7 @@ def _call1_dumb_ow24h(ticker: str, fresh_articles: list[dict], row: dict | None,
             "website": website,
             "generated_by_fr": llm_source,
             "articles_hash": new_hash,
-            "ai_summary": ai_result.get("summary", ""),
+            "ai_summary_fr": ai_result.get("summary", ""),
             "ai_sentiment": ai_result.get("sentiment", "NEUTRAL"),
             "ai_sentiment_reason": ai_result.get("sentiment_reason", ""),
             "ow7d_cached_at": now.isoformat(),
@@ -571,7 +604,7 @@ def _call2_ow7d(ticker: str, fresh_articles: list[dict], row: dict | None,
     else:
         update = {
             "ticker": ticker,
-            "ai_summary": ai_result.get("summary", ""),
+            "ai_summary_fr": ai_result.get("summary", ""),
             "ai_sentiment": ai_result.get("sentiment", "NEUTRAL"),
             "ai_sentiment_reason": ai_result.get("sentiment_reason", ""),
             "ow7d_cached_at": now.isoformat(),
@@ -600,7 +633,7 @@ def get_news_stale(ticker: str, lang: str = None) -> tuple[dict | None, bool]:
         return None, True
 
     now = datetime.now(timezone.utc)
-    needs_refresh = (_needs_24h_refresh(row, now) and not batch_mode) or _needs_7d_refresh(row, now)
+    needs_refresh = (_needs_24h_refresh(row) and not batch_mode) or _needs_7d_refresh(row) or _is_stale_6h(row, now)
 
     if not row.get("exchange"):
         try:
@@ -627,8 +660,8 @@ def get_news(ticker: str, lang: str = None, force_24h: bool = False) -> dict:
     row = cache.data[0] if cache.data else None
 
     now = datetime.now(timezone.utc)
-    needs_24h = (_needs_24h_refresh(row, now) or force_24h) and not batch_mode
-    needs_7d  = _needs_7d_refresh(row, now)
+    needs_24h = (_needs_24h_refresh(row) or force_24h) and not batch_mode
+    needs_7d  = _needs_7d_refresh(row)
 
     fresh_articles, website = _fetch_news(ticker)
 
@@ -659,14 +692,15 @@ def _build_response(ticker: str, articles: list, row: dict) -> dict:
     return {
         "ticker": ticker,
         "articles": articles,
-        "summary": row.get("ai_summary_en", "") or row.get("ai_summary", ""),
+        "summary": row.get("ai_summary_en", "") or row.get("ai_summary_fr", ""),
         "sentiment": row.get("ai_sentiment", "NEUTRAL"),
         "sentiment_reason": row.get("ai_sentiment_reason", ""),
-        "summary_24h": row.get("ai_summary_24h_en", "") or row.get("ai_summary_24h", ""),
+        "summary_24h": row.get("ai_summary_24h_en", "") or row.get("ai_summary_24h_fr", ""),
         "sentiment_24h": row.get("ai_sentiment_24h", "NEUTRAL"),
         "sentiment_reason_24h": row.get("ai_sentiment_reason_24h", ""),
         "no_24h_news": row.get("no_24h_news", False),
         "cached_at": row.get("cached_at", ""),
+        "website": row.get("website", ""),
         "llm_source": row.get("generated_by_fr") or row.get("generated_by_en") or "cache",
     }
 

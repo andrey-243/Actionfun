@@ -1,5 +1,4 @@
-from fastapi import APIRouter, HTTPException, Query
-from services.digest_service import generate_digest_for_ticker
+from fastapi import APIRouter, HTTPException
 from supabase import create_client
 from datetime import datetime, timezone, timedelta
 import os
@@ -8,9 +7,8 @@ router = APIRouter()
 
 
 def _articles_from_archive(supa, ticker: str, hours: int = 48) -> list[dict]:
-    """Lit articles depuis articles_merged_finn_yahoo pour la fenêtre demandée."""
     now = datetime.now(timezone.utc)
-    cutoff_ts = int((now.timestamp()) - hours * 3600)
+    cutoff_ts = int(now.timestamp()) - hours * 3600
     year_months = {now.strftime("%Y-%m")}
     if now.day <= (hours // 24 + 1):
         prev = now.replace(day=1) - timedelta(days=1)
@@ -23,41 +21,13 @@ def _articles_from_archive(supa, ticker: str, hours: int = 48) -> list[dict]:
         if r and r.data and r.data.get("articles"):
             raw.extend(r.data["articles"])
 
-    articles = []
-    for a in raw:
-        ts = a.get("datetime", 0)
-        if not ts or ts < cutoff_ts:
-            continue
-        articles.append({
-            "headline": a.get("headline", ""),
-            "source": a.get("source", ""),
-            "url": a.get("url", ""),
-            "datetime": int(ts),
-        })
+    articles = [
+        {"headline": a.get("headline", ""), "source": a.get("source", ""), "url": a.get("url", ""), "datetime": int(a["datetime"])}
+        for a in raw
+        if a.get("datetime", 0) > cutoff_ts and a.get("headline")
+    ]
     articles.sort(key=lambda x: x["datetime"], reverse=True)
     return articles[:15]
-
-
-@router.get("/digest/{ticker}")
-async def digest(ticker: str, date: str = Query(default=None), force: bool = Query(default=False)):
-    try:
-        t = ticker.upper()
-        result = generate_digest_for_ticker(t, force=force)
-        supa = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
-        cache = supa.table("stock_news_cache").select("website").eq("ticker", t).maybe_single().execute()
-        website = (cache.data or {}).get("website") if cache else None
-        if not result:
-            return {"ticker": t, "date": date, "articles": [], "summary": "", "sentiment": "NEUTRAL", "website": website, "generated_at": None}
-        result["website"] = website
-        # EN first : normalise summary pour le frontend
-        if not result.get("summary") and result.get("summary_en"):
-            result["summary"] = result["summary_en"]
-        # Fallback : si le digest n'a pas d'articles, les lire directement depuis le cache
-        if not result.get("articles"):
-            result["articles"] = _articles_from_archive(supa, t, hours=48)
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 def _week_articles_from_archive(supa, ticker: str) -> list[dict]:

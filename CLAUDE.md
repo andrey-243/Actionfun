@@ -43,3 +43,23 @@ cd frontend && npm run dev  # http://localhost:3000
 - Routes FastAPI async par défaut
 - Noms produit : OW / DUMB / BUB / Breaks (pas les noms de fichiers seuls)
 - **Git** : ne jamais inclure `Co-Authored-By: Claude` dans les commits — aucune exception
+- **Colonnes LLM bilingues** : toute colonne DB contenant du texte généré par LLM **doit** avoir un suffixe de langue : `_fr` ou `_en`. Ne jamais créer/utiliser un nom générique sans suffixe (`ai_summary`, `cause`, `summary`…). En Python, `_summary_col()` retourne `"ai_summary_fr"` ou `"ai_summary_en"` selon `LLM_LANG`. Idem pour toute nouvelle colonne de ce type.
+
+## RTK — Token Efficiency
+
+Toujours préfixer les commandes shell par `rtk` :
+
+| Commande native | Utiliser |
+|---|---|
+| `grep` / `grep -n` / `grep -rn` | `rtk grep` |
+| `find` | `rtk find` |
+| `cat` | `rtk read` |
+| `ls` | `rtk ls` |
+| `git status` / `git diff` / `git log` | `rtk git` |
+| `curl -s` | `rtk curl` |
+| `wc -l` | `rtk wc` |
+| `ps aux` | `rtk ps` |
+| `pip install` / `pip freeze` | `rtk pip` |
+| `npm run` / `npx tsc` | `rtk npm` / `rtk tsc` |
+
+Ne pas utiliser `rtk` pour : `uvicorn`, `python3`, `pkill`, `lsof`, `pgrep` — pas de filtre applicable.

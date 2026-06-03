@@ -131,12 +131,12 @@ function StatBox({ label, value }: { label: string; value: string }) {
       background: "var(--color-surface)",
       border: "1px solid var(--color-border)",
       borderRadius: "8px",
-      padding: "14px 16px",
+      padding: "8px 12px",
     }}>
-      <div style={{ fontSize: "11px", color: "var(--color-text-muted)", marginBottom: "4px", letterSpacing: "0.04em" }}>
+      <div style={{ fontSize: "10px", color: "var(--color-text-muted)", marginBottom: "2px", letterSpacing: "0.04em" }}>
         {label}
       </div>
-      <div style={{ fontSize: "14px", fontWeight: 700, fontFamily: "var(--font-mono)", color: "var(--color-text-primary)" }}>
+      <div style={{ fontSize: "13px", fontWeight: 700, fontFamily: "var(--font-mono)", color: "var(--color-text-primary)" }}>
         {value}
       </div>
     </div>
@@ -213,68 +213,55 @@ function NewsCard({ article, onClick }: { article: Article; onClick: () => void 
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
       style={{
-        display: "flex",
-        gap: "14px",
-        padding: "14px 16px",
+        padding: "10px 14px",
         cursor: "pointer",
         borderBottom: "1px solid var(--color-border)",
         background: hovered ? "var(--color-surface-2)" : "transparent",
         transition: "background 0.1s",
       }}
     >
-      {/* Thumbnail or type indicator */}
-      <div style={{ flexShrink: 0, width: "72px" }}>
-        {article.thumbnail ? (
-          <div style={{ position: "relative", width: "72px", height: "48px", borderRadius: "6px", overflow: "hidden" }}>
-            <img src={article.thumbnail} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
-            {isVideo && (
-              <div style={{
-                position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center",
-                background: "rgba(0,0,0,0.4)",
-              }}>
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="#fff"><polygon points="5 3 19 12 5 21 5 3" /></svg>
-              </div>
-            )}
-          </div>
-        ) : (
-          <div style={{
-            width: "72px", height: "48px", borderRadius: "6px",
-            background: "var(--color-surface-2)", border: "1px solid var(--color-border)",
-            display: "flex", alignItems: "center", justifyContent: "center",
-          }}>
-            {isVideo
-              ? <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--color-text-muted)" strokeWidth="2"><polygon points="5 3 19 12 5 21 5 3" /></svg>
-              : <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--color-text-muted)" strokeWidth="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z" /><polyline points="14 2 14 8 20 8" /></svg>
-            }
-          </div>
-        )}
-      </div>
-
-      {/* Content */}
-      <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: "5px", marginBottom: "5px" }}>
-          <MiniSourceBadge name={article.source} />
-          {(article.extra_sources || []).slice(0, 2).map((s, i) => <MiniSourceBadge key={i} name={s.name} />)}
-          {ago && <span style={{ fontSize: "11px", color: "var(--color-text-muted)" }}>· {ago}</span>}
-          {isVideo && (
-            <span style={{
-              fontSize: "9px", fontWeight: 700, letterSpacing: "0.06em",
-              padding: "1px 5px", borderRadius: "3px",
-              background: "var(--color-surface-2)", color: "var(--color-text-muted)",
-            }}>
-              VIDEO
-            </span>
+      {/* Pic (left, spans 2 rows) + source+date / title (right) */}
+      <div style={{ display: "flex", gap: "10px", marginBottom: (article.dumb_en || article.dumb_fr) ? "3px" : "0" }}>
+        {/* Thumbnail */}
+        <div style={{ flexShrink: 0, width: "64px" }}>
+          {article.thumbnail ? (
+            <div style={{ position: "relative", width: "64px", height: "48px", borderRadius: "5px", overflow: "hidden" }}>
+              <img src={article.thumbnail} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+              {isVideo && (
+                <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", background: "rgba(0,0,0,0.45)" }}>
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="#fff"><polygon points="5 3 19 12 5 21 5 3" /></svg>
+                </div>
+              )}
+            </div>
+          ) : (
+            <div style={{ width: "64px", height: "48px", borderRadius: "5px", background: "var(--color-surface-2)", border: "1px solid var(--color-border)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+              {isVideo
+                ? <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--color-text-muted)" strokeWidth="2"><polygon points="5 3 19 12 5 21 5 3" /></svg>
+                : <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--color-text-muted)" strokeWidth="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z" /><polyline points="14 2 14 8 20 8" /></svg>
+              }
+            </div>
           )}
         </div>
-        <div style={{ fontSize: "13px", fontWeight: 600, color: "var(--color-text-primary)", lineHeight: 1.4, marginBottom: "6px" }}>
-          {article.title}
-        </div>
-        {(article.dumb_en || article.dumb_fr) && (
-          <div style={{ fontSize: "12px", color: "var(--color-accent)", lineHeight: 1.5 }}>
-            {article.dumb_en || article.dumb_fr}
+        {/* Content : source+date / title */}
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: "5px", marginBottom: "4px" }}>
+            <MiniSourceBadge name={article.source} />
+            {(article.extra_sources || []).slice(0, 2).map((s, i) => <MiniSourceBadge key={i} name={s.name} />)}
+            {ago && <span style={{ fontSize: "10px", color: "var(--color-text-muted)" }}>{ago}</span>}
+            {isVideo && <span style={{ fontSize: "9px", fontWeight: 700, letterSpacing: "0.06em", padding: "1px 5px", borderRadius: "3px", background: "var(--color-surface-2)", color: "var(--color-text-muted)" }}>VIDEO</span>}
           </div>
-        )}
+          <div style={{ fontSize: "13px", fontWeight: 600, color: "var(--color-text-primary)", lineHeight: 1.4 }}>
+            {article.title}
+          </div>
+        </div>
       </div>
+
+      {/* Dumb — pleine largeur */}
+      {(article.dumb_en || article.dumb_fr) && (
+        <div style={{ fontSize: "12px", color: "var(--color-accent)", lineHeight: 1.5 }}>
+          {article.dumb_en || article.dumb_fr}
+        </div>
+      )}
     </div>
   );
 }
@@ -337,14 +324,19 @@ export default function StockPage() {
 
   useEffect(() => {
     if (!news?.is_refreshing || !ticker) return;
-    const timer = setTimeout(() => {
-      fetch(`${API}/api/news/${ticker.toUpperCase()}`)
-        .then((r) => r.json())
-        .then((d) => setNews(d))
-        .catch(() => {});
-    }, 20_000);
-    return () => clearTimeout(timer);
-  }, [news?.is_refreshing]);
+    let active = true;
+    const poll = () => {
+      setTimeout(() => {
+        if (!active) return;
+        fetch(`${API}/api/news/${ticker.toUpperCase()}`)
+          .then((r) => r.json())
+          .then((d) => { setNews(d); if (active && d.is_refreshing) poll(); })
+          .catch(() => { if (active) poll(); });
+      }, 20_000);
+    };
+    poll();
+    return () => { active = false; };
+  }, [news?.is_refreshing, ticker]);
 
   useEffect(() => {
     if (!ticker || !stock) return;
@@ -568,14 +560,12 @@ export default function StockPage() {
     const DAY = 86_400_000;
 
     if (chartPeriod === "1d") {
-      const todayMidnight = new Date();
-      todayMidnight.setUTCHours(0, 0, 0, 0);
-      return all.filter(a => a.pub_date && new Date(a.pub_date).getTime() >= todayMidnight.getTime());
+      return all.filter(a => a.pub_date && new Date(a.pub_date).getTime() >= now - 26 * 3_600_000 && (a.dumb_en || a.dumb_fr));
     }
     if (chartPeriod === "5d") {
       // 1W : bucket par jour, max 3/jour, tri par longueur brutalised
       const cutoff = now - 7 * DAY;
-      const inRange = all.filter(a => a.pub_date && new Date(a.pub_date).getTime() >= cutoff);
+      const inRange = all.filter(a => a.pub_date && new Date(a.pub_date).getTime() >= cutoff && (a.dumb_en || a.dumb_fr));
       const slots: Record<number, Article[]> = {};
       for (const a of inRange) {
         const key = Math.floor(new Date(a.pub_date).getTime() / DAY);
@@ -636,7 +626,7 @@ export default function StockPage() {
         </div>
       </header>
 
-      <main style={{ maxWidth: "720px", margin: "0 auto", padding: "24px 20px 80px" }}>
+      <main style={{ maxWidth: "880px", margin: "0 auto", padding: "24px 20px 80px" }}>
 
         {/* Cold start banner — tickers rares hors top 250 */}
         {ticker && (
@@ -668,7 +658,7 @@ export default function StockPage() {
           </div>
         ) : stock && (
           <>
-            <div style={{ marginBottom: "20px" }}>
+            <div style={{ marginBottom: "20px", position: "relative" }}>
               <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "4px" }}>
                 <h1 style={{
                   fontSize: "24px", fontWeight: 800, fontFamily: "var(--font-mono)",
@@ -720,6 +710,11 @@ export default function StockPage() {
                   </button>
                 )}
               </div>
+              {news && (chartPeriod === "1d" || chartPeriod === "5d") && (() => {
+                const sentiment = chartPeriod === "1d" ? news.sentiment_24h : news.sentiment;
+                if (!sentiment) return null;
+                return <div style={{ position: "absolute", top: 0, right: 0 }}><SentimentBadge sentiment={sentiment} /></div>;
+              })()}
             </div>
 
             {/* Chart */}
@@ -749,14 +744,14 @@ export default function StockPage() {
                     <span style={{ marginLeft: "8px", fontSize: "10px", color: "var(--color-text-muted)", alignSelf: "center" }}>…</span>
                   )}
                 </div>
-                <div style={{ height: "180px" }}>
+                <div style={{ height: "240px" }}>
                   <Line data={chartData} options={chartOptions as Parameters<typeof Line>[0]["options"]} plugins={[verticalLinesPlugin]} />
                 </div>
               </div>
             )}
 
             {/* Stats */}
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: "10px", marginBottom: "28px" }}>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: "8px", marginBottom: "20px" }}>
               <StatBox label="Market Cap" value={fmtCap(stock.market_cap)} />
               <StatBox label="P/E Ratio" value={fmt(stock.pe_ratio)} />
               <StatBox label="52W High" value={`${displaySymbol}${fmt(convert(stock.week_52_high))}`} />
@@ -770,9 +765,11 @@ export default function StockPage() {
           <span style={{ fontSize: "11px", fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase", color: "var(--color-text-muted)" }}>
             News & Analysis
           </span>
-          <span style={{ fontSize: "11px", color: "var(--color-text-muted)" }}>
-            {chartPeriod === "1d" ? "24h" : chartPeriod === "5d" ? "7 jours" : chartPeriod === "1mo" ? "1 mois" : chartPeriod === "6mo" ? "6 mois" : chartPeriod === "1y" ? "1 an" : "5 ans"}
-          </span>
+          {chartPeriod !== "1d" && chartPeriod !== "5d" && (
+            <span style={{ fontSize: "11px", color: "var(--color-text-muted)" }}>
+              {chartPeriod === "1mo" ? "1 mois" : chartPeriod === "6mo" ? "6 mois" : chartPeriod === "1y" ? "1 an" : "5 ans"}
+            </span>
+          )}
         </div>
 
         {newsLoading ? (
@@ -810,12 +807,12 @@ export default function StockPage() {
               return (
                 <div style={{
                   background: "var(--color-surface)", border: "1px solid var(--color-border)",
-                  borderRadius: "8px", padding: "22px 24px", marginBottom: "12px",
+                  borderRadius: "8px", padding: "14px 18px", marginBottom: "12px",
                 }}>
-                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "16px" }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "10px" }}>
                     <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
                       <span style={{ fontSize: "11px", fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase", color: "var(--color-text-muted)" }}>
-                        AI Overview · {is24h ? "24h" : "7 jours"}
+                        AI Overview{!is24h ? " · 7 jours" : ""}
                       </span>
                       {is24h && news.no_24h_news && (
                         <span style={{
@@ -828,24 +825,32 @@ export default function StockPage() {
                       )}
                       {news.is_refreshing && (
                         <span style={{
-                          fontSize: "10px", padding: "2px 7px", borderRadius: "4px",
-                          background: "rgba(255,255,255,0.04)", color: "var(--color-text-muted)",
-                          fontFamily: "var(--font-mono)", letterSpacing: "0.05em",
+                          display: "inline-flex", alignItems: "center", gap: "5px",
+                          fontSize: "10px", padding: "2px 8px", borderRadius: "4px",
+                          background: "rgba(76,175,130,0.12)", color: "var(--color-accent)",
+                          fontFamily: "var(--font-mono)", letterSpacing: "0.05em", fontWeight: 600,
+                          border: "1px solid rgba(76,175,130,0.25)",
                         }}>
-                          ↻ mise à jour...
+                          <span className="refreshing-icon">↻</span> mise à jour...
                         </span>
                       )}
                     </div>
-                    <SentimentBadge sentiment={activeSentiment} />
+                    {news.cached_at && (() => {
+                      try {
+                        const d = new Date(news.cached_at);
+                        return <span className="ow-date-blink" style={{ fontSize: "11px", fontFamily: "var(--font-mono)", color: "var(--color-accent)", fontWeight: 600 }}>{d.toLocaleDateString("fr-FR", { day: "2-digit", month: "2-digit" })} {d.toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" })}</span>;
+                      } catch { return null; }
+                    })()}
                   </div>
-                  {is24h && news.no_24h_news && (
-                    <p style={{ fontSize: "12px", color: "var(--color-text-muted)", marginBottom: "12px", fontStyle: "italic" }}>
-                      Aucune actualité publiée dans les dernières 24h — analyse basée sur les données récentes disponibles.
+                  {is24h && news.no_24h_news ? (
+                    <p style={{ fontSize: "13px", color: "var(--color-text-muted)", margin: 0, fontStyle: "italic" }}>
+                      Aucune news dans les dernières 24h — basé sur les données disponibles.
+                    </p>
+                  ) : (
+                    <p style={{ fontSize: "15px", color: "var(--color-text-primary)", lineHeight: 1.75, margin: 0, fontWeight: 400 }}>
+                      {activeSummary}
                     </p>
                   )}
-                  <p style={{ fontSize: "15px", color: "var(--color-text-primary)", lineHeight: 1.75, margin: 0, fontWeight: 400 }}>
-                    {activeSummary}
-                  </p>
                 </div>
               );
             })()}

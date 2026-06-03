@@ -119,7 +119,7 @@ export default function ProfilePage() {
         </div>
       </header>
 
-      <main style={{ maxWidth: "720px", margin: "0 auto", padding: "24px 20px 80px" }}>
+      <main style={{ maxWidth: "880px", margin: "0 auto", padding: "24px 20px 80px" }}>
 
         {/* Shortcuts */}
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px", marginBottom: "28px" }}>

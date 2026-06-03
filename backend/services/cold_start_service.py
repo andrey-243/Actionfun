@@ -327,21 +327,21 @@ def translate_pending_fr():
 
 
 def _translate_ticker_fr(ticker: str, supa, translate_fn):
-    """Traduit ai_summary + ai_summary_24h dans stock_news_cache et article summaries."""
+    """Traduit *_en → *_fr dans stock_news_cache et article summaries."""
     # stock_news_cache
-    row = supa.table("stock_news_cache").select("ai_summary_en, ai_summary_24h_en").eq("ticker", ticker).maybe_single().execute()
+    row = supa.table("stock_news_cache").select("ai_summary_en, ai_summary_24h_en, ai_summary_fr, ai_summary_24h_fr").eq("ticker", ticker).maybe_single().execute()
     if row and row.data:
         updates = {}
-        if row.data.get("ai_summary_en") and not row.data.get("ai_summary"):
-            updates["ai_summary"] = translate_fn(row.data["ai_summary_en"])
-        if row.data.get("ai_summary_24h_en") and not row.data.get("ai_summary_24h"):
-            updates["ai_summary_24h"] = translate_fn(row.data["ai_summary_24h_en"])
+        if row.data.get("ai_summary_en") and not row.data.get("ai_summary_fr"):
+            updates["ai_summary_fr"] = translate_fn(row.data["ai_summary_en"])
+        if row.data.get("ai_summary_24h_en") and not row.data.get("ai_summary_24h_fr"):
+            updates["ai_summary_24h_fr"] = translate_fn(row.data["ai_summary_24h_en"])
         if updates:
             supa.table("stock_news_cache").update(updates).eq("ticker", ticker).execute()
 
-    # article_week_summaries — traduire ai_summary_en → ai_summary
-    weeks = supa.table("article_week_summaries").select("year_month, week_num, ai_summary_en").eq("ticker", ticker).execute()
+    # article_week_summaries — traduire ai_summary_en → ai_summary_fr
+    weeks = supa.table("article_week_summaries").select("year_month, week_num, ai_summary_en, ai_summary_fr").eq("ticker", ticker).execute()
     for w in (weeks.data or []):
-        if w.get("ai_summary_en") and not w.get("ai_summary"):
+        if w.get("ai_summary_en") and not w.get("ai_summary_fr"):
             fr = translate_fn(w["ai_summary_en"])
-            supa.table("article_week_summaries").update({"ai_summary": fr}).eq("ticker", ticker).eq("year_month", w["year_month"]).eq("week_num", w["week_num"]).execute()
+            supa.table("article_week_summaries").update({"ai_summary_fr": fr}).eq("ticker", ticker).eq("year_month", w["year_month"]).eq("week_num", w["week_num"]).execute()

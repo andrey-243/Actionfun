@@ -86,7 +86,7 @@ def get_event_news(ticker: str, date: str, change_pct: float = 0.0) -> dict:
 
     # Cache Supabase permanent
     row = supa.table("event_causes") \
-        .select("articles, cause, cause_en") \
+        .select("articles, cause_fr, cause_en") \
         .eq("ticker", ticker) \
         .eq("date", date) \
         .maybe_single() \
@@ -95,7 +95,7 @@ def get_event_news(ticker: str, date: str, change_pct: float = 0.0) -> dict:
     lang = os.environ.get("LLM_LANG", "en")
     cached = row.data if row else None
     if cached:
-        cause = cached.get("cause_en" if lang == "en" else "cause")
+        cause = cached.get("cause_en" if lang == "en" else "cause_fr")
         if cause:
             return {"date": date, "articles": cached["articles"], "cause": cause}
 
@@ -188,7 +188,7 @@ def get_event_news(ticker: str, date: str, change_pct: float = 0.0) -> dict:
     cause = cause_result
     result = {"date": date, "articles": articles, "cause": cause}
 
-    cause_field = "cause_en" if lang == "en" else "cause"
+    cause_field = "cause_en" if lang == "en" else "cause_fr"
     upsert_data = {
         "ticker":    ticker,
         "date":      date,

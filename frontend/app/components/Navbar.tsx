@@ -173,7 +173,7 @@ export const HEADER_STYLE: React.CSSProperties = {
 };
 
 export const HEADER_INNER: React.CSSProperties = {
-  maxWidth: "720px",
+  maxWidth: "880px",
   margin: "0 auto",
   padding: "0 20px",
   height: "66px",
