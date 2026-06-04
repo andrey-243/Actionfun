@@ -59,11 +59,11 @@ def run_eod_digest_email():
     digests = []
     for ticker in tickers:
         row = supa.table("stock_news_cache") \
-            .select("ai_summary_24h_en, ai_summary_24h, ai_sentiment_24h") \
+            .select("ai_summary_24h_en, ai_sentiment_24h") \
             .eq("ticker", ticker).maybe_single().execute()
         if not row or not row.data:
             continue
-        summary = row.data.get("ai_summary_24h_en") or row.data.get("ai_summary_24h", "")
+        summary = row.data.get("ai_summary_24h_en", "")
         if not summary:
             continue
         articles = _articles_24h(supa, ticker)

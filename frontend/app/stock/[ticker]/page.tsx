@@ -155,6 +155,39 @@ function MiniSourceBadge({ name }: { name: string }) {
   );
 }
 
+function ExpandButton({ count, expanded, onClick, accentColor }: {
+  count: number; expanded: boolean; onClick: () => void; accentColor: string;
+}) {
+  const [hovered, setHovered] = useState(false);
+  return (
+    <button
+      onClick={onClick}
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
+      style={{
+        display: "flex", alignItems: "center", gap: "5px",
+        padding: "3px 8px 3px 10px",
+        borderRadius: "12px",
+        border: `1px solid ${accentColor}`,
+        background: hovered ? accentColor : "transparent",
+        color: hovered ? "#fff" : accentColor,
+        cursor: "pointer",
+        fontSize: "10px", fontWeight: 700, letterSpacing: "0.04em",
+        transition: "background 0.15s, color 0.15s",
+        flexShrink: 0,
+      }}
+    >
+      {count} articles
+      <svg
+        width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"
+        style={{ transform: expanded ? "rotate(90deg)" : "none", transition: "transform 0.15s" }}
+      >
+        <polyline points="9 18 15 12 9 6" />
+      </svg>
+    </button>
+  );
+}
+
 function CompactArticleRow({ article, onClick, directLink }: { article: Article; onClick: () => void; directLink?: boolean }) {
   const [hovered, setHovered] = useState(false);
   const ago = article.pub_date
@@ -186,13 +219,6 @@ function CompactArticleRow({ article, onClick, directLink }: { article: Article;
           transition: "background 0.1s",
         }}
       >
-        {article.thumbnail && (
-          <img
-            src={article.thumbnail}
-            alt=""
-            style={{ width: "52px", height: "36px", objectFit: "cover", borderRadius: "4px", flexShrink: 0 }}
-          />
-        )}
         <div style={{ flex: 1, minWidth: 0 }}>
           <span style={{ fontSize: "11px", fontWeight: 500, color: "var(--color-text-primary)", lineHeight: 1.3 }}>
             {article.title}
@@ -202,6 +228,9 @@ function CompactArticleRow({ article, onClick, directLink }: { article: Article;
           <MiniSourceBadge name={article.source} />
           {(article.extra_sources || []).slice(0, 2).map((s, i) => <MiniSourceBadge key={i} name={s.name} />)}
           {ago && <span style={{ fontSize: "10px", color: "var(--color-text-muted)", marginLeft: "4px" }}>{ago}</span>}
+          <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="var(--color-text-muted)" strokeWidth="2" style={{ marginLeft: "2px", flexShrink: 0 }}>
+            <path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/>
+          </svg>
         </div>
       </div>
     );
@@ -331,6 +360,8 @@ export default function StockPage() {
   const [periodArticles, setPeriodArticles] = useState<Article[]>([]);
   const [periodSummaries, setPeriodSummaries] = useState<{type: string; year_month?: string; year?: string; week_num?: number | null; label: string; ai_summary?: string | null; article_count?: number; top_articles?: Article[]; skewed?: boolean; skewed_range?: string}[]>([]);
   const [periodLoading, setPeriodLoading] = useState(false);
+  const [expandedSections, setExpandedSections] = useState<Record<string, number>>({});
+  const [expandedYears, setExpandedYears] = useState<Record<string, boolean>>({});
 
   const [coldStartPhase, setColdStartPhase] = useState<string | null>(null);
 
@@ -391,17 +422,26 @@ export default function StockPage() {
   // Articles par période : Finnhub/archive pour 1M+, Yahoo filtré pour 24H/1W
   useEffect(() => {
     if (!ticker) return;
+    setExpandedSections({});
+    setExpandedYears({});
     const ARCHIVE_PERIODS = new Set(["1mo", "6mo", "1y", "5y"]);
     const apiPeriod = chartPeriod === "5y" ? "all" : chartPeriod;
     if (ARCHIVE_PERIODS.has(chartPeriod)) {
       setPeriodLoading(true);
       setPeriodArticles([]);
       setPeriodSummaries([]);
-      fetch(`${API}/api/articles/${ticker.toUpperCase()}?period=${apiPeriod}`)
+      const cn = stock?.name ? `&company_name=${encodeURIComponent(stock.name)}` : "";
+      fetch(`${API}/api/articles/${ticker.toUpperCase()}?period=${apiPeriod}${cn}`)
         .then((r) => r.json())
         .then((d) => {
+          const summaries: typeof periodSummaries = d.summaries ?? [];
           setPeriodArticles(d.articles ?? []);
-          setPeriodSummaries(d.summaries ?? []);
+          setPeriodSummaries(summaries);
+          // Ouvrir l'année la plus récente par défaut en 5Y
+          if (chartPeriod === "5y") {
+            const firstYear = summaries.find(s => s.type === "year")?.year;
+            if (firstYear) setExpandedYears({ [firstYear]: true });
+          }
           setPeriodLoading(false);
         })
         .catch(() => setPeriodLoading(false));
@@ -679,7 +719,8 @@ export default function StockPage() {
               // Recharger les articles quand une phase se termine
               if (["1m", "6m", "1y"].includes(phase)) {
                 const apiPeriod = chartPeriod === "5y" ? "all" : chartPeriod;
-                fetch(`${API}/api/articles/${ticker.toUpperCase()}?period=${apiPeriod}`)
+                const cn2 = stock?.name ? `&company_name=${encodeURIComponent(stock.name)}` : "";
+                fetch(`${API}/api/articles/${ticker.toUpperCase()}?period=${apiPeriod}${cn2}`)
                   .then((r) => r.json())
                   .then((d) => { setPeriodArticles(d.articles ?? []); setPeriodSummaries(d.summaries ?? []); })
                   .catch(() => {});
@@ -906,79 +947,145 @@ export default function StockPage() {
               return (
                 <>
                   {/* Sections semaine (1M) ou mois (6M/1Y/ALL) */}
-                  {["1mo","6mo","1y","5y"].includes(chartPeriod) && periodSummaries.length > 0 ? periodSummaries.map((s, i) => {
-                    const key = s.year_month ? `${s.year_month}-${s.week_num ?? "m"}` : s.year ?? String(i);
-                    const accentColor = s.skewed
-                      ? "var(--color-text-muted)"
-                      : s.type === "year" ? "#9B77CF" : s.type === "week" ? "#4CAF82" : "#5B9BD5";
-                    const sectionLabel = s.skewed
-                      ? `${s.skewed_range} · ${s.label}`
-                      : s.type === "year" ? `Année ${s.year}` : s.label;
-                    const sectionArticles = s.top_articles ?? [];
-                    return (
-                      <div key={key} style={{ marginBottom: "16px" }}>
-                        {/* Header section */}
-                        <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "6px" }}>
-                          <div style={{ height: "1px", width: "12px", background: accentColor, flexShrink: 0 }} />
-                          <span style={{ fontSize: "10px", fontWeight: 700, letterSpacing: "0.07em", textTransform: "uppercase", color: accentColor, whiteSpace: "nowrap" }}>
-                            {sectionLabel}
-                          </span>
-                          {s.article_count ? (
-                            <span style={{ fontSize: "10px", color: "var(--color-text-muted)" }}>· {s.article_count} articles</span>
-                          ) : null}
-                          <div style={{ flex: 1, height: "1px", background: "var(--color-border)" }} />
-                        </div>
+                  {["1mo","6mo","1y","5y"].includes(chartPeriod) && periodSummaries.length > 0 ? (() => {
+                    /* Helper : rendu d'une section mensuelle/hebdo */
+                    const renderSection = (s: typeof periodSummaries[0], i: number) => {
+                      const key = s.year_month ? `${s.year_month}-${s.week_num ?? "m"}` : s.year ?? String(i);
+                      const accentColor = s.type === "week" ? "#4CAF82" : "#5B9BD5";
+                      const sectionLabel = s.skewed ? `${s.skewed_range} · ${s.label}` : s.label;
+                      const sectionArticles = s.top_articles ?? [];
+                      const shown = expandedSections[key] ?? 0;
+                      const visibleArticles = sectionArticles.slice(0, shown);
+                      const hasMore = sectionArticles.length > shown;
+                      const isExpanded = shown > 0;
+                      const toggleExpand = () => setExpandedSections(prev => ({ ...prev, [key]: isExpanded ? 0 : 10 }));
+                      const loadMore = () => setExpandedSections(prev => ({ ...prev, [key]: shown + 10 }));
 
-                        {s.skewed ? (
-                          /* Cas skewed — pas de récap hebdo possible */
-                          <>
-                            <div style={{
-                              display: "flex", alignItems: "center", gap: "8px",
-                              padding: "8px 12px", marginBottom: "4px",
-                              background: "var(--color-surface)", border: "1px solid var(--color-border)",
-                              borderRadius: "6px",
-                            }}>
-                              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="var(--color-text-muted)" strokeWidth="2">
-                                <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
-                              </svg>
-                              <span style={{ fontSize: "11px", color: "var(--color-text-muted)", fontStyle: "italic" }}>
-                                Récap hebdomadaire indisponible — couverture insuffisante sur cette période
+                      return (
+                        <div key={key} style={{ marginBottom: "10px" }}>
+                          <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "6px" }}>
+                            <div style={{ height: "1px", width: "12px", background: accentColor, flexShrink: 0 }} />
+                            <span style={{ fontSize: "10px", fontWeight: 700, letterSpacing: "0.07em", textTransform: "uppercase", color: accentColor, whiteSpace: "nowrap" }}>
+                              {sectionLabel}
+                            </span>
+                            {s.article_count ? (
+                              <span style={{ fontSize: "10px", color: "var(--color-text-muted)" }}>· {s.article_count} articles</span>
+                            ) : null}
+                            <div style={{ flex: 1, height: "1px", background: "var(--color-border)" }} />
+                            {sectionArticles.length > 0 && (
+                              <ExpandButton count={sectionArticles.length} expanded={isExpanded} onClick={toggleExpand} accentColor={accentColor} />
+                            )}
+                          </div>
+                          {s.skewed ? (
+                            <>
+                              {sectionArticles.length === 0 && (
+                                <div style={{ display: "flex", alignItems: "center", gap: "8px", padding: "8px 12px", marginBottom: "4px", background: "var(--color-surface)", border: "1px solid var(--color-border)", borderRadius: "6px" }}>
+                                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="var(--color-text-muted)" strokeWidth="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+                                  <span style={{ fontSize: "11px", color: "var(--color-text-muted)", fontStyle: "italic" }}>Récap hebdomadaire indisponible</span>
+                                </div>
+                              )}
+                              {isExpanded && visibleArticles.length > 0 && (
+                                <div style={{ background: "var(--color-surface)", border: "1px solid var(--color-border)", borderRadius: "8px", overflow: "hidden" }}>
+                                  {visibleArticles.map((article) => (
+                                    <CompactArticleRow key={article.id} article={article} onClick={() => handleArticleClick(article)} directLink={["6mo", "1y"].includes(chartPeriod)} />
+                                  ))}
+                                  {hasMore && (
+                                    <button onClick={loadMore} style={{ width: "100%", padding: "7px", background: "none", border: "none", borderTop: "1px solid var(--color-border)", cursor: "pointer", color: "var(--color-text-muted)", fontSize: "11px", display: "flex", alignItems: "center", justifyContent: "center", gap: "4px" }}>
+                                      <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><polyline points="6 9 12 15 18 9" /></svg>
+                                      {Math.min(10, sectionArticles.length - shown)} de plus
+                                    </button>
+                                  )}
+                                </div>
+                              )}
+                            </>
+                          ) : (
+                            <>
+                              {s.ai_summary && (
+                                <div style={{ background: "var(--color-surface)", border: "1px solid var(--color-border)", borderRadius: "8px", padding: "14px 16px", marginBottom: isExpanded && visibleArticles.length > 0 ? "3px" : 0 }}>
+                                  <p style={{ fontSize: "13px", color: "var(--color-text-secondary)", lineHeight: 1.65, margin: 0 }}>{s.ai_summary}</p>
+                                </div>
+                              )}
+                              {isExpanded && visibleArticles.length > 0 && (
+                                <div style={{ background: "var(--color-surface)", border: "1px solid var(--color-border)", borderRadius: "8px", overflow: "hidden" }}>
+                                  {visibleArticles.map((article) => (
+                                    <CompactArticleRow key={article.id} article={article} onClick={() => handleArticleClick(article)} directLink={["6mo", "1y"].includes(chartPeriod)} />
+                                  ))}
+                                  {hasMore && (
+                                    <button onClick={loadMore} style={{ width: "100%", padding: "7px", background: "none", border: "none", borderTop: "1px solid var(--color-border)", cursor: "pointer", color: "var(--color-text-muted)", fontSize: "11px", display: "flex", alignItems: "center", justifyContent: "center", gap: "4px" }}>
+                                      <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><polyline points="6 9 12 15 18 9" /></svg>
+                                      {Math.min(10, sectionArticles.length - shown)} de plus
+                                    </button>
+                                  )}
+                                </div>
+                              )}
+                            </>
+                          )}
+                        </div>
+                      );
+                    };
+
+                    /* Vue 5Y : grouper par année */
+                    if (chartPeriod === "5y") {
+                      const yearGroups: { year: string; yearData: typeof periodSummaries[0]; months: typeof periodSummaries }[] = [];
+                      let currentGroup: (typeof yearGroups)[0] | null = null;
+                      for (const s of periodSummaries) {
+                        if (s.type === "year") {
+                          currentGroup = { year: s.year!, yearData: s, months: [] };
+                          yearGroups.push(currentGroup);
+                        } else if (currentGroup) {
+                          currentGroup.months.push(s);
+                        }
+                      }
+                      return yearGroups.map(({ year, yearData, months }) => {
+                        const isYearOpen = expandedYears[year] ?? false;
+                        const totalArticles = months.reduce((acc, m) => acc + (m.article_count ?? 0), 0);
+                        return (
+                          <div key={year} style={{ marginBottom: "16px" }}>
+                            {/* Header année — dropdown */}
+                            <button
+                              onClick={() => setExpandedYears(prev => ({ ...prev, [year]: !isYearOpen }))}
+                              style={{
+                                width: "100%", display: "flex", alignItems: "center", gap: "10px",
+                                background: "none", border: "none", cursor: "pointer",
+                                marginBottom: isYearOpen ? "10px" : 0, padding: 0,
+                              }}
+                            >
+                              <div style={{ height: "1px", width: "12px", background: "#9B77CF", flexShrink: 0 }} />
+                              <span style={{ fontSize: "11px", fontWeight: 800, letterSpacing: "0.08em", textTransform: "uppercase", color: "#9B77CF", whiteSpace: "nowrap" }}>
+                                {year}
                               </span>
-                            </div>
-                            {sectionArticles.length > 0 && (
-                              <div style={{ background: "var(--color-surface)", border: "1px solid var(--color-border)", borderRadius: "8px", overflow: "hidden" }}>
-                                {sectionArticles.map((article) => (
-                                  <CompactArticleRow key={article.id} article={article} onClick={() => handleArticleClick(article)} directLink={["6mo", "1y"].includes(chartPeriod)} />
-                                ))}
+                              {totalArticles > 0 && (
+                                <span style={{ fontSize: "10px", color: "var(--color-text-muted)" }}>· {totalArticles} articles</span>
+                              )}
+                              <div style={{ flex: 1, height: "1px", background: "var(--color-border)" }} />
+                              <svg
+                                width="13" height="13" viewBox="0 0 24 24" fill="none"
+                                stroke="#9B77CF" strokeWidth="2.5"
+                                style={{ flexShrink: 0, transform: isYearOpen ? "rotate(90deg)" : "none", transition: "transform 0.18s" }}
+                              >
+                                <polyline points="9 18 15 12 9 6" />
+                              </svg>
+                            </button>
+                            {/* Résumé annuel */}
+                            {isYearOpen && yearData.ai_summary && (
+                              <div style={{ background: "var(--color-surface)", border: "1px solid var(--color-border)", borderRadius: "8px", padding: "14px 16px", marginBottom: "10px" }}>
+                                <p style={{ fontSize: "13px", color: "var(--color-text-secondary)", lineHeight: 1.65, margin: 0 }}>{yearData.ai_summary}</p>
                               </div>
                             )}
-                          </>
-                        ) : (
-                          /* Cas normal — résumé AI + articles compacts */
-                          <>
-                            {s.ai_summary && (
-                              <div style={{
-                                background: "var(--color-surface)", border: "1px solid var(--color-border)",
-                                borderRadius: "8px", padding: "14px 16px",
-                                marginBottom: sectionArticles.length > 0 ? "3px" : 0,
-                              }}>
-                                <p style={{ fontSize: "13px", color: "var(--color-text-secondary)", lineHeight: 1.65, margin: 0 }}>
-                                  {s.ai_summary}
-                                </p>
+                            {/* Mois du dropdown */}
+                            {isYearOpen && (
+                              <div style={{ paddingLeft: "16px", borderLeft: "2px solid rgba(155,119,207,0.3)" }}>
+                                {months.map((m, i) => renderSection(m, i))}
                               </div>
                             )}
-                            {sectionArticles.length > 0 && (
-                              <div style={{ background: "var(--color-surface)", border: "1px solid var(--color-border)", borderRadius: "8px", overflow: "hidden" }}>
-                                {sectionArticles.map((article) => (
-                                  <CompactArticleRow key={article.id} article={article} onClick={() => handleArticleClick(article)} directLink={["6mo", "1y"].includes(chartPeriod)} />
-                                ))}
-                              </div>
-                            )}
-                          </>
-                        )}
-                      </div>
-                    );
-                  }) : null}
+                          </div>
+                        );
+                      });
+                    }
+
+                    /* Vues 1M / 6M / 1Y : rendu plat */
+                    return periodSummaries.map((s, i) => renderSection(s, i));
+                  })() : null}
                   {/* Articles bruts (fallback semaines sans summary) */}
                   {displayed.length > 0 && (
                     <div style={{ background: "var(--color-surface)", border: "1px solid var(--color-border)", borderRadius: "8px", overflow: "hidden" }}>

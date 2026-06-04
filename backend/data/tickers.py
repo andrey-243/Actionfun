@@ -23,7 +23,7 @@ US = [
     "PG","KO","PEP","PM","MO","MDLZ","GIS","K","CPB","SJM",
     "CL","CHD","EL","COTY","REV","SPB","HRL","TSN","CAG","LW",
     # Energie
-    "XOM","CVX","COP","EOG","PXD","DVN","HAL","SLB","BKR","HES",
+    "XOM","CVX","COP","EOG","DVN","HAL","SLB","BKR",
     "OXY","MPC","PSX","VLO","FANG","CTRA","APA","AR","EQT","RRC",
     # Industriels
     "GE","BA","RTX","LMT","NOC","GD","HII","TDG","HWM","SPR",

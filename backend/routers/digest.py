@@ -1,16 +1,16 @@
 """
-GET /api/weekly/{ticker}  → weekly summary + articles 7j pour la page "Mes news"
+GET /api/weekly/{ticker}  → OW 7J + articles 7j pour la page "Mes news"
 
 Lit depuis :
-  - article_week_summaries (résumé AI hebdo si disponible)
+  - stock_news_cache (même OW 7J que la page stock + cached_at + website)
   - articles_merged_finn_yahoo (articles 7j bruts, normalisés)
-  - stock_news_cache (website pour logo)
 Zéro appel LLM à la volée.
 """
 from fastapi import APIRouter, HTTPException
 from supabase import create_client
 from datetime import datetime, timezone, timedelta
 import os
+from services.breakers_articles_service import _is_ticker_related
 
 router = APIRouter()
 
@@ -31,7 +31,14 @@ def _articles_from_archive(supa, ticker: str, hours: int = 48) -> list[dict]:
             raw.extend(r.data["articles"])
 
     articles = [
-        {"headline": a.get("headline", ""), "source": a.get("source", ""), "url": a.get("url", ""), "datetime": int(a["datetime"])}
+        {
+            "headline": a.get("headline", ""),
+            "source":   a.get("source", ""),
+            "url":      a.get("url", ""),
+            "datetime": int(a["datetime"]),
+            "dumb_en":  a.get("dumb_en", ""),
+            "dumb_fr":  a.get("dumb_fr", ""),
+        }
         for a in raw
         if a.get("datetime", 0) > cutoff_ts and a.get("headline")
     ]
@@ -39,17 +46,20 @@ def _articles_from_archive(supa, ticker: str, hours: int = 48) -> list[dict]:
     return articles[:15]
 
 
-def _week_articles_from_archive(supa, ticker: str) -> list[dict]:
+def _week_articles_from_archive(supa, ticker: str, company_name: str = "") -> list[dict]:
     """Retourne les articles de articles_merged_finn_yahoo des 7 derniers jours, triés desc."""
     raw = _articles_from_archive(supa, ticker, hours=7 * 24)
     return [
         {
-            "title": a.get("headline", ""),
-            "source": a.get("source", ""),
-            "url": a.get("url", ""),
+            "title":    a.get("headline", ""),
+            "source":   a.get("source", ""),
+            "url":      a.get("url", ""),
             "pub_date": datetime.fromtimestamp(a["datetime"], tz=timezone.utc).isoformat(),
+            "dumb_en":  a.get("dumb_en", ""),
+            "dumb_fr":  a.get("dumb_fr", ""),
         }
         for a in raw[:20]
+        if _is_ticker_related(a, ticker, company_name)
     ]
 
 
@@ -58,34 +68,29 @@ async def weekly(ticker: str):
     try:
         supa = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
         t = ticker.upper()
-        row = (
-            supa.table("article_week_summaries")
-            .select("ticker, year_month, week_num, ai_summary, ai_summary_en, article_count, condensed_at")
-            .eq("ticker", t)
-            .order("year_month", desc=True)
-            .order("week_num", desc=True)
-            .limit(1)
-            .maybe_single()
-            .execute()
-        )
-        cache = supa.table("stock_news_cache").select("website").eq("ticker", t).maybe_single().execute()
-        website = (cache.data or {}).get("website") if cache else None
-        current_articles = _week_articles_from_archive(supa, t)
 
-        row_data = (row.data or {}) if row and row.data else {}
-        ai_summary = row_data.get("ai_summary_en") or row_data.get("ai_summary", "")
-        year_month = row_data.get("year_month")
-        week_num = row_data.get("week_num")
-        condensed_at = row_data.get("condensed_at")
+        cache = supa.table("stock_news_cache") \
+            .select("ai_summary_en, ai_summary_fr, cached_at, website") \
+            .eq("ticker", t).maybe_single().execute()
+        row = (cache.data or {}) if cache and cache.data else {}
+
+        ai_summary = row.get("ai_summary_en") or row.get("ai_summary_fr", "")
+        cached_at = row.get("cached_at")
+        website = row.get("website")
+
+        # company_name depuis pinned_stocks pour enrichir _is_ticker_related
+        cn_row = supa.table("pinned_stocks").select("company_name") \
+            .eq("ticker", t).limit(1).execute()
+        company_name = (cn_row.data[0].get("company_name", "") if cn_row.data else "") or ""
+
+        current_articles = _week_articles_from_archive(supa, t, company_name)
 
         return {
             "ticker": t,
-            "year_month": year_month,
-            "week_num": week_num,
             "ai_summary": ai_summary,
             "top_articles": current_articles,
             "website": website,
-            "condensed_at": condensed_at,
+            "cached_at": cached_at,
             "generating": not ai_summary and bool(current_articles),
         }
     except Exception as e:

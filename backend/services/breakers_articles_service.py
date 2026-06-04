@@ -16,6 +16,7 @@ Source de vérité articles : articles_merged_finn_yahoo (jamais article_archive
 """
 import httpx
 import os
+import re
 import logging
 from datetime import date, datetime, timezone, timedelta
 from calendar import monthrange
@@ -110,12 +111,34 @@ def _article_text(a: dict) -> str:
     return f"- {headline}"
 
 
-def _is_ticker_related(a: dict, ticker: str) -> bool:
-    """Vrai si l'article mentionne le ticker dans le headline — filtre les articles génériques."""
+_GENERIC_CORP_WORDS = {
+    "corporation", "incorporated", "inc", "corp", "company", "co",
+    "limited", "ltd", "group", "holdings", "holding", "plc", "sa",
+    "ag", "nv", "bv", "gmbh", "se", "ab", "asa", "spa", "the",
+    "and", "of", "international", "global", "technologies", "technology",
+}
+
+def _company_keywords(company_name: str) -> list[str]:
+    """Extrait les mots significatifs d'un nom de société."""
+    words = re.sub(r"[^\w\s]", " ", company_name.lower()).split()
+    return [w for w in words if w not in _GENERIC_CORP_WORDS and len(w) > 2]
+
+
+def _is_ticker_related(a: dict, ticker: str, company_name: str = "") -> bool:
+    """Passe si dumb présent, ou si ticker/mots-clés société dans headline+summary."""
     if a.get("dumb_en") or a.get("dumb_fr"):
         return True
-    headline = (a.get("headline") or a.get("title") or "").lower()
-    return ticker.lower() in headline
+    text = " ".join(filter(None, [
+        a.get("headline") or a.get("title") or "",
+        a.get("summary") or "",
+    ])).lower()
+    keywords = [ticker.lower()] + (_company_keywords(company_name) if company_name else [])
+    # Pour les tickers avec suffixe exchange (ex: "7203.T", "005930.KS"),
+    # ajouter la base numérique — les headlines utilisent le format "TSE:7203" pas "7203.T"
+    base = ticker.split(".")[0].lower()
+    if base != ticker.lower() and len(base) >= 3:
+        keywords.append(base)
+    return any(kw in text for kw in keywords)
 
 
 def _normalize_finnhub(a: dict) -> dict:
@@ -245,7 +268,7 @@ def _apply_density(articles: list[dict], slot_days: int, max_per_slot: int) -> l
 
 # ─── API principale ───────────────────────────────────────────────────────────
 
-def get_period_articles(ticker: str, period: str) -> dict:
+def get_period_articles(ticker: str, period: str, company_name: str = "") -> dict:
     """
     1mo : sections par semaine (W1-W4) avec articles groupés par date.
     6mo / 1y : sections par mois avec articles groupés par year_month.
@@ -258,7 +281,7 @@ def get_period_articles(ticker: str, period: str) -> dict:
     year_months = _year_months_for_period(months_back)
 
     if period == "1mo":
-        return _get_monthly_with_weeks(ticker, year_months, supa)
+        return _get_monthly_with_weeks(ticker, year_months, supa, company_name)
 
     # 6mo / 1y : récupérer month summaries AI (optionnel)
     month_rows = supa.table("article_month_summaries") \
@@ -285,9 +308,9 @@ def get_period_articles(ticker: str, period: str) -> dict:
         # Filtrer : dans la fenêtre globale ET dans les bornes réelles du mois + dedup
         ym_start, ym_end = _ym_bounds(ym)
         raw = _dedup_by_headline(raw)
-        filtered = [a for a in raw if a.get("datetime", 0) >= cutoff_ts and ym_start <= a.get("datetime", 0) <= ym_end and _is_ticker_related(a, ticker)]
+        filtered = [a for a in raw if a.get("datetime", 0) >= cutoff_ts and ym_start <= a.get("datetime", 0) <= ym_end and _is_ticker_related(a, ticker, company_name)]
         filtered.sort(key=lambda a: a.get("datetime", 0), reverse=True)
-        top = [_normalize_finnhub(a) for a in filtered[:MAX_PER_MONTH]]
+        top = [_normalize_finnhub(a) for a in filtered]
 
         if not top and not ai:
             continue
@@ -341,7 +364,7 @@ def _ym_bounds(year_month: str) -> tuple[float, float]:
     return start.timestamp(), end.timestamp()
 
 
-def _get_monthly_with_weeks(ticker: str, year_months: list[str], supa) -> dict:
+def _get_monthly_with_weeks(ticker: str, year_months: list[str], supa, company_name: str = "") -> dict:
     """Pour 1mo : sections par semaine si distribution ok, sinon section merged avec warning."""
     week_rows = supa.table("article_week_summaries") \
         .select("year_month, week_num, ai_summary, article_count") \
@@ -389,7 +412,7 @@ def _get_monthly_with_weeks(ticker: str, year_months: list[str], supa) -> dict:
             for w in range(1, 5):
                 all_articles.extend(by_week[w])
             all_articles.sort(key=lambda a: a.get("datetime", 0), reverse=True)
-            top = [_normalize_finnhub(a) for a in all_articles if _is_ticker_related(a, ticker)][:15]
+            top = [_normalize_finnhub(a) for a in all_articles if _is_ticker_related(a, ticker, company_name)]
             if top:
                 first_w = min(weeks_with_articles) if weeks_with_articles else 1
                 last_w = max(weeks_with_articles) if weeks_with_articles else 4
@@ -411,7 +434,7 @@ def _get_monthly_with_weeks(ticker: str, year_months: list[str], supa) -> dict:
                 if not articles and not ai:
                     continue
                 articles.sort(key=lambda a: a.get("datetime", 0), reverse=True)
-                top = [_normalize_finnhub(a) for a in articles if _is_ticker_related(a, ticker)][:10]
+                top = [_normalize_finnhub(a) for a in articles if _is_ticker_related(a, ticker, company_name)]
                 summaries.append({
                     "type":          "week",
                     "year_month":    ym,
@@ -574,6 +597,7 @@ def _llm_call(prompt: str, max_tokens: int = 400, allow_groq: bool = True) -> st
         max_tokens=max_tokens,
         timeout=45,
         allow_groq=allow_groq,
+        caller="Breaks",
     )
     _llm_call._last_source = resp.get("_llm_source")
     return resp["choices"][0]["message"]["content"].strip()

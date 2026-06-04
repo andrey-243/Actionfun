@@ -12,12 +12,16 @@ interface DigestArticle {
   source: string;
   url: string;
   pub_date: string;
+  dumb_en?: string;
+  dumb_fr?: string;
 }
 
 interface Digest {
   ticker: string;
   summary_24h: string;
   sentiment_24h: string;
+  summary?: string;
+  no_24h_news?: boolean;
   articles?: DigestArticle[];
   website?: string | null;
   cached_at?: string | null;
@@ -28,16 +32,16 @@ interface WeeklyArticle {
   url: string;
   source?: string;
   pub_date?: string;
+  dumb_en?: string;
+  dumb_fr?: string;
 }
 
 interface Weekly {
   ticker: string;
-  year_month: string | null;
-  week_num: number | null;
   ai_summary: string;
   top_articles: WeeklyArticle[];
   website?: string | null;
-  condensed_at?: string | null;
+  cached_at?: string | null;
   generating?: boolean;
 }
 
@@ -103,12 +107,94 @@ function TickerLogo({ ticker, website, onLogoClick }: { ticker?: string | null; 
   );
 }
 
+function ArticleRow({ title, source, pub_date, url, dumb }: {
+  title: string;
+  source?: string;
+  pub_date?: string;
+  url?: string;
+  dumb?: string;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const [btnHovered, setBtnHovered] = useState(false);
+  const hasDumb = !!dumb;
+
+  const ago = pub_date ? (() => {
+    const d = new Date(pub_date);
+    const diff = Date.now() - d.getTime();
+    const h = Math.floor(diff / 3600000);
+    if (h < 1) return `${Math.floor(diff / 60000)}m`;
+    if (h < 24) return `${h}h`;
+    return `${Math.floor(diff / 86400000)}j`;
+  })() : null;
+
+  const sourceBadge = source ? (() => {
+    const st = sourceStyle(source);
+    return (
+      <span style={{ padding: "1px 6px", borderRadius: "3px", fontSize: "10px", fontWeight: 700, letterSpacing: "0.04em", background: st.bg, color: st.text, whiteSpace: "nowrap" }}>
+        {source.length > 12 ? source.slice(0, 12) + "…" : source}
+      </span>
+    );
+  })() : null;
+
+  return (
+    <div style={{ borderBottom: "1px solid var(--color-border)" }}>
+      <div style={{ display: "flex", alignItems: "center" }}>
+        {/* titre + méta inline */}
+        <a
+          href={url}
+          target="_blank"
+          rel="noopener noreferrer"
+          style={{ flex: 1, minWidth: 0, padding: "8px 12px", textDecoration: "none", display: "flex", alignItems: "center", gap: "8px" }}
+        >
+          <span style={{ flex: 1, minWidth: 0, fontSize: "11px", fontWeight: 500, color: "var(--color-text-primary)", lineHeight: 1.35 }}>
+            {title}
+          </span>
+          <div style={{ display: "flex", alignItems: "center", gap: "5px", flexShrink: 0 }}>
+            {sourceBadge}
+            {ago && <span style={{ fontSize: "10px", color: "var(--color-text-muted)" }}>{ago}</span>}
+          </div>
+        </a>
+        {hasDumb && (
+          <button
+            onClick={(e) => { e.preventDefault(); setExpanded(v => !v); }}
+            onMouseEnter={() => setBtnHovered(true)}
+            onMouseLeave={() => setBtnHovered(false)}
+            style={{
+              flexShrink: 0, marginRight: "12px",
+              display: "flex", alignItems: "center", justifyContent: "center",
+              width: "22px", height: "22px", borderRadius: "50%",
+              background: btnHovered ? "var(--color-accent)" : "rgba(76,175,130,0.15)",
+              border: "none",
+              cursor: "pointer", transition: "background 0.15s",
+            }}
+          >
+            <svg
+              width="10" height="10" viewBox="0 0 24 24" fill="none"
+              stroke={btnHovered ? "#fff" : "var(--color-accent)"} strokeWidth="2.5"
+              style={{ transform: expanded ? "rotate(90deg)" : "none", transition: "transform 0.15s" }}
+            >
+              <polyline points="9 18 15 12 9 6" />
+            </svg>
+          </button>
+        )}
+      </div>
+      {expanded && dumb && (
+        <div style={{ padding: "6px 12px 10px", borderTop: "1px solid var(--color-border)", background: "rgba(76,175,130,0.04)" }}>
+          <p style={{ margin: 0, fontSize: "12px", color: "var(--color-accent)", lineHeight: 1.5 }}>
+            {dumb}
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function DigestCard({ digest }: { digest: Digest }) {
   const router = useRouter();
   const [expanded, setExpanded] = useState(false);
   const s = SENTIMENT_STYLE[digest.sentiment_24h] ?? SENTIMENT_STYLE.NEUTRAL;
 
-  const cutoff24h = Date.now() - 24 * 3600 * 1000;
+  const cutoff24h = Date.now() - 26 * 3600 * 1000; // 26h pour couvrir les timezones UTC-8 (marchés US/Asie)
   const articles24h = (digest.articles ?? []).filter((a) => {
     try { return new Date(a.pub_date).getTime() >= cutoff24h; } catch { return false; }
   });
@@ -118,11 +204,40 @@ function DigestCard({ digest }: { digest: Digest }) {
   const owAgeLabel = formatAge(digest.cached_at);
   const dotClass = owAgeMs < 6 * 3600000 ? "fresh" : owAgeMs < 24 * 3600000 ? "medium" : "stale";
 
+  const noNews = digest.no_24h_news ?? !hasArticles;
+
+  // Staleness based on most recent article (any, not just 24h)
+  const lastArticle = (digest.articles ?? [])[0];
+  const lastNewsMs = lastArticle ? Date.now() - new Date(lastArticle.pub_date).getTime() : Infinity;
+  const staleLevel = noNews
+    ? lastNewsMs < 3 * 3600000 ? "warn"
+    : lastNewsMs < 6 * 3600000 ? "alert"
+    : "critical"
+    : null;
+
+  const STALE_COLORS: Record<string, { glow: string; text: string; bg: string }> = {
+    warn:     { glow: "rgba(245,197,24,0.9)",  text: "#F5C518", bg: "rgba(245,197,24,0.1)"  },
+    alert:    { glow: "rgba(255,140,0,0.9)",   text: "#FF8C00", bg: "rgba(255,140,0,0.1)"   },
+    critical: { glow: "rgba(224,92,75,0.9)",   text: "#E05C4B", bg: "rgba(224,92,75,0.1)"   },
+  };
+  const sc = staleLevel ? STALE_COLORS[staleLevel] : null;
+  const finalDotClass = staleLevel ?? dotClass;
+
+  const noNewsAge = lastNewsMs === Infinity ? "—"
+    : lastNewsMs < 3600000 ? `${Math.floor(lastNewsMs / 60000)}m`
+    : lastNewsMs < 86400000 ? `${Math.floor(lastNewsMs / 3600000)}h`
+    : `${Math.floor(lastNewsMs / 86400000)}j`;
+
   return (
-    <div style={{
-      background: "var(--color-surface)", border: "1px solid var(--color-border)",
-      borderRadius: "10px", overflow: "hidden", marginBottom: "16px",
-    }}>
+    <div
+      className={staleLevel ? "neon-border-rotate" : ""}
+      style={{
+        background: staleLevel ? undefined : "var(--color-surface)",
+        border: staleLevel ? undefined : "1px solid var(--color-border)",
+        borderRadius: "10px", overflow: "hidden", marginBottom: "16px",
+        ...(sc ? { "--glow-color": sc.glow } as React.CSSProperties : {}),
+      }}
+    >
       <div
         onClick={() => hasArticles && setExpanded((v) => !v)}
         style={{ padding: "16px 18px", cursor: hasArticles ? "pointer" : "default", display: "flex", alignItems: "flex-start", gap: "12px" }}
@@ -137,27 +252,51 @@ function DigestCard({ digest }: { digest: Digest }) {
             <span style={{ fontFamily: "var(--font-mono)", fontWeight: 800, fontSize: "15px", color: "var(--color-text-primary)" }}>
               {digest.ticker}
             </span>
-            <span style={{
-              padding: "2px 8px", borderRadius: "4px", fontSize: "10px", fontWeight: 700,
-              fontFamily: "var(--font-mono)", letterSpacing: "0.06em",
-              background: s.bg, color: s.color,
-            }}>
-              {digest.sentiment_24h}
-            </span>
             {hasArticles && (
+              <span style={{
+                padding: "2px 8px", borderRadius: "4px", fontSize: "10px", fontWeight: 700,
+                fontFamily: "var(--font-mono)", letterSpacing: "0.06em",
+                background: s.bg, color: s.color,
+              }}>
+                {digest.sentiment_24h}
+              </span>
+            )}
+            {hasArticles ? (
               <span style={{ fontSize: "11px", color: "var(--color-text-muted)", fontFamily: "var(--font-mono)" }}>
                 {articles24h.length} article{articles24h.length > 1 ? "s" : ""} 24h
+              </span>
+            ) : (
+              <span style={{ display: "inline-flex", alignItems: "center", gap: "0px" }}>
+                <span style={{
+                  padding: "2px 6px", borderRadius: "4px 0 0 4px", fontSize: "10px", fontWeight: 700,
+                  fontFamily: "var(--font-mono)", letterSpacing: "0.05em",
+                  background: "transparent",
+                  border: `1px solid ${sc?.text ?? "var(--color-text-muted)"}`,
+                  borderRight: "none",
+                  color: sc?.text ?? "var(--color-text-muted)",
+                }}>
+                  NO NEWS
+                </span>
+                <span style={{
+                  padding: "2px 6px", borderRadius: "0 4px 4px 0", fontSize: "10px", fontWeight: 700,
+                  fontFamily: "var(--font-mono)", letterSpacing: "0.05em",
+                  background: sc?.bg ?? "rgba(128,128,128,0.1)",
+                  border: `1px solid ${sc?.text ?? "var(--color-text-muted)"}`,
+                  color: sc?.text ?? "var(--color-text-muted)",
+                }}>
+                  {noNewsAge}
+                </span>
               </span>
             )}
             {owAgeLabel && (
               <span style={{ display: "flex", alignItems: "center", gap: "5px", marginLeft: "auto" }}>
-                <span className={`freshness-dot ${dotClass}`} />
+                <span className={`freshness-dot ${finalDotClass}`} />
                 <span style={{ fontSize: "11px", color: "var(--color-text-muted)" }}>{owAgeLabel}</span>
               </span>
             )}
           </div>
           <p style={{ fontSize: "13px", color: "var(--color-text-secondary)", lineHeight: 1.6, margin: 0 }}>
-            {digest.summary_24h || "Pas de résumé disponible."}
+            {noNews ? (digest.summary || "") : (digest.summary_24h || "Pas de résumé disponible.")}
           </p>
         </div>
         {hasArticles && (
@@ -174,32 +313,14 @@ function DigestCard({ digest }: { digest: Digest }) {
       {expanded && hasArticles && (
         <div style={{ borderTop: "1px solid var(--color-border)" }}>
           {articles24h.map((a, i) => (
-            <a
+            <ArticleRow
               key={i}
-              href={a.url}
-              target="_blank"
-              rel="noopener noreferrer"
-              style={{
-                display: "block", padding: "11px 18px", textDecoration: "none",
-                borderBottom: i < articles24h.length - 1 ? "1px solid var(--color-border)" : "none",
-              }}
-              onMouseEnter={(e) => (e.currentTarget.style.background = "var(--color-surface-2)")}
-              onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
-            >
-              <div style={{ fontSize: "13px", color: "var(--color-text-primary)", fontWeight: 500, marginBottom: "3px" }}>
-                {a.title}
-              </div>
-              <div style={{ display: "flex", alignItems: "center", gap: "6px", marginTop: "3px" }}>
-                {a.source && (() => { const st = sourceStyle(a.source); return (
-                  <span style={{ padding: "1px 6px", borderRadius: "3px", fontSize: "10px", fontWeight: 700, letterSpacing: "0.04em", background: st.bg, color: st.text }}>
-                    {a.source}
-                  </span>
-                ); })()}
-                <span style={{ fontSize: "11px", color: "var(--color-text-muted)" }}>
-                  {new Date(a.pub_date).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" })}
-                </span>
-              </div>
-            </a>
+              title={a.title}
+              source={a.source}
+              pub_date={a.pub_date}
+              url={a.url}
+              dumb={a.dumb_en || a.dumb_fr}
+            />
           ))}
         </div>
       )}
@@ -211,10 +332,11 @@ function WeeklyCard({ weekly }: { weekly: Weekly }) {
   const router = useRouter();
   const [expanded, setExpanded] = useState(false);
   const articles = weekly.top_articles ?? [];
+  const hasArticles = articles.length > 0;
 
-  const label = weekly.year_month && weekly.week_num != null
-    ? `S${weekly.week_num} · ${weekly.year_month}`
-    : null;
+  const ageMs = weekly.cached_at ? Date.now() - new Date(weekly.cached_at).getTime() : Infinity;
+  const ageLabel = formatAge(weekly.cached_at);
+  const dotClass = ageMs < 6 * 3600000 ? "fresh" : ageMs < 24 * 3600000 ? "medium" : "stale";
 
   return (
     <div style={{
@@ -222,8 +344,8 @@ function WeeklyCard({ weekly }: { weekly: Weekly }) {
       borderRadius: "10px", overflow: "hidden", marginBottom: "16px",
     }}>
       <div
-        onClick={() => articles.length > 0 && setExpanded((v) => !v)}
-        style={{ padding: "16px 18px", cursor: articles.length > 0 ? "pointer" : "default", display: "flex", alignItems: "flex-start", gap: "12px" }}
+        onClick={() => hasArticles && setExpanded((v) => !v)}
+        style={{ padding: "16px 18px", cursor: hasArticles ? "pointer" : "default", display: "flex", alignItems: "flex-start", gap: "12px" }}
       >
         <TickerLogo
           ticker={weekly.ticker}
@@ -235,38 +357,30 @@ function WeeklyCard({ weekly }: { weekly: Weekly }) {
             <span style={{ fontFamily: "var(--font-mono)", fontWeight: 800, fontSize: "15px", color: "var(--color-text-primary)" }}>
               {weekly.ticker}
             </span>
-            {label && (
-              <span style={{
-                padding: "2px 8px", borderRadius: "4px", fontSize: "10px", fontWeight: 700,
-                fontFamily: "var(--font-mono)", letterSpacing: "0.06em",
-                background: "var(--color-surface-2)", color: "var(--color-text-muted)",
-              }}>
-                {label}
+            <span style={{
+              padding: "2px 8px", borderRadius: "4px", fontSize: "10px", fontWeight: 700,
+              fontFamily: "var(--font-mono)", letterSpacing: "0.06em",
+              background: "var(--color-surface-2)", color: "var(--color-text-muted)",
+            }}>
+              7J
+            </span>
+            {hasArticles && (
+              <span style={{ fontSize: "11px", color: "var(--color-text-muted)", fontFamily: "var(--font-mono)" }}>
+                {articles.length} article{articles.length > 1 ? "s" : ""} 7j
               </span>
             )}
-            {weekly.condensed_at && (() => {
-              const ageMs = Date.now() - new Date(weekly.condensed_at).getTime();
-              const dot = ageMs < 6 * 3600000 ? "fresh" : ageMs < 7 * 86400000 ? "medium" : "stale";
-              const label = formatAge(weekly.condensed_at);
-              return (
-                <span style={{ display: "flex", alignItems: "center", gap: "5px", marginLeft: "auto" }}>
-                  <span className={`freshness-dot ${dot}`} />
-                  <span style={{ fontSize: "11px", color: "var(--color-text-muted)" }}>{label}</span>
-                </span>
-              );
-            })()}
+            {ageLabel && (
+              <span style={{ display: "flex", alignItems: "center", gap: "5px", marginLeft: "auto" }}>
+                <span className={`freshness-dot ${dotClass}`} />
+                <span style={{ fontSize: "11px", color: "var(--color-text-muted)" }}>{ageLabel}</span>
+              </span>
+            )}
           </div>
-          {weekly.generating ? (
-            <p style={{ fontSize: "13px", color: "var(--color-text-muted)", lineHeight: 1.6, margin: 0, fontStyle: "italic" }}>
-              Résumé IA en cours de génération…
-            </p>
-          ) : (
-            <p style={{ fontSize: "13px", color: "var(--color-text-secondary)", lineHeight: 1.6, margin: 0 }}>
-              {weekly.ai_summary || "Résumé hebdomadaire non disponible."}
-            </p>
-          )}
+          <p style={{ fontSize: "13px", color: weekly.generating ? "var(--color-text-muted)" : "var(--color-text-secondary)", lineHeight: 1.6, margin: 0, fontStyle: weekly.generating ? "italic" : "normal" }}>
+            {weekly.generating ? "Résumé IA en cours de génération…" : (weekly.ai_summary || "Résumé hebdomadaire non disponible.")}
+          </p>
         </div>
-        {articles.length > 0 && (
+        {hasArticles && (
           <svg
             width="14" height="14" viewBox="0 0 24 24" fill="none"
             stroke="var(--color-text-muted)" strokeWidth="2"
@@ -277,39 +391,17 @@ function WeeklyCard({ weekly }: { weekly: Weekly }) {
         )}
       </div>
 
-      {expanded && articles.length > 0 && (
+      {expanded && hasArticles && (
         <div style={{ borderTop: "1px solid var(--color-border)" }}>
           {articles.map((a, i) => (
-            <a
+            <ArticleRow
               key={i}
-              href={a.url}
-              target="_blank"
-              rel="noopener noreferrer"
-              style={{
-                display: "block", padding: "11px 18px", textDecoration: "none",
-                borderBottom: i < articles.length - 1 ? "1px solid var(--color-border)" : "none",
-              }}
-              onMouseEnter={(e) => (e.currentTarget.style.background = "var(--color-surface-2)")}
-              onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
-            >
-              <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-                <span style={{ fontSize: "13px", color: "var(--color-text-primary)", fontWeight: 500, flex: 1 }}>
-                  {a.title}
-                </span>
-                <div style={{ display: "flex", alignItems: "center", gap: "6px", flexShrink: 0 }}>
-                  {a.source && (() => { const st = sourceStyle(a.source); return (
-                    <span style={{ padding: "1px 6px", borderRadius: "3px", fontSize: "10px", fontWeight: 700, letterSpacing: "0.04em", background: st.bg, color: st.text }}>
-                      {a.source}
-                    </span>
-                  ); })()}
-                  {a.pub_date && (
-                    <span style={{ fontSize: "11px", color: "var(--color-text-muted)" }}>
-                      {new Date(a.pub_date).toLocaleDateString("fr-FR", { day: "numeric", month: "short" })}
-                    </span>
-                  )}
-                </div>
-              </div>
-            </a>
+              title={a.title}
+              source={a.source}
+              pub_date={a.pub_date}
+              url={a.url}
+              dumb={a.dumb_en || a.dumb_fr}
+            />
           ))}
         </div>
       )}
@@ -349,16 +441,20 @@ export default function MyNewsPage() {
 
       if (tickers.length === 0) { setLoadingDaily(false); return; }
 
-      const results = await Promise.all(
+      let firstArrived = false;
+      await Promise.all(
         tickers.map((t) =>
           fetch(`${API}/api/news/${t}`)
             .then((r) => r.json())
+            .then((d) => {
+              if (d && d.ticker && d.summary_24h) {
+                setDigests((prev) => [...prev, d]);
+                if (!firstArrived) { firstArrived = true; setLoadingDaily(false); }
+              }
+            })
             .catch(() => null)
         )
       );
-      const valid = results.filter((d): d is Digest => d !== null && !!d.ticker && !!d.summary_24h);
-      setDigests(valid);
-
       setLoadingDaily(false);
     });
   }, []);
@@ -366,14 +462,20 @@ export default function MyNewsPage() {
   async function fetchWeeklies() {
     if (weeklyFetched || pins.length === 0) return;
     setLoadingWeekly(true);
-    const results = await Promise.all(
+    let firstArrived = false;
+    await Promise.all(
       pins.map((t) =>
         fetch(`${API}/api/weekly/${t}`)
           .then((r) => r.json())
+          .then((w) => {
+            if (w && w.ticker) {
+              setWeeklies((prev) => [...prev, w]);
+              if (!firstArrived) { firstArrived = true; setLoadingWeekly(false); }
+            }
+          })
           .catch(() => null)
       )
     );
-    setWeeklies(results.filter((w): w is Weekly => w !== null && !!w.ticker && !!w.ai_summary));
     setLoadingWeekly(false);
     setWeeklyFetched(true);
   }

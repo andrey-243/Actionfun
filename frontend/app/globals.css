@@ -70,6 +70,32 @@
 .freshness-dot.stale {
   background: #E05C4B;
 }
+.freshness-dot.warn     { background: #F5C518; }
+.freshness-dot.alert    { background: #FF8C00; }
+.freshness-dot.critical { background: #E05C4B; }
+
+@property --border-angle {
+  syntax: "<angle>";
+  initial-value: 0deg;
+  inherits: false;
+}
+@keyframes neon-rotate {
+  to { --border-angle: -360deg; }
+}
+.neon-border-rotate {
+  --border-angle: 0deg;
+  border: 1px solid transparent !important;
+  background:
+    linear-gradient(#1E1D1B, #1E1D1B) padding-box,
+    conic-gradient(
+      from var(--border-angle),
+      transparent 0%,
+      transparent 74%,
+      var(--glow-color, rgba(245,197,24,0.9)) 85%,
+      transparent 100%
+    ) border-box;
+  animation: neon-rotate 3s linear infinite;
+}
 
 @keyframes nb-spin {
   from { transform: rotate(0deg); }

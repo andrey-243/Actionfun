@@ -15,6 +15,7 @@ from datetime import datetime, timezone, timedelta
 from supabase import create_client
 import services.llm_service as _llm_svc
 from services.llm_service import llm_json
+from services.breakers_articles_service import _is_ticker_related
 
 GROQ_HEAVY = "meta-llama/llama-4-scout-17b-16e-instruct"
 GROQ_LIGHT  = "llama-3.1-8b-instant"
@@ -238,6 +239,16 @@ def _format_stock_context_7d(ctx: dict) -> str:
 
 # ─── Fetch ────────────────────────────────────────────────────────────────────
 
+def _lookup_company_name(ticker: str, supa) -> str:
+    """Retourne le company_name depuis pinned_stocks (premier résultat)."""
+    try:
+        r = supa.table("pinned_stocks").select("company_name") \
+            .eq("ticker", ticker).limit(1).execute()
+        return (r.data[0].get("company_name", "") if r.data else "") or ""
+    except Exception:
+        return ""
+
+
 def _fetch_news(ticker: str) -> tuple[list[dict], str | None]:
     import hashlib as _hashlib
     from urllib.parse import urlparse
@@ -254,6 +265,7 @@ def _fetch_news(ticker: str) -> tuple[list[dict], str | None]:
 
     # Articles depuis articles_merged_finn_yahoo (merge Finn+Yahoo) — 7 derniers jours
     supa = _get_supabase()
+    company_name = _lookup_company_name(ticker, supa)
     now = datetime.now(timezone.utc)
     cutoff_ts = int((now - timedelta(days=7)).timestamp())
 
@@ -280,6 +292,12 @@ def _fetch_news(ticker: str) -> tuple[list[dict], str | None]:
             continue
         summary = a.get("summary", "").strip()
         if len(summary) < MIN_SUMMARY_CHARS:
+            continue
+        if not _is_ticker_related(a, ticker, company_name):
+            continue
+        dumb_en = a.get("dumb_en", "")
+        dumb_fr = a.get("dumb_fr", "")
+        if dumb_en.strip().upper() == "SKIP" or dumb_fr.strip().upper() == "SKIP":
             continue
         url = a.get("url", "")
         articles.append({
@@ -330,7 +348,7 @@ def _brutalise(ticker: str, articles: list[dict], stock_context: str = "", lang:
     prompt = (BRUTALIZE_PROMPT_EN if lang == "en" else BRUTALIZE_PROMPT).format(
         ticker=ticker, stock_context=stock_context, count=len(articles), articles_text=articles_text,
     )
-    return llm_json([{"role": "user", "content": prompt}], groq_model=GROQ_HEAVY, max_tokens=3000, timeout=60)
+    return llm_json([{"role": "user", "content": prompt}], groq_model=GROQ_HEAVY, max_tokens=3000, timeout=60, caller="OW")
 
 
 def _ow7d_from_abrutis(ticker: str, articles: list[dict], stock_context: str = "", lang: str = "fr") -> dict:
@@ -346,7 +364,7 @@ def _ow7d_from_abrutis(ticker: str, articles: list[dict], stock_context: str = "
     prompt = (OW7D_PROMPT_EN if lang == "en" else OW7D_PROMPT).format(
         ticker=ticker, stock_context=stock_context, articles_text=articles_text,
     )
-    return llm_json([{"role": "user", "content": prompt}], groq_model=GROQ_HEAVY, max_tokens=500, timeout=30)
+    return llm_json([{"role": "user", "content": prompt}], groq_model=GROQ_HEAVY, max_tokens=500, timeout=30, caller="OW")
 
 
 def _ow24h_from_abrutis(ticker: str, articles_24h: list[dict], stock_context: str = "", lang: str = "fr") -> dict:
@@ -360,7 +378,7 @@ def _ow24h_from_abrutis(ticker: str, articles_24h: list[dict], stock_context: st
     prompt = (SUMMARY_24H_PROMPT_EN if lang == "en" else SUMMARY_24H_PROMPT).format(
         ticker=ticker, stock_context=stock_context, articles_text=articles_text,
     )
-    return llm_json([{"role": "user", "content": prompt}], groq_model=GROQ_LIGHT, max_tokens=500, timeout=25)
+    return llm_json([{"role": "user", "content": prompt}], groq_model=GROQ_LIGHT, max_tokens=500, timeout=25, caller="OW")
 
 
 # ─── LLM2 — hash articles ─────────────────────────────────────────────────────
@@ -403,7 +421,7 @@ def _write_dumb_to_archive(ticker: str, articles: list[dict], lang: str, supa) -
     by_ym: dict[str, dict[str, str]] = {}
     for a in articles:
         dumb = a.get(dumb_field, "")
-        if not dumb or dumb.strip().upper() == "SKIP":
+        if not dumb:
             continue
         url = a.get("url", "")
         pub_date = a.get("pub_date", "")
@@ -456,7 +474,7 @@ def brutalise_new_articles(ticker: str, lang: str = None) -> int:
     brutalised_map = {item["id"]: item["brutalised"] for item in ai_result.get("articles", [])}
     for i, a in enumerate(to_brutalise):
         b = brutalised_map.get(i, "")
-        if b and b.strip().upper() != "SKIP":
+        if b:
             a[dumb_field] = b
 
     _write_dumb_to_archive(ticker, to_brutalise, lang, supa)
@@ -495,7 +513,7 @@ def _call1_dumb_ow24h(ticker: str, fresh_articles: list[dict], row: dict | None,
         brutalised_map = {item["id"]: item["brutalised"] for item in ai_result.get("articles", [])}
         for i, a in enumerate(to_brutalise):
             b = brutalised_map.get(i, "")
-            if b and b.strip().upper() != "SKIP":
+            if b:
                 a[dumb_field] = b
 
         _write_dumb_to_archive(ticker, to_brutalise, lang, supa)
@@ -523,7 +541,7 @@ def _call1_dumb_ow24h(ticker: str, fresh_articles: list[dict], row: dict | None,
         no_news_note = "No news in the last 24 hours." if lang == "en" else "Aucune actualité dans les dernières 24 heures."
         existing_7d = (row.get("ai_summary_en") or row.get("ai_summary_fr") or "") if row else ""
         result_24h = {
-            "summary": f"{no_news_note}{(' ' + bench_line) if bench_line else ''}{(' ' + existing_7d) if existing_7d else ''}".strip(),
+            "summary": f"{no_news_note}{(' ' + bench_line) if bench_line else ''}".strip(),
             "sentiment": ai_result.get("sentiment", "NEUTRAL"),
             "sentiment_reason": ai_result.get("sentiment_reason", ""),
             "_no_24h_news": True,
@@ -768,6 +786,14 @@ def run_hourly_news_refresh() -> list[str]:
     refreshed: list[str] = []
     for ticker in candidates:
         try:
+            # Fetch Yahoo avant de lire la DB — sinon les tickers <3 users ne sont jamais mis à jour
+            try:
+                from services.breakers_articles_service import _accumulate_yahoo
+                current_ym = now.strftime("%Y-%m")
+                _accumulate_yahoo(ticker, current_ym, supa)
+            except Exception as acc_err:
+                logger.debug(f"[hourly_refresh] yahoo accumulate {ticker}: {acc_err}")
+
             fresh_articles, _ = _fetch_news(ticker)
             articles_24h = _filter_24h(fresh_articles)
             if len(articles_24h) == 0:

@@ -4,6 +4,81 @@ _Format : date · contexte · symptôme · cause · fix_
 
 ---
 
+## 2026-06-04 · refresh_breakers — Breakers générés sans DUMB (qualité dégradée US/EU/ASIA)
+
+**Symptôme** : Les weekly/monthly summaries générés par `refresh_breakers.py` utilisaient le fallback `summary → headline` au lieu des `dumb_en` enrichis, produisant une qualité de condensation moindre.
+
+**Cause** : `refresh_breakers.py` ne appelait jamais `brutalise_new_articles` — le DUMB était généré uniquement par les crons Yahoo/Finnhub (`min_users=3`). Les ~700 tickers batch n'atteignent pas ce seuil en setup single-user → zéro `dumb_en` en DB au moment de la condensation.
+
+**Fix** : `_process_ticker` appelle `brutalise_new_articles(ticker, lang)` en step 1b (après scrape, avant weeklies). Non-bloquant : une erreur DUMB ne stoppe pas le ticker.
+
+**Re-run** : Tickers déjà generés (US: 260, EU: 79) → auto-marqués `legacy` au prochain run normal → `_process_weeklies`/`_process_monthlies` avec `force_regen=True` (bypass existence check) → re-générés avec DUMB. Commande : `python scripts/refresh_breakers.py --region US --lang en` suffit.
+
+**Fichier** : `scripts/refresh_breakers.py` — `_process_ticker`, `_process_weeklies`, `_process_monthlies`, `main()`.
+
+---
+
+## 2026-06-04 · `_is_ticker_related` — company_name absent dans `_fetch_news` et `digest.py`
+
+**Symptôme** : Des articles pertinents passaient le fetch Yahoo/Finnhub mais étaient filtrés dans `_fetch_news` — DUMB et OW générés depuis un set d'articles réduit. Exemple : articles "Amazon Announces..." filtrés pour AMZN si "amzn" n'apparaît pas littéralement.
+
+**Cause** : `_fetch_news` et `_week_articles_from_archive` appelaient `_is_ticker_related(a, ticker)` sans `company_name`. Les mots-clés société ("amazon", "toyota", "nokia") n'étaient jamais testés → seul le ticker brut était cherché dans le texte.
+
+**Fix** : `_lookup_company_name(ticker, supa)` lookup depuis `pinned_stocks` dans `_fetch_news`. Même lookup dans `routers/digest.py` weekly endpoint. `company_name` maintenant passé partout.
+
+**Fichier** : `services/overview_service.py` — `_lookup_company_name()` + `_fetch_news()` · `routers/digest.py` — `weekly()` + `_week_articles_from_archive()`.
+
+---
+
+## 2026-06-04 · my-news — tickers < 3 pins jamais rafraîchis par Yahoo cron
+
+**Symptôme** : Un ticker personnel (ex: 7203.T) affiche "NO NEWS 3j" dans my-news alors que Yahoo Finance montre des articles du jour. Articles présents sur Yahoo mais absents de `articles_merged_finn_yahoo`.
+
+**Cause** : `run_yahoo_accumulation` (cron */3h) utilise `min_users=3` — seuls les tickers pinnés par ≥ 3 users reçoivent des articles Yahoo. `run_hourly_news_refresh` (cron :15) lit la DB existante sans fetcher Yahoo, donc pour les tickers personnels (1 user), la DB stagne indéfiniment.
+
+**Fix** : Dans `run_hourly_news_refresh`, appeler `_accumulate_yahoo(ticker, current_ym, supa)` avant de lire la DB — les tickers no_24h_news avec < 3 pins reçoivent maintenant un fetch Yahoo à chaque cycle horaire.
+
+**Fichier** : `services/overview_service.py` — boucle `run_hourly_news_refresh`.
+
+---
+
+## 2026-06-04 · `_is_ticker_related` — faux négatif sur tickers avec suffixe exchange
+
+**Symptôme** : Des articles clairement liés à Toyota (headline "The Bull Case For Toyota Motor (TSE:7203)") passent le fetch Yahoo mais sont filtrés par `_is_ticker_related` → disparaissent de `_fetch_news` → `no_24h_news=True` malgré des articles récents.
+
+**Cause** : `_is_ticker_related` cherche `ticker.lower()` = `"7203.t"` dans le texte. Les headlines utilisent le format `TSE:7203` (exchange:numéro) pas `7203.T` (numéro.exchange). Le match échoue. Affecte tous les tickers non-US avec suffixe (7203.T, 005930.KS, 1299.HK, etc.).
+
+**Fix** : Extraire la base du ticker (avant le `.`) et l'ajouter aux keywords si différente du ticker complet et ≥ 3 chars :
+```python
+base = ticker.split(".")[0].lower()
+if base != ticker.lower() and len(base) >= 3:
+    keywords.append(base)
+```
+`"7203"` matche `"tse:7203"` → articles correctement inclus.
+
+**Fichier** : `services/breakers_articles_service.py` — `_is_ticker_related()`.
+
+---
+
+## 2026-06-04 · refresh_breakers — tickers marqués done malgré des échecs LLM
+
+**Symptôme** : 63 tickers US marqués `done` dans le checkpoint mais avec des trous en DB (0 weekly ou monthly summaries sur 2026-01→06). Détectés via SQL :
+```sql
+SELECT d.ticker, COUNT(*) as mois_manquants
+FROM done_tickers d
+JOIN articles_merged_finn_yahoo a ON a.ticker = d.ticker AND a.year_month BETWEEN '2026-01' AND '2026-06'
+WHERE NOT EXISTS (SELECT 1 FROM article_month_summaries m WHERE m.ticker = d.ticker AND m.year_month = a.year_month AND m.ai_summary_en IS NOT NULL)
+GROUP BY d.ticker HAVING COUNT(*) > 0;
+```
+
+**Cause** : pendant le batch US EN, creux où FreeTheAI (circuit breaker) + Hapuppy (timeout ×3) + Groq (quota daily épuisé) étaient tous indisponibles simultanément. `_gen_weekly`/`_gen_monthly` catchaient `GroqExhaustedError` → retournaient `None` → aucun write DB. Mais `done.add(ticker)` était appelé inconditionnellement.
+
+**Fix code** (`refresh_breakers.py`) : `_process_weeklies` et `_process_monthlies` remontent maintenant un compteur `failures`. `done.add(ticker)` est conditionnel : uniquement si `failures == 0 and error is None`. Log explicite si ticker non marqué done.
+
+**Fix données** : retirer manuellement les tickers affectés du checkpoint JSON (`done` array) → ils sont retraités au prochain run (le script skip les rows déjà en DB, ne génère que les manquants).
+
+---
+
 ## 2026-05-29 · yfinance rate limit
 
 **Symptôme** : `YFRateLimitError: Too Many Requests` sur toutes les routes stock/news, même après 20h sans calls.

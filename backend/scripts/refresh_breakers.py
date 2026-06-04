@@ -394,8 +394,8 @@ def _month_prompt(ticker: str, label: str, content: str) -> str:
 # ─── Weekly generation ────────────────────────────────────────────────────────
 
 def _gen_weekly(ticker: str, year_month: str, week_num: int,
-                articles: list[dict], supa) -> bool:
-    """Génère et upserte un weekly summary. Retourne True si succès."""
+                articles: list[dict], supa) -> str | bool:
+    """str=succès · False=échec LLM. Pas de skip possible (articles déjà vérifiés)."""
     label = _week_label(year_month, week_num)
     articles_text = "\n".join(f"- {a['headline']}" for a in articles[:30])
     try:
@@ -413,32 +413,36 @@ def _gen_weekly(ticker: str, year_month: str, week_num: int,
             "condensed_at":  datetime.now(timezone.utc).isoformat(),
         }).execute()
         logger.info(f"  ✓ W {ticker} {year_month} W{week_num} ({len(articles)} arts) [{src}]")
-        return True
+        return src
     except Exception as e:
         logger.error(f"  ✗ W {ticker} {year_month} W{week_num}: {e}")
         return False
 
 
 def _process_weeklies(ticker: str, finn_skewed: bool, cluster_wnum: int,
-                      sliding_weeks: list[tuple[str, int]], supa) -> int:
-    """Génère les weekly summaries manquants. Retourne le nb généré."""
+                      sliding_weeks: list[tuple[str, int]], supa,
+                      force_regen: bool = False) -> tuple[int, list[str], int]:
+    """Génère les weekly summaries manquants. Retourne (nb généré, sources LLM, nb échecs)."""
     generated = 0
+    sources: list[str] = []
+    failures = 0
     for year_month, week_num in sliding_weeks:
         # Skip la semaine cluster si skew détecté
         if finn_skewed and week_num == cluster_wnum:
             logger.info(f"  ⏭ W {ticker} {year_month} W{week_num} — skew cluster, skip")
             continue
 
-        # Déjà existant ?
-        exists = supa.table("article_week_summaries") \
-            .select("week_num") \
-            .eq("ticker", ticker) \
-            .eq("year_month", year_month) \
-            .eq("week_num", week_num) \
-            .limit(1) \
-            .execute()
-        if exists.data:
-            continue
+        # Déjà existant ? (sauf si force_regen)
+        if not force_regen:
+            exists = supa.table("article_week_summaries") \
+                .select("week_num") \
+                .eq("ticker", ticker) \
+                .eq("year_month", year_month) \
+                .eq("week_num", week_num) \
+                .limit(1) \
+                .execute()
+            if exists.data:
+                continue
 
         # Charger les articles de cette semaine
         row = supa.table("articles_merged_finn_yahoo") \
@@ -458,16 +462,21 @@ def _process_weeklies(ticker: str, finn_skewed: bool, cluster_wnum: int,
             logger.info(f"  ⏭ W {ticker} {year_month} W{week_num} — {len(week_articles)} arts < {MIN_ARTICLES_FOR_WEEKLY}")
             continue
 
-        if _gen_weekly(ticker, year_month, week_num, week_articles, supa):
+        src = _gen_weekly(ticker, year_month, week_num, week_articles, supa)
+        if isinstance(src, str):
             generated += 1
+            sources.append(src)
+        else:
+            failures += 1  # False = LLM exception
         time.sleep(0.3)
 
-    return generated
+    return generated, sources, failures
 
 
 # ─── Monthly generation ───────────────────────────────────────────────────────
 
-def _gen_monthly_from_raw(ticker: str, year_month: str, supa) -> bool:
+def _gen_monthly_from_raw(ticker: str, year_month: str, supa) -> str | None | bool:
+    """str=succès · None=skip (pas de data) · False=échec LLM."""
     row = supa.table("articles_merged_finn_yahoo") \
         .select("articles") \
         .eq("ticker", ticker) \
@@ -475,10 +484,10 @@ def _gen_monthly_from_raw(ticker: str, year_month: str, supa) -> bool:
         .limit(1) \
         .execute()
     if not row.data:
-        return False
+        return None
     raw = row.data[0].get("articles") or []
     if len(raw) < MIN_ARTICLES_FOR_MONTHLY:
-        return False
+        return None
 
     label = _month_label(year_month)
     articles_text = "\n".join(f"- {a['headline']}" for a in raw[:40])
@@ -494,14 +503,14 @@ def _gen_monthly_from_raw(ticker: str, year_month: str, supa) -> bool:
             "condensed_at":  datetime.now(timezone.utc).isoformat(),
         }).execute()
         logger.info(f"  ✓ M {ticker} {year_month} raw ({len(raw)} arts) [{src}]")
-        return True
+        return src
     except Exception as e:
         logger.error(f"  ✗ M {ticker} {year_month} raw: {e}")
         return False
 
 
 def _gen_monthly_from_weeklies(ticker: str, year_month: str,
-                                week_rows: list[dict], supa) -> bool:
+                                week_rows: list[dict], supa) -> str | bool:
     sc = _summary_col()
     src_col = "ai_summary_en" if os.environ.get("LLM_LANG") == "en" else "ai_summary_fr"
     weeks_text = "\n".join(
@@ -521,33 +530,34 @@ def _gen_monthly_from_weeklies(ticker: str, year_month: str,
             "condensed_at":  datetime.now(timezone.utc).isoformat(),
         }).execute()
         logger.info(f"  ✓ M {ticker} {year_month} weeklies ({len(week_rows)} W) [{src}]")
-        return True
+        return src
     except Exception as e:
         logger.error(f"  ✗ M {ticker} {year_month} weeklies: {e}")
         return False
 
 
 def _process_monthlies(ticker: str, finn_skewed: bool,
-                        months: list[str], supa) -> int:
-    """Génère les monthly summaries manquants. Retourne le nb généré."""
+                        months: list[str], supa,
+                        force_regen: bool = False) -> tuple[int, list[str], int]:
+    """Génère les monthly summaries manquants. Retourne (nb généré, sources LLM, nb échecs)."""
     generated = 0
+    sources: list[str] = []
+    failures = 0
     for year_month in months:
-        # Déjà existant ?
-        exists = supa.table("article_month_summaries") \
-            .select("year_month") \
-            .eq("ticker", ticker) \
-            .eq("year_month", year_month) \
-            .limit(1) \
-            .execute()
-        if exists.data:
-            continue
+        # Déjà existant ? (sauf si force_regen)
+        if not force_regen:
+            exists = supa.table("article_month_summaries") \
+                .select("year_month") \
+                .eq("ticker", ticker) \
+                .eq("year_month", year_month) \
+                .limit(1) \
+                .execute()
+            if exists.data:
+                continue
 
         if finn_skewed:
-            # Skew → gen depuis raw directement
-            if _gen_monthly_from_raw(ticker, year_month, supa):
-                generated += 1
+            src = _gen_monthly_from_raw(ticker, year_month, supa)
         else:
-            # Essayer depuis les weeklies d'abord
             week_rows = supa.table("article_week_summaries") \
                 .select("week_num, ai_summary, ai_summary_en, article_count") \
                 .eq("ticker", ticker) \
@@ -556,26 +566,32 @@ def _process_monthlies(ticker: str, finn_skewed: bool,
                 .execute()
 
             if week_rows.data and len(week_rows.data) >= 3:
-                if _gen_monthly_from_weeklies(ticker, year_month, week_rows.data, supa):
-                    generated += 1
+                src = _gen_monthly_from_weeklies(ticker, year_month, week_rows.data, supa)
             else:
-                # Pas assez de weeklies → gen depuis raw
-                if _gen_monthly_from_raw(ticker, year_month, supa):
-                    generated += 1
+                src = _gen_monthly_from_raw(ticker, year_month, supa)
+
+        if isinstance(src, str):
+            generated += 1
+            sources.append(src)
+        elif src is False:
+            failures += 1  # LLM exception
+        # None = skip légitime (pas de data), pas un failure
         time.sleep(0.3)
 
-    return generated
+    return generated, sources, failures
 
 
 # ─── Main per-ticker ──────────────────────────────────────────────────────────
 
 def _process_ticker(ticker: str, year_month: str, sliding_weeks: list[tuple[str, int]],
-                    months: list[str], supa) -> dict:
+                    months: list[str], supa, lang: str = "en",
+                    force_regen: bool = False) -> dict:
     result = {
         "ticker": ticker,
         "new_articles": 0,
         "weeklies": 0,
         "monthlies": 0,
+        "failures": 0,
         "skewed": False,
         "error": None,
     }
@@ -586,6 +602,15 @@ def _process_ticker(ticker: str, year_month: str, sliding_weeks: list[tuple[str,
         if added > 0:
             logger.info(f"  + {ticker}: {added} nouveaux articles")
 
+        # 1b. DUMB — génère dumb_en pour les articles sans DUMB avant condensation
+        try:
+            from services.overview_service import brutalise_new_articles
+            n_dumb = brutalise_new_articles(ticker, lang)
+            if n_dumb > 0:
+                logger.info(f"  DUMB {ticker}: {n_dumb} articles brutalised")
+        except Exception as dumb_err:
+            logger.warning(f"  DUMB {ticker} failed (non bloquant): {dumb_err}")
+
         # 2. Détection skew sur les 3 derniers mois
         skew_months = months[:3]
         is_skewed, cluster_wnum = _detect_finn_skew(ticker, skew_months, supa)
@@ -594,14 +619,35 @@ def _process_ticker(ticker: str, year_month: str, sliding_weeks: list[tuple[str,
             logger.info(f"  ⚠ {ticker}: Finnhub skew détecté W{cluster_wnum}")
 
         # 3. Weeklies
-        result["weeklies"] = _process_weeklies(ticker, is_skewed, cluster_wnum, sliding_weeks, supa)
+        w_count, w_sources, w_failures = _process_weeklies(ticker, is_skewed, cluster_wnum, sliding_weeks, supa, force_regen=force_regen)
+        result["weeklies"] = w_count
 
         # 4. Monthlies
-        result["monthlies"] = _process_monthlies(ticker, is_skewed, months, supa)
+        m_count, m_sources, m_failures = _process_monthlies(ticker, is_skewed, months, supa, force_regen=force_regen)
+        result["monthlies"] = m_count
+        result["failures"] = w_failures + m_failures
+
+        # 5. Récap sources LLM
+        if w_count or m_count:
+            def _fmt_sources(sources: list[str]) -> str:
+                if not sources:
+                    return "0"
+                counts: dict[str, int] = {}
+                for s in sources:
+                    k = str(s)
+                    counts[k] = counts.get(k, 0) + 1
+                return " · ".join(f"{c} {s}" for s, c in sorted(counts.items()))
+            parts = []
+            if w_count:
+                parts.append(f"{w_count}W [{_fmt_sources(w_sources)}]")
+            if m_count:
+                parts.append(f"{m_count}M [{_fmt_sources(m_sources)}]")
+            logger.info(f"  ↳ {ticker} — {' · '.join(parts)}")
 
     except Exception as e:
+        import traceback
         result["error"] = str(e)
-        logger.error(f"  ✗ {ticker}: {e}")
+        logger.error(f"  ✗ {ticker}: {e}\n{traceback.format_exc()}")
 
     return result
 
@@ -615,6 +661,7 @@ def main():
     parser.add_argument("--ticker", default=None, help="Ticker unique (debug)")
     parser.add_argument("--no-resume", action="store_true", help="Ignore le checkpoint")
     parser.add_argument("--re-enrich-legacy", action="store_true", help="Re-traite les tickers legacy (pré-dumb enrichment)")
+    parser.add_argument("--force-regen", action="store_true", help="Régénère weeklies/monthlies même s'ils existent déjà en DB")
     args = parser.parse_args()
 
     os.environ["LLM_LANG"] = args.lang
@@ -638,7 +685,8 @@ def main():
         todo = [t for t in tickers if t in legacy]
         logger.info(f"Re-enrich legacy : {len(todo)} tickers")
     else:
-        todo = [t for t in tickers if t not in done]
+        # Legacy inclus même si dans done — génèrent DUMB + force-regen auto
+        todo = [t for t in tickers if t not in done or t in legacy]
     total = len(todo)
 
     now = datetime.now(timezone.utc)
@@ -664,7 +712,10 @@ def main():
 
     for i, ticker in enumerate(todo, 1):
         logger.info(f"[{i}/{total}] {ticker}")
-        res = _process_ticker(ticker, year_month, sliding, months, supa)
+        # Les tickers legacy sont automatiquement force-regénérés (rows existantes réécrites)
+        is_legacy = ticker in legacy
+        res = _process_ticker(ticker, year_month, sliding, months, supa, lang=args.lang,
+                              force_regen=args.force_regen or is_legacy)
 
         if res["error"]:
             batch_errors.append(ticker)
@@ -675,9 +726,13 @@ def main():
         total_weeks_gen += res["weeklies"]
         total_months_gen += res["monthlies"]
 
-        done.add(ticker)
-        legacy.discard(ticker)
-        _save_checkpoint(cp_path, done, legacy)
+        # Ne marquer done que si aucun échec LLM — sinon retenté au prochain batch
+        if not res["failures"] and not res["error"]:
+            done.add(ticker)
+            legacy.discard(ticker)
+            _save_checkpoint(cp_path, done, legacy)
+        else:
+            logger.warning(f"  ⚠ {ticker} non marqué done ({res['failures']} échec(s) LLM) — retenté au prochain batch")
 
         if i % NOTIFY_EVERY == 0:
             elapsed = int(time.time() - start_time)

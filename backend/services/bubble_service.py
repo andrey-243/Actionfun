@@ -237,7 +237,7 @@ Intègre si le move est spécifique au titre ou corrélé au marché général.
 Commence directement par les faits, pas d'introduction."""
     try:
         from services.llm_service import llm_call
-        resp = llm_call([{"role": "user", "content": prompt}], groq_model=GROQ_LIGHT, max_tokens=280, timeout=25)
+        resp = llm_call([{"role": "user", "content": prompt}], groq_model=GROQ_LIGHT, max_tokens=280, timeout=25, caller="BUB")
         return resp["choices"][0]["message"]["content"].strip(), resp.get("_llm_source")
     except Exception:
         return None, None
@@ -276,6 +276,7 @@ Commence directement par les faits, pas d'introduction."""
             groq_model=GROQ_LIGHT,
             max_tokens=280,
             timeout=25,
+            caller="BUB",
         )
     except Exception:
         return None
