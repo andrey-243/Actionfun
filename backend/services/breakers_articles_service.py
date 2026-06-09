@@ -589,7 +589,7 @@ def _summary_col() -> str:
     return "ai_summary_en" if _lang() == "en" else "ai_summary_fr"
 
 
-def _llm_call(prompt: str, max_tokens: int = 400, allow_groq: bool = True) -> str:
+def _llm_call(prompt: str, max_tokens: int = 400, allow_groq: bool = True, item_id: str = "") -> str:
     from services.llm_service import llm_call
     resp = llm_call(
         [{"role": "user", "content": prompt}],
@@ -598,6 +598,7 @@ def _llm_call(prompt: str, max_tokens: int = 400, allow_groq: bool = True) -> st
         timeout=45,
         allow_groq=allow_groq,
         caller="Breaks",
+        item_id=item_id,
     )
     _llm_call._last_source = resp.get("_llm_source")
     return resp["choices"][0]["message"]["content"].strip()
@@ -675,7 +676,7 @@ def run_weekly_condensation():
                 ticker=ticker,
                 label=label,
                 articles_text=articles_text,
-            ))
+            ), item_id=ticker)
             top_articles = [_normalize_finnhub(a) for a in sorted(week_articles, key=lambda x: x.get("pub_date", ""), reverse=True)[:10]]
             supa.table("article_week_summaries").upsert({
                 "ticker":        ticker,
@@ -774,7 +775,7 @@ def run_monthly_condensation():
                     ticker=ticker,
                     label=_month_label(target_ym),
                     weeks_text=weeks_text,
-                ), max_tokens=500)
+                ), max_tokens=500, item_id=ticker)
             else:
                 row = supa.table("articles_merged_finn_yahoo") \
                     .select("articles") \
@@ -791,7 +792,7 @@ def run_monthly_condensation():
                     ticker=ticker,
                     label=_month_label(target_ym),
                     weeks_text=articles_text,
-                ), max_tokens=500)
+                ), max_tokens=500, item_id=ticker)
 
             supa.table("article_month_summaries").upsert({
                 "ticker":        ticker,
@@ -851,7 +852,7 @@ def run_yearly_condensation():
                 ticker=ticker,
                 year=target_year,
                 months_text=months_text,
-            ), max_tokens=600)
+            ), max_tokens=600, item_id=ticker)
 
             supa.table("article_year_summaries").upsert({
                 "ticker":       ticker,
@@ -1123,7 +1124,7 @@ def run_monthly_calendaire(tickers: list[str] | None = None):
                 ticker=ticker,
                 label=_month_label(target_ym),
                 weeks_text=weeks_text,
-            ), max_tokens=500)
+            ), max_tokens=500, item_id=ticker)
 
             supa.table("article_month_summaries").upsert({
                 "ticker":        ticker,
@@ -1180,7 +1181,7 @@ def get_weekly_ondemand(ticker: str) -> str | None:
     try:
         summary = _llm_call(_pick(WEEK_CONDENSE_PROMPT, WEEK_CONDENSE_PROMPT_EN).format(
             ticker=ticker, label=label, articles_text=articles_text,
-        ), max_tokens=400)
+        ), max_tokens=400, item_id=ticker)
     except Exception as e:
         logger.error(f"Weekly ondemand {ticker}: {e}")
         return None
@@ -1229,7 +1230,7 @@ def get_monthly_ondemand(ticker: str) -> str | None:
             ticker=ticker,
             label=label,
             weeks_text=weeks_text,
-        ), max_tokens=500)
+        ), max_tokens=500, item_id=ticker)
     except Exception as e:
         logger.error(f"Monthly ondemand {ticker}: {e}")
         return None

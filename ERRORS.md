@@ -4,6 +4,56 @@ _Format : date · contexte · symptôme · cause · fix_
 
 ---
 
+## 2026-06-04 · digest — Management API 404 sur auth/users/{uid}
+
+**Symptôme** : `_send_emails` appelait `https://api.supabase.com/v1/projects/{ref}/auth/users/{uid}` pour récupérer l'email — 404 systématique. Aucun email envoyé, aucun log d'erreur visible (le `except` catchait silencieusement).
+
+**Cause** : Le token `SUPABASE_MANAGEMENT_TOKEN` n'a pas les droits sur l'endpoint `GET /auth/users/{id}` de la Management API.
+
+**Fix** : Remplacé par `supa.auth.admin.get_user_by_id(uid)` — utilise le service role key via le client Supabase Python, fonctionne correctement.
+
+**Fichier** : `services/digest_service.py` — `_send_emails()`.
+
+---
+
+## 2026-06-04 · digest — user_preferences vide = emails silencieusement skippés
+
+**Symptôme** : Les deux digests tournaient sans erreur (4 tickers trouvés, summaries chargés) mais aucun email envoyé. Aucun log indiquant un problème.
+
+**Cause** : La table `user_preferences` était vide — aucun utilisateur n'avait de row. `notify_email=eq.True` retournait 0 résultats, la boucle `_send_emails` ne tournait jamais.
+
+**Fix** : Insérer une row `user_preferences` depuis l'UI Profile (les toggles Daily/Weekly upsertent la row) ou manuellement en DB. Le user s'inscrit implicitement à son premier toggle.
+
+**Règle** : Toujours vérifier `user_preferences` non vide avant de conclure qu'un digest ne fonctionne pas. Logger explicitement `"0 users to notify"` si la query retourne vide.
+
+**Fichier** : `services/digest_service.py` — `_send_emails()`.
+
+---
+
+## 2026-06-04 · digest — race condition Finnhub cron (18h30) vs Daily digest (18h30)
+
+**Symptôme** : Le daily digest pouvait snapshot un OW en cours de refresh par Finnhub (même heure exacte), potentiellement lire `ai_summary_24h_en` avant qu'il soit écrit.
+
+**Cause** : `finnhub_refresh` (APScheduler) tourne à `*/6h :30` → tombe à 18h30. Daily digest était aussi à 18h30 → overlap possible.
+
+**Fix** : Daily digest décalé à 19h15 — après Yahoo (18h00) + Finnhub (18h30) + cold_start FR (19h00). Buffer de 45 min sur le dernier refresh avant snapshot.
+
+**Fichier** : `backend/main.py` — `daily_digest_email` cron.
+
+---
+
+## 2026-06-04 · digest — `user_preferences.lang` DEFAULT 'fr' au lieu de 'en'
+
+**Symptôme** : Tout nouveau user sans préférence langue explicite recevait ses digests en français, même sans traduction FR disponible — risque d'emails vides si `ai_summary_fr` est null.
+
+**Cause** : Colonne `lang` créée avec `DEFAULT 'fr'` dans un commit précédent.
+
+**Fix** : `ALTER TABLE user_preferences ALTER COLUMN lang SET DEFAULT 'en'`. Fallback EN garanti pour tout user sans préférence.
+
+**Règle** : EN est toujours la langue primaire (générée en premier). DEFAULT doit être 'en', pas 'fr'.
+
+---
+
 ## 2026-06-04 · refresh_breakers — Breakers générés sans DUMB (qualité dégradée US/EU/ASIA)
 
 **Symptôme** : Les weekly/monthly summaries générés par `refresh_breakers.py` utilisaient le fallback `summary → headline` au lieu des `dumb_en` enrichis, produisant une qualité de condensation moindre.
@@ -27,6 +77,25 @@ _Format : date · contexte · symptôme · cause · fix_
 **Fix** : `_lookup_company_name(ticker, supa)` lookup depuis `pinned_stocks` dans `_fetch_news`. Même lookup dans `routers/digest.py` weekly endpoint. `company_name` maintenant passé partout.
 
 **Fichier** : `services/overview_service.py` — `_lookup_company_name()` + `_fetch_news()` · `routers/digest.py` — `weekly()` + `_week_articles_from_archive()`.
+
+---
+
+## 2026-06-04 · llm_service — 3 notifs TG en one shot sur quota Hapuppy
+
+**Symptôme** : FreeTheAI quota + Hapuppy 403 → 3 notifs simultanées : `hapuppy_quota` + `both_quota` + `hapuppy_down`. Message `both_quota` affichait "reset à minuit UTC" pour Hapuppy (faux — Hapuppy reset à 18h Paris).
+
+**Cause** :
+1. `hapuppy_quota` part dans le bloc Hapuppy (avant Groq).
+2. `both_quota` partait systématiquement avant Groq si les deux flags sont non-null, sans vérifier si `hapuppy_quota` venait de partir.
+3. `groq_reason == "hapuppy_down"` (set unconditionnellement après le bloc Hapuppy) déclenchait `hapuppy_down` au succès Groq même si la cause était un quota.
+4. Headers `_CASCADE_HEADERS` hardcodés avec des heures figées incorrectes.
+
+**Fix** :
+- `_hapuppy_quota_notif_sent` (local `llm_call`) : set à True quand `hapuppy_quota` part → supprime `both_quota` et `hapuppy_down` dans le même call.
+- `hapuppy_down` à succès Groq : condition `and not _hapuppy_quota_notif_sent and _hapuppy_quota_skip_until is None`.
+- `header_override` dans `_send_cascade_notif` : `hapuppy_quota` et `both_quota` calculent les heures de reset dynamiquement. Format : `Reset 18h00 Paris (dans 1h58m)`.
+
+**Fichier** : `services/llm_service.py` — `llm_call()`, `_send_cascade_notif()`.
 
 ---
 
@@ -76,6 +145,42 @@ GROUP BY d.ticker HAVING COUNT(*) > 0;
 **Fix code** (`refresh_breakers.py`) : `_process_weeklies` et `_process_monthlies` remontent maintenant un compteur `failures`. `done.add(ticker)` est conditionnel : uniquement si `failures == 0 and error is None`. Log explicite si ticker non marqué done.
 
 **Fix données** : retirer manuellement les tickers affectés du checkpoint JSON (`done` array) → ils sont retraités au prochain run (le script skip les rows déjà en DB, ne génère que les manquants).
+
+---
+
+## 2026-06-04 · stock page 1M — count articles incohérent entre header et CTA
+
+**Symptôme** : Header de section affichait "· 3 articles" mais le bouton CTA indiquait "2 articles >". L'user voyait deux chiffres contradictoires sur la même ligne.
+
+**Cause** : `s.article_count` (champ brut du backend, total non filtré) était affiché dans le header, tandis que `sectionArticles.length` (longueur du tableau `top_articles` filtré retourné par le backend) alimentait le CTA `ExpandButton`. Les deux ne correspondent pas : le backend peut envoyer un `article_count` total > le nombre d'articles dans `top_articles` après filtrage `_is_ticker_related`.
+
+**Fix** : Suppression du span `· {s.article_count} articles` dans le header de section (`renderSection` dans `stock/[ticker]/page.tsx`). Le CTA seul affiche le vrai nombre d'articles accessibles.
+
+**Fichier** : `frontend/app/stock/[ticker]/page.tsx` — `renderSection`.
+
+---
+
+## 2026-06-04 · my-news W/D async — W affichait moins d'articles que D sur 24h
+
+**Symptôme** : WeeklyCard AMZN affichait 9 articles sur 7 jours alors que DigestCard en affichait 21 sur 24h — incohérent (fenêtre plus large = moins d'articles).
+
+**Cause** : `_articles_from_archive` dans `routers/digest.py` cappait à `[:15]` avant le filtre `_is_ticker_related`. Pour un ticker très couvert (AMZN), les 15 candidats retenus ne survivaient pas tous au filtre — résultat : 9. Pendant ce temps `_fetch_news` retournait `[:100]` articles.
+
+**Fix** : Cap passé de `[:15]` à `[:100]` dans `_articles_from_archive`.
+
+**Fichier** : `backend/routers/digest.py` — `_articles_from_archive`.
+
+---
+
+## 2026-06-04 · my-news — doublons de cartes (React StrictMode)
+
+**Symptôme** : Chaque ticker apparaissait deux fois dans la liste daily et weekly de my-news.
+
+**Cause** : React 18 StrictMode (développement) exécute les `useEffect` deux fois — le fetch individuel par ticker et le `setDigests((prev) => [...prev, d])` cumulatif tournait donc deux fois, doublant tous les éléments.
+
+**Fix** : Déduplication au render via `.filter((d, i, arr) => arr.findIndex(x => x.ticker === d.ticker) === i)` sur `digests` et `weeklies` avant le map.
+
+**Fichier** : `frontend/app/my-news/page.tsx` — render daily + weekly.
 
 ---
 

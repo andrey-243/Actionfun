@@ -37,6 +37,7 @@ export default function ProfilePage() {
   const [notifyWeekly, setNotifyWeeklyState] = useState(true);
   const [digestTickers, setDigestTickers] = useState<Set<string>>(new Set());
   const [saving, setSaving] = useState(false);
+  const [lang, setLangState] = useState<"en" | "fr">("en");
   const { currency, setCurrency } = useCurrencyPref();
 
   useEffect(() => {
@@ -52,11 +53,12 @@ export default function ProfilePage() {
       if (pinData) setPins(pinData);
 
       // Load preferences
-      const { data: prefs } = await supa.from("user_preferences").select("notify_email, notify_weekly, digest_tickers").eq("user_id", u.id).single();
+      const { data: prefs } = await supa.from("user_preferences").select("notify_email, notify_weekly, digest_tickers, lang").eq("user_id", u.id).single();
       if (prefs) {
         setNotifyEmailState(prefs.notify_email ?? true);
         setNotifyWeeklyState(prefs.notify_weekly ?? true);
         setDigestTickers(new Set(prefs.digest_tickers ?? []));
+        setLangState((prefs.lang as "en" | "fr") ?? "en");
       } else {
         // Default: all tickers selected
         if (pinData) setDigestTickers(new Set(pinData.map((p: PinnedStock) => p.ticker)));
@@ -87,6 +89,15 @@ export default function ProfilePage() {
   async function handleNotifyWeekly(val: boolean) {
     setNotifyWeeklyState(val);
     await savePrefs({ notify_weekly: val });
+  }
+
+  async function handleLang(val: "en" | "fr") {
+    setLangState(val);
+    const supa = createClient();
+    if (!supa || !user) return;
+    setSaving(true);
+    await supa.from("user_preferences").upsert({ user_id: user.id, lang: val, updated_at: new Date().toISOString() });
+    setSaving(false);
   }
 
   async function toggleDigestTicker(ticker: string) {
@@ -178,7 +189,7 @@ export default function ProfilePage() {
                       background: "rgba(255,180,0,0.10)", color: "#C8960C",
                     }}>Premium</span>
                   </div>
-                  <div style={{ fontSize: "12px", color: "var(--color-text-muted)", marginTop: "2px" }}>Un seul email EOD avec toutes tes actions</div>
+                  <div style={{ fontSize: "12px", color: "var(--color-text-muted)", marginTop: "2px" }}>Résumé IA quotidien — envoi 19h15</div>
                 </div>
                 <Toggle value={notifyEmail} onChange={handleNotifyEmail} />
               </div>
@@ -194,7 +205,7 @@ export default function ProfilePage() {
                       background: "var(--color-accent-light)", color: "var(--color-accent)",
                     }}>Premium</span>
                   </div>
-                  <div style={{ fontSize: "12px", color: "var(--color-text-muted)", marginTop: "2px" }}>Résumé IA de la semaine chaque lundi</div>
+                  <div style={{ fontSize: "12px", color: "var(--color-text-muted)", marginTop: "2px" }}>Résumé IA de la semaine — envoi samedi 7h</div>
                 </div>
                 <Toggle value={notifyWeekly} onChange={handleNotifyWeekly} />
               </div>
@@ -229,6 +240,36 @@ export default function ProfilePage() {
                   </div>
                 </div>
               )}
+            </div>
+          </div>
+        )}
+
+        {/* Language */}
+        {user && (
+          <div style={{ marginBottom: "28px" }}>
+            <div style={{ fontSize: "11px", fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase", color: "var(--color-text-muted)", marginBottom: "10px" }}>Digest Language</div>
+            <div style={{ background: "var(--color-surface)", border: "1px solid var(--color-border)", borderRadius: "8px", overflow: "hidden" }}>
+              {([
+                { value: "en", label: "English", desc: "AI summaries in English" },
+                { value: "fr", label: "Français", desc: "Résumés IA en français" },
+              ] as { value: "en" | "fr"; label: string; desc: string }[]).map((opt, i) => {
+                const selected = lang === opt.value;
+                return (
+                  <div key={opt.value} onClick={() => handleLang(opt.value)} style={{
+                    display: "flex", alignItems: "center", justifyContent: "space-between",
+                    padding: "14px 18px", cursor: "pointer",
+                    borderBottom: i === 0 ? "1px solid var(--color-border)" : "none",
+                    background: selected ? "var(--color-accent-light)" : "transparent",
+                    transition: "background 0.1s",
+                  }}>
+                    <div>
+                      <div style={{ fontSize: "13px", fontWeight: 600, color: selected ? "var(--color-accent)" : "var(--color-text-primary)", fontFamily: "var(--font-mono)" }}>{opt.label}</div>
+                      <div style={{ fontSize: "12px", color: "var(--color-text-muted)", marginTop: "2px" }}>{opt.desc}</div>
+                    </div>
+                    {selected && <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--color-accent)" strokeWidth="2.5"><polyline points="20 6 9 17 4 12" /></svg>}
+                  </div>
+                );
+              })}
             </div>
           </div>
         )}

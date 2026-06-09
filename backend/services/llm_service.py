@@ -20,6 +20,23 @@ from zoneinfo import ZoneInfo
 from pathlib import Path
 
 _USAGE_LOG = Path.home() / "llm-stack" / "token_usage.jsonl"
+_FAILED_LOG = Path.home() / "llm-stack" / "logs" / "llm_cascade_failures.jsonl"
+
+
+def _log_cascade_failure(reason: str, caller: str, item_id: str) -> None:
+    """Persiste les échecs complets de cascade pour retry au prochain batch."""
+    try:
+        entry = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "reason": reason,
+            "caller": caller or "llm_service",
+            "item_id": item_id,
+        }
+        with _FAILED_LOG.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
 
 def _log_usage(model: str, tokens_in: int, tokens_out: int) -> None:
     if not _USAGE_LOG.parent.exists():
@@ -131,15 +148,17 @@ _CASCADE_HEADERS = {
 }
 
 
-def _send_cascade_notif(reason: str, trail: list[str], caller: str = "") -> None:
+def _send_cascade_notif(reason: str, trail: list[str], caller: str = "", header_override: str = "", item_id: str = "") -> None:
     """Notif unique avec le trail complet. Throttle 30min par raison."""
     now = time.monotonic()
     key = f"cascade_{reason}"
     if now - _notif_sent_at.get(key, 0) < NOTIF_THROTTLE:
         return
     _notif_sent_at[key] = now
-    header = _CASCADE_HEADERS.get(reason, f"🟠 *Cascade LLM — {reason}*")
+    header = header_override or _CASCADE_HEADERS.get(reason, f"🟠 *Cascade LLM — {reason}*")
     source = caller if caller else "llm_service"
+    if reason in ("all_failed", "groq_exhausted"):
+        _log_cascade_failure(reason, source, item_id)
     _notify_telegram(f"{header}\n\n" + "\n".join(trail) + f"\n📍 <i>{source}</i>")
 
 
@@ -215,6 +234,7 @@ def llm_call(
     timeout: int = 45,
     allow_groq: bool = True,
     caller: str = "",
+    item_id: str = "",
 ) -> dict:
     """
     Appel LLM avec cascade FreeTheAI → Groq.
@@ -235,6 +255,7 @@ def llm_call(
     trail: list[str] = []  # trail complet de la cascade pour la notif TG
     global _last_llm_source
     _freetheai_tried = False  # True ssi FreeTheAI tenté ce call (pas pre-frozen)
+    _hapuppy_quota_notif_sent = False  # True ssi hapuppy_quota envoyé dans ce call → supprime both_quota et hapuppy_down
 
     # ── FreeTheAI ──────────────────────────────────────────────────────────────
     # _freetheai_available() acquiert _freetheai_semaphore(1) si dispo — relâché en fin de bloc
@@ -369,9 +390,15 @@ def llm_call(
                         return result
                     elif status_code == 403:
                         # Crédits épuisés → freeze jusqu'au prochain reset 18h Paris
-                        _hapuppy_quota_skip_until = time.monotonic() + _seconds_until_hapuppy_reset()
+                        _hap_secs = _seconds_until_hapuppy_reset()
+                        _hapuppy_quota_skip_until = time.monotonic() + _hap_secs
                         trail.append(f"Hapuppy `{HAPUPPY_MODEL}` : ✗ 403 crédits épuisés")
-                        _send_cascade_notif("hapuppy_quota", trail, caller)
+                        _hap_dt = datetime.now(ZoneInfo("Europe/Paris")) + timedelta(seconds=_hap_secs)
+                        _hap_h, _hap_m = int(_hap_secs // 3600), int((_hap_secs % 3600) // 60)
+                        _hap_header = (f"🔴 *Hapuppy `{HAPUPPY_MODEL}` — crédits épuisés (403)*\n"
+                                       f"Recharger les crédits. Reset {_hap_dt.strftime('%Hh%M')} Paris (dans {_hap_h}h{_hap_m:02d}m).")
+                        _send_cascade_notif("hapuppy_quota", trail, caller, header_override=_hap_header)
+                        _hapuppy_quota_notif_sent = True
                         break
                     elif status_code == 429:
                         try:
@@ -380,9 +407,15 @@ def llm_call(
                             body_text = ""
                         is_quota = any(k in body_text for k in _HAPUPPY_QUOTA_KEYWORDS)
                         if is_quota:
-                            _hapuppy_quota_skip_until = time.monotonic() + _seconds_until_hapuppy_reset()
+                            _hap_secs = _seconds_until_hapuppy_reset()
+                            _hapuppy_quota_skip_until = time.monotonic() + _hap_secs
                             trail.append(f"Hapuppy `{HAPUPPY_MODEL}` : ✗ 429 quota épuisé")
-                            _send_cascade_notif("hapuppy_quota", trail, caller)
+                            _hap_dt = datetime.now(ZoneInfo("Europe/Paris")) + timedelta(seconds=_hap_secs)
+                            _hap_h, _hap_m = int(_hap_secs // 3600), int((_hap_secs % 3600) // 60)
+                            _hap_header = (f"🔴 *Hapuppy `{HAPUPPY_MODEL}` — quota épuisé (429)*\n"
+                                           f"Reset {_hap_dt.strftime('%Hh%M')} Paris (dans {_hap_h}h{_hap_m:02d}m).")
+                            _send_cascade_notif("hapuppy_quota", trail, caller, header_override=_hap_header)
+                            _hapuppy_quota_notif_sent = True
                             break
                         else:
                             # Rate-limit : backoff global partagé → tous les threads attendent,
@@ -407,9 +440,16 @@ def llm_call(
 
         groq_reason = "hapuppy_down"
 
-    # Trigger global : FreeTheAI quota épuisé ET Hapuppy quota épuisé → Groq seul
-    if _freetheai_skip_until is not None and _hapuppy_quota_skip_until is not None:
-        _send_cascade_notif("both_quota", trail, caller)
+    # Trigger global : FreeTheAI quota ET Hapuppy quota simultanément épuisés
+    # (supprimé si hapuppy_quota vient d'être envoyé dans ce même call)
+    if _freetheai_skip_until is not None and _hapuppy_quota_skip_until is not None and not _hapuppy_quota_notif_sent:
+        _now_mono = time.monotonic()
+        _hap_secs = max(0.0, _hapuppy_quota_skip_until - _now_mono)
+        _hap_dt = datetime.now(ZoneInfo("Europe/Paris")) + timedelta(seconds=_hap_secs)
+        _fte_utc = _freetheai_skip_until.strftime("%Hh%M UTC")
+        _both_header = (f"🔴 *FreeTheAI + Hapuppy hors quota*\nGroq seul actif.\n"
+                        f"Hapuppy reset ~{_hap_dt.strftime('%Hh%M')} Paris · FreeTheAI reset {_fte_utc}.")
+        _send_cascade_notif("both_quota", trail, caller, header_override=_both_header)
 
     # ── Groq (fallback final) ──────────────────────────────────────────────────
     # TODO PROD : réactiver la restriction BATCH_MODE pour préserver le quota Groq prod
@@ -441,7 +481,7 @@ def llm_call(
                 if _groq_consecutive_429 >= 3:
                     _groq_exhausted = True
                     trail.append(f"Groq `{groq_model}` : ✗ 429 x3 → quota daily épuisé")
-                    _send_cascade_notif("groq_exhausted", trail, caller)
+                    _send_cascade_notif("groq_exhausted", trail, caller, item_id=item_id)
                     raise GroqExhaustedError("Groq 429 x3 consécutifs")
                 if attempt < 2:
                     time.sleep(20 * (attempt + 1))
@@ -454,7 +494,9 @@ def llm_call(
             u = result.get("usage", {})
             _log_usage(groq_model, u.get("prompt_tokens", 0), u.get("completion_tokens", 0))
             trail.append(f"Groq `{groq_model}` : ✓")
-            if _freetheai_tried or groq_reason == "hapuppy_down":
+            # hapuppy_quota déjà envoyé → pas de doublon hapuppy_down
+            # quota frozen → c'est un quota, pas un "down" → pas de notif redondante
+            if (_freetheai_tried or groq_reason == "hapuppy_down") and not _hapuppy_quota_notif_sent and _hapuppy_quota_skip_until is None:
                 _send_cascade_notif(groq_reason, trail, caller)
             return result
         except GroqExhaustedError:
@@ -465,12 +507,12 @@ def llm_call(
                 time.sleep(2 ** attempt)
                 continue
             trail.append(f"Groq `{groq_model}` : ✗ {groq_err}")
-            _send_cascade_notif("all_failed", trail, caller)
+            _send_cascade_notif("all_failed", trail, caller, item_id=item_id)
             raise
         except Exception as e:
             groq_err = str(e)
             trail.append(f"Groq `{groq_model}` : ✗ {groq_err}")
-            _send_cascade_notif("all_failed", trail, caller)
+            _send_cascade_notif("all_failed", trail, caller, item_id=item_id)
             raise
     raise RuntimeError("LLM unreachable after all retries")
 
@@ -484,6 +526,7 @@ def llm_text(
     timeout: int = 45,
     allow_groq: bool = True,
     caller: str = "",
+    item_id: str = "",
 ) -> str:
     """Shortcut → retourne directement le texte du message."""
     resp = llm_call(
@@ -494,6 +537,7 @@ def llm_text(
         timeout=timeout,
         allow_groq=allow_groq,
         caller=caller,
+        item_id=item_id,
     )
     return resp["choices"][0]["message"]["content"].strip()
 
@@ -507,6 +551,7 @@ def llm_json(
     timeout: int = 45,
     allow_groq: bool = True,
     caller: str = "",
+    item_id: str = "",
 ) -> dict:
     """Shortcut → retourne le JSON parsé (response_format: json_object)."""
     import json
@@ -519,6 +564,7 @@ def llm_json(
         timeout=timeout,
         allow_groq=allow_groq,
         caller=caller,
+        item_id=item_id,
     )
     content = resp["choices"][0]["message"]["content"].strip()
     # Strip markdown code blocks if model wrapped the JSON

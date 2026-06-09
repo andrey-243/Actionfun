@@ -43,7 +43,7 @@ def _articles_from_archive(supa, ticker: str, hours: int = 48) -> list[dict]:
         if a.get("datetime", 0) > cutoff_ts and a.get("headline")
     ]
     articles.sort(key=lambda x: x["datetime"], reverse=True)
-    return articles[:15]
+    return articles[:100]
 
 
 def _week_articles_from_archive(supa, ticker: str, company_name: str = "") -> list[dict]:

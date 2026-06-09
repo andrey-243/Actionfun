@@ -968,9 +968,6 @@ export default function StockPage() {
                             <span style={{ fontSize: "10px", fontWeight: 700, letterSpacing: "0.07em", textTransform: "uppercase", color: accentColor, whiteSpace: "nowrap" }}>
                               {sectionLabel}
                             </span>
-                            {s.article_count ? (
-                              <span style={{ fontSize: "10px", color: "var(--color-text-muted)" }}>· {s.article_count} articles</span>
-                            ) : null}
                             <div style={{ flex: 1, height: "1px", background: "var(--color-border)" }} />
                             {sectionArticles.length > 0 && (
                               <ExpandButton count={sectionArticles.length} expanded={isExpanded} onClick={toggleExpand} accentColor={accentColor} />

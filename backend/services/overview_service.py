@@ -348,7 +348,7 @@ def _brutalise(ticker: str, articles: list[dict], stock_context: str = "", lang:
     prompt = (BRUTALIZE_PROMPT_EN if lang == "en" else BRUTALIZE_PROMPT).format(
         ticker=ticker, stock_context=stock_context, count=len(articles), articles_text=articles_text,
     )
-    return llm_json([{"role": "user", "content": prompt}], groq_model=GROQ_HEAVY, max_tokens=3000, timeout=60, caller="OW")
+    return llm_json([{"role": "user", "content": prompt}], groq_model=GROQ_HEAVY, max_tokens=3000, timeout=60, caller="OW", item_id=ticker)
 
 
 def _ow7d_from_abrutis(ticker: str, articles: list[dict], stock_context: str = "", lang: str = "fr") -> dict:
@@ -364,7 +364,7 @@ def _ow7d_from_abrutis(ticker: str, articles: list[dict], stock_context: str = "
     prompt = (OW7D_PROMPT_EN if lang == "en" else OW7D_PROMPT).format(
         ticker=ticker, stock_context=stock_context, articles_text=articles_text,
     )
-    return llm_json([{"role": "user", "content": prompt}], groq_model=GROQ_HEAVY, max_tokens=500, timeout=30, caller="OW")
+    return llm_json([{"role": "user", "content": prompt}], groq_model=GROQ_HEAVY, max_tokens=500, timeout=30, caller="OW", item_id=ticker)
 
 
 def _ow24h_from_abrutis(ticker: str, articles_24h: list[dict], stock_context: str = "", lang: str = "fr") -> dict:
@@ -378,7 +378,7 @@ def _ow24h_from_abrutis(ticker: str, articles_24h: list[dict], stock_context: st
     prompt = (SUMMARY_24H_PROMPT_EN if lang == "en" else SUMMARY_24H_PROMPT).format(
         ticker=ticker, stock_context=stock_context, articles_text=articles_text,
     )
-    return llm_json([{"role": "user", "content": prompt}], groq_model=GROQ_LIGHT, max_tokens=500, timeout=25, caller="OW")
+    return llm_json([{"role": "user", "content": prompt}], groq_model=GROQ_LIGHT, max_tokens=500, timeout=25, caller="OW", item_id=ticker)
 
 
 # ─── LLM2 — hash articles ─────────────────────────────────────────────────────

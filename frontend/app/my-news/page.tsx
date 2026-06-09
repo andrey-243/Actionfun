@@ -53,16 +53,6 @@ const SENTIMENT_STYLE: Record<string, { bg: string; color: string }> = {
 
 const LOGODEV_TOKEN = process.env.NEXT_PUBLIC_LOGODEV_TOKEN ?? "";
 
-function formatAge(isoTimestamp: string | null | undefined): string | null {
-  if (!isoTimestamp) return null;
-  const diff = Date.now() - new Date(isoTimestamp).getTime();
-  const mins = Math.floor(diff / 60000);
-  if (mins < 60) return `il y a ${mins}min`;
-  const hrs = Math.floor(diff / 3600000);
-  if (hrs < 24) return `il y a ${hrs}h`;
-  const days = Math.floor(diff / 86400000);
-  return `il y a ${days}j`;
-}
 
 function TickerLogo({ ticker, website, onLogoClick }: { ticker?: string | null; website?: string | null; onLogoClick?: () => void }) {
   const [failed, setFailed] = useState(false);
@@ -189,24 +179,31 @@ function ArticleRow({ title, source, pub_date, url, dumb }: {
   );
 }
 
+function shortAge(ms: number): string {
+  if (ms === Infinity || ms < 0) return "—";
+  if (ms < 3600000) return `${Math.floor(ms / 60000)}m`;
+  if (ms < 86400000) return `${Math.floor(ms / 3600000)}h`;
+  return `${Math.floor(ms / 86400000)}j`;
+}
+
+const DAILY_LIMIT = 5;
+const WEEKLY_LIMIT = 10;
+
 function DigestCard({ digest }: { digest: Digest }) {
   const router = useRouter();
   const [expanded, setExpanded] = useState(false);
+  const [showAll, setShowAll] = useState(false);
   const s = SENTIMENT_STYLE[digest.sentiment_24h] ?? SENTIMENT_STYLE.NEUTRAL;
 
-  const cutoff24h = Date.now() - 26 * 3600 * 1000; // 26h pour couvrir les timezones UTC-8 (marchés US/Asie)
+  const cutoff24h = Date.now() - 26 * 3600 * 1000;
   const articles24h = (digest.articles ?? []).filter((a) => {
     try { return new Date(a.pub_date).getTime() >= cutoff24h; } catch { return false; }
   });
   const hasArticles = articles24h.length > 0;
 
   const owAgeMs = digest.cached_at ? Date.now() - new Date(digest.cached_at).getTime() : Infinity;
-  const owAgeLabel = formatAge(digest.cached_at);
-  const dotClass = owAgeMs < 6 * 3600000 ? "fresh" : owAgeMs < 24 * 3600000 ? "medium" : "stale";
-
   const noNews = digest.no_24h_news ?? !hasArticles;
 
-  // Staleness based on most recent article (any, not just 24h)
   const lastArticle = (digest.articles ?? [])[0];
   const lastNewsMs = lastArticle ? Date.now() - new Date(lastArticle.pub_date).getTime() : Infinity;
   const staleLevel = noNews
@@ -221,12 +218,18 @@ function DigestCard({ digest }: { digest: Digest }) {
     critical: { glow: "rgba(224,92,75,0.9)",   text: "#E05C4B", bg: "rgba(224,92,75,0.1)"   },
   };
   const sc = staleLevel ? STALE_COLORS[staleLevel] : null;
-  const finalDotClass = staleLevel ?? dotClass;
 
-  const noNewsAge = lastNewsMs === Infinity ? "—"
-    : lastNewsMs < 3600000 ? `${Math.floor(lastNewsMs / 60000)}m`
-    : lastNewsMs < 86400000 ? `${Math.floor(lastNewsMs / 3600000)}h`
-    : `${Math.floor(lastNewsMs / 86400000)}j`;
+  // Freshness du check : vert < 6h · amber 6-24h · rouge > 24h
+  const syncColor = owAgeMs < 6 * 3600000
+    ? { bg: "rgba(76,175,130,0.12)",  color: "#4CAF82", border: "1px solid rgba(76,175,130,0.2)" }
+    : owAgeMs < 24 * 3600000
+    ? { bg: "rgba(245,197,24,0.08)",  color: "#C8960C", border: "1px solid rgba(245,197,24,0.15)" }
+    : { bg: "rgba(224,92,75,0.08)",   color: "#E05C4B", border: "1px solid rgba(224,92,75,0.15)" };
+
+  const chipBase: React.CSSProperties = {
+    padding: "2px 7px", borderRadius: "4px", fontSize: "9px",
+    fontWeight: 600, fontFamily: "var(--font-mono)", letterSpacing: "0.04em",
+  };
 
   return (
     <div
@@ -247,54 +250,42 @@ function DigestCard({ digest }: { digest: Digest }) {
           website={digest.website}
           onLogoClick={() => router.push(`/stock/${digest.ticker}`)}
         />
-        <div style={{ flex: 1 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "8px", flexWrap: "wrap" }}>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          {/* Ticker · badge sentiment/NO NEWS · chips poussées à droite */}
+          <div style={{ display: "flex", alignItems: "center", gap: "7px", marginBottom: "8px" }}>
             <span style={{ fontFamily: "var(--font-mono)", fontWeight: 800, fontSize: "15px", color: "var(--color-text-primary)" }}>
               {digest.ticker}
             </span>
-            {hasArticles && (
-              <span style={{
-                padding: "2px 8px", borderRadius: "4px", fontSize: "10px", fontWeight: 700,
-                fontFamily: "var(--font-mono)", letterSpacing: "0.06em",
-                background: s.bg, color: s.color,
-              }}>
+            {hasArticles ? (
+              <span style={{ ...chipBase, fontSize: "10px", background: s.bg, color: s.color }}>
                 {digest.sentiment_24h}
               </span>
-            )}
-            {hasArticles ? (
-              <span style={{ fontSize: "11px", color: "var(--color-text-muted)", fontFamily: "var(--font-mono)" }}>
-                {articles24h.length} article{articles24h.length > 1 ? "s" : ""} 24h
-              </span>
             ) : (
-              <span style={{ display: "inline-flex", alignItems: "center", gap: "0px" }}>
-                <span style={{
-                  padding: "2px 6px", borderRadius: "4px 0 0 4px", fontSize: "10px", fontWeight: 700,
-                  fontFamily: "var(--font-mono)", letterSpacing: "0.05em",
-                  background: "transparent",
-                  border: `1px solid ${sc?.text ?? "var(--color-text-muted)"}`,
-                  borderRight: "none",
-                  color: sc?.text ?? "var(--color-text-muted)",
-                }}>
-                  NO NEWS
-                </span>
-                <span style={{
-                  padding: "2px 6px", borderRadius: "0 4px 4px 0", fontSize: "10px", fontWeight: 700,
-                  fontFamily: "var(--font-mono)", letterSpacing: "0.05em",
-                  background: sc?.bg ?? "rgba(128,128,128,0.1)",
-                  border: `1px solid ${sc?.text ?? "var(--color-text-muted)"}`,
-                  color: sc?.text ?? "var(--color-text-muted)",
-                }}>
-                  {noNewsAge}
-                </span>
+              <span style={{
+                ...chipBase, fontSize: "10px",
+                background: sc?.bg ?? "rgba(128,128,128,0.1)",
+                border: `1px solid ${sc?.text ?? "var(--color-text-muted)"}`,
+                color: sc?.text ?? "var(--color-text-muted)",
+              }}>
+                NO NEWS
               </span>
             )}
-            {owAgeLabel && (
-              <span style={{ display: "flex", alignItems: "center", gap: "5px", marginLeft: "auto" }}>
-                <span className={`freshness-dot ${finalDotClass}`} />
-                <span style={{ fontSize: "11px", color: "var(--color-text-muted)" }}>{owAgeLabel}</span>
-              </span>
-            )}
+            <div style={{ flex: 1 }} />
+            {/* count — secondary */}
+            <span style={{ ...chipBase, background: "var(--color-surface-2)", color: "var(--color-text-secondary)", border: "1px solid var(--color-border)" }}>
+              {hasArticles ? `${articles24h.length} news` : "0 news"}
+            </span>
+            {/* dernier article — bleu */}
+            <span style={{ ...chipBase, background: "rgba(90,140,220,0.10)", color: "#7BA4E0", border: "1px solid rgba(90,140,220,0.18)" }}>
+              last news {shortAge(lastNewsMs)} ago
+            </span>
+            {/* check — freshness coloré */}
+            <span style={{ ...chipBase, ...syncColor }}>
+              ↻ {shortAge(owAgeMs)}
+            </span>
           </div>
+
+          {/* Résumé */}
           <p style={{ fontSize: "13px", color: "var(--color-text-secondary)", lineHeight: 1.6, margin: 0 }}>
             {noNews ? (digest.summary || "") : (digest.summary_24h || "Pas de résumé disponible.")}
           </p>
@@ -312,7 +303,7 @@ function DigestCard({ digest }: { digest: Digest }) {
 
       {expanded && hasArticles && (
         <div style={{ borderTop: "1px solid var(--color-border)" }}>
-          {articles24h.map((a, i) => (
+          {(showAll ? articles24h : articles24h.slice(0, DAILY_LIMIT)).map((a, i) => (
             <ArticleRow
               key={i}
               title={a.title}
@@ -322,6 +313,18 @@ function DigestCard({ digest }: { digest: Digest }) {
               dumb={a.dumb_en || a.dumb_fr}
             />
           ))}
+          {articles24h.length > DAILY_LIMIT && (
+            <button
+              onClick={() => setShowAll(v => !v)}
+              style={{
+                width: "100%", padding: "8px", border: "none", background: "transparent",
+                color: "var(--color-text-muted)", fontSize: "11px", fontWeight: 600,
+                cursor: "pointer", letterSpacing: "0.04em",
+              }}
+            >
+              {showAll ? "Voir moins ↑" : `+${articles24h.length - DAILY_LIMIT} articles`}
+            </button>
+          )}
         </div>
       )}
     </div>
@@ -331,12 +334,19 @@ function DigestCard({ digest }: { digest: Digest }) {
 function WeeklyCard({ weekly }: { weekly: Weekly }) {
   const router = useRouter();
   const [expanded, setExpanded] = useState(false);
+  const [showAll, setShowAll] = useState(false);
   const articles = weekly.top_articles ?? [];
   const hasArticles = articles.length > 0;
 
   const ageMs = weekly.cached_at ? Date.now() - new Date(weekly.cached_at).getTime() : Infinity;
-  const ageLabel = formatAge(weekly.cached_at);
   const dotClass = ageMs < 6 * 3600000 ? "fresh" : ageMs < 24 * 3600000 ? "medium" : "stale";
+
+  const lastArticle = articles[0];
+  const lastNewsMs = lastArticle?.pub_date
+    ? Date.now() - new Date(lastArticle.pub_date).getTime()
+    : Infinity;
+  const metaLastArticle = shortAge(lastNewsMs);
+  const metaChecked = shortAge(ageMs);
 
   return (
     <div style={{
@@ -352,30 +362,44 @@ function WeeklyCard({ weekly }: { weekly: Weekly }) {
           website={weekly.website}
           onLogoClick={() => router.push(`/stock/${weekly.ticker}`)}
         />
-        <div style={{ flex: 1 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "8px", flexWrap: "wrap" }}>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          {/* Ticker · badge 7J · chips */}
+          <div style={{ display: "flex", alignItems: "center", gap: "7px", marginBottom: "8px" }}>
             <span style={{ fontFamily: "var(--font-mono)", fontWeight: 800, fontSize: "15px", color: "var(--color-text-primary)" }}>
               {weekly.ticker}
             </span>
-            <span style={{
-              padding: "2px 8px", borderRadius: "4px", fontSize: "10px", fontWeight: 700,
-              fontFamily: "var(--font-mono)", letterSpacing: "0.06em",
-              background: "var(--color-surface-2)", color: "var(--color-text-muted)",
-            }}>
-              7J
-            </span>
+            <div style={{ flex: 1 }} />
             {hasArticles && (
-              <span style={{ fontSize: "11px", color: "var(--color-text-muted)", fontFamily: "var(--font-mono)" }}>
-                {articles.length} article{articles.length > 1 ? "s" : ""} 7j
+              <span style={{
+                padding: "2px 7px", borderRadius: "4px", fontSize: "9px", fontWeight: 600,
+                fontFamily: "var(--font-mono)", letterSpacing: "0.04em",
+                background: "var(--color-surface-2)", color: "var(--color-text-secondary)", border: "1px solid var(--color-border)",
+              }}>
+                {articles.length} news
               </span>
             )}
-            {ageLabel && (
-              <span style={{ display: "flex", alignItems: "center", gap: "5px", marginLeft: "auto" }}>
-                <span className={`freshness-dot ${dotClass}`} />
-                <span style={{ fontSize: "11px", color: "var(--color-text-muted)" }}>{ageLabel}</span>
+            {hasArticles && (
+              <span style={{
+                padding: "2px 7px", borderRadius: "4px", fontSize: "9px", fontWeight: 600,
+                fontFamily: "var(--font-mono)", letterSpacing: "0.04em",
+                background: "rgba(90,140,220,0.10)", color: "#7BA4E0", border: "1px solid rgba(90,140,220,0.18)",
+              }}>
+                last news {metaLastArticle} ago
               </span>
             )}
+            <span style={{
+              padding: "2px 7px", borderRadius: "4px", fontSize: "9px", fontWeight: 600,
+              fontFamily: "var(--font-mono)", letterSpacing: "0.04em",
+              ...(ageMs < 6 * 3600000
+                ? { background: "rgba(76,175,130,0.12)",  color: "#4CAF82", border: "1px solid rgba(76,175,130,0.2)" }
+                : ageMs < 24 * 3600000
+                ? { background: "rgba(245,197,24,0.08)",  color: "#C8960C", border: "1px solid rgba(245,197,24,0.15)" }
+                : { background: "rgba(224,92,75,0.08)",   color: "#E05C4B", border: "1px solid rgba(224,92,75,0.15)" }),
+            }}>
+              ↻ {metaChecked}
+            </span>
           </div>
+          {/* Résumé */}
           <p style={{ fontSize: "13px", color: weekly.generating ? "var(--color-text-muted)" : "var(--color-text-secondary)", lineHeight: 1.6, margin: 0, fontStyle: weekly.generating ? "italic" : "normal" }}>
             {weekly.generating ? "Résumé IA en cours de génération…" : (weekly.ai_summary || "Résumé hebdomadaire non disponible.")}
           </p>
@@ -393,7 +417,7 @@ function WeeklyCard({ weekly }: { weekly: Weekly }) {
 
       {expanded && hasArticles && (
         <div style={{ borderTop: "1px solid var(--color-border)" }}>
-          {articles.map((a, i) => (
+          {(showAll ? articles : articles.slice(0, WEEKLY_LIMIT)).map((a, i) => (
             <ArticleRow
               key={i}
               title={a.title}
@@ -403,6 +427,18 @@ function WeeklyCard({ weekly }: { weekly: Weekly }) {
               dumb={a.dumb_en || a.dumb_fr}
             />
           ))}
+          {articles.length > WEEKLY_LIMIT && (
+            <button
+              onClick={() => setShowAll(v => !v)}
+              style={{
+                width: "100%", padding: "8px", border: "none", background: "transparent",
+                color: "var(--color-text-muted)", fontSize: "11px", fontWeight: 600,
+                cursor: "pointer", letterSpacing: "0.04em",
+              }}
+            >
+              {showAll ? "Voir moins ↑" : `+${articles.length - WEEKLY_LIMIT} articles`}
+            </button>
+          )}
         </div>
       )}
     </div>
@@ -523,8 +559,8 @@ export default function MyNewsPage() {
             onClick={() => handleTab(tab === "daily" ? "weekly" : "daily")}
             style={{
               display: "flex", gap: "2px",
-              background: "rgba(76,175,130,0.10)",
-              border: "1px solid rgba(76,175,130,0.28)",
+              background: "var(--color-surface-2)",
+              border: "1px solid var(--color-border)",
               borderRadius: "20px", padding: "3px",
               cursor: "pointer", userSelect: "none",
             }}
@@ -571,7 +607,7 @@ export default function MyNewsPage() {
               <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "16px" }}>
                 <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
                   <span style={{ fontSize: "11px", fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase", color: "var(--color-text-muted)" }}>
-                    {digests.length} action{digests.length > 1 ? "s" : ""} · digest du jour
+                    {new Set(digests.map(d => d.ticker)).size} action{new Set(digests.map(d => d.ticker)).size > 1 ? "s" : ""} · digest du jour
                   </span>
                   <span style={{
                     padding: "1px 6px", borderRadius: "4px", fontSize: "9px", fontWeight: 700,
@@ -583,7 +619,13 @@ export default function MyNewsPage() {
                   {new Date().toLocaleDateString("fr-FR", { weekday: "long", day: "numeric", month: "long" })}
                 </span>
               </div>
-              {digests.map((d, i) => <DigestCard key={d.ticker ?? i} digest={d} />)}
+              {[...new Map(digests.map(d => [d.ticker, d])).values()]
+                .sort((a, b) => {
+                  const aMs = a.articles?.[0]?.pub_date ? new Date(a.articles[0].pub_date).getTime() : 0;
+                  const bMs = b.articles?.[0]?.pub_date ? new Date(b.articles[0].pub_date).getTime() : 0;
+                  return bMs - aMs;
+                })
+                .map((d, i) => <DigestCard key={d.ticker ?? i} digest={d} />)}
             </>
           )
         ) : (
@@ -595,13 +637,19 @@ export default function MyNewsPage() {
             <>
               <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "16px" }}>
                 <span style={{ fontSize: "11px", fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase", color: "var(--color-text-muted)" }}>
-                  {weeklies.length} action{weeklies.length > 1 ? "s" : ""} · recap de la semaine
+                  {new Set(weeklies.map(w => w.ticker)).size} action{new Set(weeklies.map(w => w.ticker)).size > 1 ? "s" : ""} · recap de la semaine
                 </span>
                 <span style={{ fontSize: "11px", color: "var(--color-text-muted)", fontFamily: "var(--font-mono)" }}>
                   {getCurrentWeekLabel()}
                 </span>
               </div>
-              {weeklies.map((w, i) => <WeeklyCard key={w.ticker ?? i} weekly={w} />)}
+              {[...new Map(weeklies.map(w => [w.ticker, w])).values()]
+                .sort((a, b) => {
+                  const aMs = a.top_articles?.[0]?.pub_date ? new Date(a.top_articles[0].pub_date).getTime() : 0;
+                  const bMs = b.top_articles?.[0]?.pub_date ? new Date(b.top_articles[0].pub_date).getTime() : 0;
+                  return bMs - aMs;
+                })
+                .map((w, i) => <WeeklyCard key={w.ticker ?? i} weekly={w} />)}
             </>
           )
         )}

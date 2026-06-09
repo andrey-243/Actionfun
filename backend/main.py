@@ -6,7 +6,8 @@ Enregistre tous les routers (/api/stock, /api/news, /api/search, /api/events,
   - yahoo */3h      : merge articles + trigger OW si nouveaux articles
   - finnhub */6h    : idem côté Finnhub
   - hourly :15      : refresh OW pour tickers no_24h_news
-  - email 18h30     : EOD digest Resend
+  - email 19h15     : Daily digest Resend (1J)
+  - email sam 7h00  : Weekly digest Resend (7J)
   - weekly lun 3h30 : condensation weekly summaries
   - monthly 1er 4h  : condensation monthly calendaire
   - yearly 1er jan  : condensation yearly summaries
@@ -52,9 +53,17 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(
         _run_digest_email,
         trigger="cron",
-        hour=18,
-        minute=30,
-        id="eod_digest_email",
+        hour=19,
+        minute=15,
+        id="daily_digest_email",
+    )
+    scheduler.add_job(
+        _run_weekly_digest_email,
+        trigger="cron",
+        day_of_week="sat",
+        hour=7,
+        minute=0,
+        id="weekly_digest_email",
     )
     scheduler.add_job(
         _run_weekly_condensation,
@@ -116,7 +125,7 @@ async def lifespan(app: FastAPI):
         id="reenrich_groq_to_freetheai",
     )
     scheduler.start()
-    logger.info("Crons démarrés — email 18h30, weekly lun 3h30, monthly 1er 4h, yearly 1er jan 5h, yahoo */3h, finnhub */6h, cold_start FR 19h, re-enrich 22h30, hourly_news :15")
+    logger.info("Crons démarrés — daily digest 18h30, weekly digest ven 22h30, weekly lun 3h30, monthly 1er 4h, yearly 1er jan 5h, yahoo */3h, finnhub */6h, cold_start FR 19h, re-enrich 22h30, hourly_news :15")
     yield
     scheduler.shutdown()
 
@@ -124,14 +133,27 @@ async def lifespan(app: FastAPI):
 def _run_digest_email():
     import time
     from services.digest_service import run_eod_digest_email
-    _tg("▶ *EOD Digest — envoi email* (18h30)")
+    _tg("▶ *Daily Digest (1J) — envoi email* (18h30)")
     t = time.time()
     try:
         run_eod_digest_email()
-        _tg(f"✅ *EOD Digest — email envoyé* ({int(time.time()-t)}s)")
+        _tg(f"✅ *Daily Digest (1J) — email envoyé* ({int(time.time()-t)}s)")
     except Exception as e:
-        logger.error(f"EOD digest email failed: {e}")
-        _tg(f"❌ *EOD Digest — email* : `{e}`")
+        logger.error(f"Daily digest email failed: {e}")
+        _tg(f"❌ *Daily Digest (1J) — email* : `{e}`")
+
+
+def _run_weekly_digest_email():
+    import time
+    from services.digest_service import run_weekly_digest_email
+    _tg("▶ *Weekly Digest (7J) — envoi email* (sam 7h)")
+    t = time.time()
+    try:
+        run_weekly_digest_email()
+        _tg(f"✅ *Weekly Digest (7J) — email envoyé* (sam 7h · {int(time.time()-t)}s)")
+    except Exception as e:
+        logger.error(f"Weekly digest email failed: {e}")
+        _tg(f"❌ *Weekly Digest (7J) — email* : `{e}`")
 
 
 def _run_weekly_condensation():
