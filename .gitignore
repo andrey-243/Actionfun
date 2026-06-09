@@ -48,3 +48,4 @@ Thumbs.db
 supabase/.branches/
 supabase/.temp/
 backend/scripts/refresh_breakers_*.json
+frontend/public/card-designs.html
