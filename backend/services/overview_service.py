@@ -1,7 +1,7 @@
 """
 Overview service — refresh déclenché uniquement sur nouveaux articles :
 
-  Call 1 : fetch articles_merged_finn_yahoo → si nouveaux → DUMB + OW 24H + OW 7J
+  Call 1 : fetch articles → si nouveaux → DUMB + OW 24H + OW 7J
   Call 2 : lit dumb en DB → OW 7J  (BATCH_MODE=1 uniquement)
 
   Pas de TTL — refresh uniquement via force_24h=True (crons Yahoo/Finnhub) ou cache absent.
@@ -263,7 +263,7 @@ def _fetch_news(ticker: str) -> tuple[list[dict], str | None]:
     except Exception:
         pass
 
-    # Articles depuis articles_merged_finn_yahoo (merge Finn+Yahoo) — 7 derniers jours
+    # Articles depuis articles (merge Finn+Yahoo) — 7 derniers jours
     supa = _get_supabase()
     company_name = _lookup_company_name(ticker, supa)
     now = datetime.now(timezone.utc)
@@ -276,7 +276,7 @@ def _fetch_news(ticker: str) -> tuple[list[dict], str | None]:
 
     raw: list[dict] = []
     for ym in sorted(year_months):
-        r = supa.table("articles_merged_finn_yahoo") \
+        r = supa.table("articles") \
             .select("articles") \
             .eq("ticker", ticker) \
             .eq("year_month", ym) \
@@ -342,13 +342,13 @@ def _bench_context_line(ctx: dict, lang: str) -> str:
 
 # ─── LLM calls ────────────────────────────────────────────────────────────────
 
-def _brutalise(ticker: str, articles: list[dict], stock_context: str = "", lang: str = "fr") -> dict:
+def _brutalise(ticker: str, articles: list[dict], stock_context: str = "", lang: str = "fr", cascade: str = "default") -> dict:
     """Call lourd — abrutis par article + OW 7J."""
     articles_text = "\n\n".join(f"[{i}] {a['title']}\n{a['summary']}" for i, a in enumerate(articles))
     prompt = (BRUTALIZE_PROMPT_EN if lang == "en" else BRUTALIZE_PROMPT).format(
         ticker=ticker, stock_context=stock_context, count=len(articles), articles_text=articles_text,
     )
-    return llm_json([{"role": "user", "content": prompt}], groq_model=GROQ_HEAVY, max_tokens=3000, timeout=60, caller="OW", item_id=ticker)
+    return llm_json([{"role": "user", "content": prompt}], groq_model=GROQ_HEAVY, max_tokens=3000, timeout=60, caller="OW", item_id=ticker, cascade=cascade)
 
 
 def _ow7d_from_abrutis(ticker: str, articles: list[dict], stock_context: str = "", lang: str = "fr") -> dict:
@@ -364,7 +364,7 @@ def _ow7d_from_abrutis(ticker: str, articles: list[dict], stock_context: str = "
     prompt = (OW7D_PROMPT_EN if lang == "en" else OW7D_PROMPT).format(
         ticker=ticker, stock_context=stock_context, articles_text=articles_text,
     )
-    return llm_json([{"role": "user", "content": prompt}], groq_model=GROQ_HEAVY, max_tokens=500, timeout=30, caller="OW", item_id=ticker)
+    return llm_json([{"role": "user", "content": prompt}], groq_model=GROQ_HEAVY, max_tokens=500, timeout=30, caller="OW", item_id=ticker, cascade="ow7j_prod")
 
 
 def _ow24h_from_abrutis(ticker: str, articles_24h: list[dict], stock_context: str = "", lang: str = "fr") -> dict:
@@ -378,7 +378,7 @@ def _ow24h_from_abrutis(ticker: str, articles_24h: list[dict], stock_context: st
     prompt = (SUMMARY_24H_PROMPT_EN if lang == "en" else SUMMARY_24H_PROMPT).format(
         ticker=ticker, stock_context=stock_context, articles_text=articles_text,
     )
-    return llm_json([{"role": "user", "content": prompt}], groq_model=GROQ_LIGHT, max_tokens=500, timeout=25, caller="OW", item_id=ticker)
+    return llm_json([{"role": "user", "content": prompt}], groq_model=GROQ_LIGHT, max_tokens=500, timeout=25, caller="OW", item_id=ticker, cascade="ow24h_prod")
 
 
 # ─── LLM2 — hash articles ─────────────────────────────────────────────────────
@@ -413,10 +413,10 @@ def _is_stale_6h(row: dict | None, now: datetime) -> bool:
         return True
 
 
-# ─── Write dumb back to articles_merged_finn_yahoo ───────────────────────────
+# ─── Write dumb back to articles ───────────────────────────
 
 def _write_dumb_to_archive(ticker: str, articles: list[dict], lang: str, supa) -> None:
-    """Écrit dumb_en/dumb_fr dans les objets article de articles_merged_finn_yahoo."""
+    """Écrit dumb_en/dumb_fr dans les objets article de articles."""
     dumb_field = "dumb_en" if lang == "en" else "dumb_fr"
     by_ym: dict[str, dict[str, str]] = {}
     for a in articles:
@@ -434,7 +434,7 @@ def _write_dumb_to_archive(ticker: str, articles: list[dict], lang: str, supa) -
         by_ym.setdefault(ym, {})[url] = dumb
 
     for ym, url_dumb in by_ym.items():
-        r = supa.table("articles_merged_finn_yahoo").select("articles") \
+        r = supa.table("articles").select("articles") \
             .eq("ticker", ticker).eq("year_month", ym).maybe_single().execute()
         if not r or not r.data:
             continue
@@ -445,15 +445,15 @@ def _write_dumb_to_archive(ticker: str, articles: list[dict], lang: str, supa) -
                 art[dumb_field] = url_dumb[art["url"]]
                 updated = True
         if updated:
-            supa.table("articles_merged_finn_yahoo").update({"articles": arts}) \
+            supa.table("articles").update({"articles": arts}) \
                 .eq("ticker", ticker).eq("year_month", ym).execute()
 
 
 # ─── Brutalise standalone — appelé par les crons dès nouveaux articles ────────
 
-def brutalise_new_articles(ticker: str, lang: str = None) -> int:
+def gen_dumb(ticker: str, lang: str = None, cascade: str = "default") -> int:
     """
-    Génère dumb_en/fr pour tous les articles sans DUMB dans articles_merged_finn_yahoo.
+    Génère dumb_en/fr pour tous les articles sans DUMB dans articles.
     Appelé par les crons Yahoo/Finnhub immédiatement après détection de nouveaux articles,
     indépendamment de la regen OW.
     Retourne le nombre d'articles brutalised.
@@ -469,7 +469,7 @@ def brutalise_new_articles(ticker: str, lang: str = None) -> int:
 
     ctx = _get_stock_context(ticker)
     ctx_7d = _format_stock_context_7d(ctx)
-    ai_result = _brutalise(ticker, to_brutalise, stock_context=ctx_7d, lang=lang)
+    ai_result = _brutalise(ticker, to_brutalise, stock_context=ctx_7d, lang=lang, cascade=cascade)
 
     brutalised_map = {item["id"]: item["brutalised"] for item in ai_result.get("articles", [])}
     for i, a in enumerate(to_brutalise):
@@ -496,7 +496,7 @@ def _call1_dumb_ow24h(ticker: str, fresh_articles: list[dict], row: dict | None,
         update = {"cached_at": now.isoformat()}
         if website and not (row or {}).get("website"):
             update["website"] = website
-        supa.table("stock_news_cache").update(update).eq("ticker", ticker).execute()
+        supa.table("ow_cache").update(update).eq("ticker", ticker).execute()
         return {**(row or {}), **update}
 
     if ctx is None:
@@ -507,7 +507,7 @@ def _call1_dumb_ow24h(ticker: str, fresh_articles: list[dict], row: dict | None,
     # Articles sans dumb → à brutaliser
     to_brutalise = [a for a in fresh_articles[:30] if not a.get(dumb_field)]
     if to_brutalise:
-        ai_result = _brutalise(ticker, to_brutalise, stock_context=ctx_7d, lang=lang)
+        ai_result = _brutalise(ticker, to_brutalise, stock_context=ctx_7d, lang=lang, cascade="dumb_prod")
         llm_source = _llm_svc._last_llm_source
 
         brutalised_map = {item["id"]: item["brutalised"] for item in ai_result.get("articles", [])}
@@ -563,7 +563,7 @@ def _call1_dumb_ow24h(ticker: str, fresh_articles: list[dict], row: dict | None,
         }
         if website:
             update["website"] = website
-        supa.table("stock_news_cache").upsert({"ticker": ticker, **update}).execute()
+        supa.table("ow_cache").upsert({"ticker": ticker, **update}).execute()
     else:
         update = {
             "ticker": ticker,
@@ -580,7 +580,7 @@ def _call1_dumb_ow24h(ticker: str, fresh_articles: list[dict], row: dict | None,
             "ai_sentiment_reason": ai_result.get("sentiment_reason", ""),
             "ow7d_cached_at": now.isoformat(),
         }
-        supa.table("stock_news_cache").upsert(update).execute()
+        supa.table("ow_cache").upsert(update).execute()
     return {**(row or {}), **update}
 
 
@@ -600,7 +600,7 @@ def _call2_ow7d(ticker: str, fresh_articles: list[dict], row: dict | None,
     else:
         # Pas de dumb → brutaliser d'abord
         to_brutalise = fresh_articles[:30]
-        ai_result = _brutalise(ticker, to_brutalise, stock_context=ctx_7d, lang=lang)
+        ai_result = _brutalise(ticker, to_brutalise, stock_context=ctx_7d, lang=lang, cascade="dumb_prod")
         brutalised_map = {item["id"]: item["brutalised"] for item in ai_result.get("articles", [])}
         for i, a in enumerate(to_brutalise):
             b = brutalised_map.get(i, "")
@@ -618,7 +618,7 @@ def _call2_ow7d(ticker: str, fresh_articles: list[dict], row: dict | None,
             "ow7d_cached_at": now.isoformat(),
             "generated_by_en": llm_source,
         }
-        supa.table("stock_news_cache").upsert({"ticker": ticker, **update}).execute()
+        supa.table("ow_cache").upsert({"ticker": ticker, **update}).execute()
     else:
         update = {
             "ticker": ticker,
@@ -628,13 +628,13 @@ def _call2_ow7d(ticker: str, fresh_articles: list[dict], row: dict | None,
             "ow7d_cached_at": now.isoformat(),
             "generated_by_fr": llm_source,
         }
-        supa.table("stock_news_cache").upsert(update).execute()
+        supa.table("ow_cache").upsert(update).execute()
     return {**(row or {}), **update}
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
-def get_news_stale(ticker: str, lang: str = None) -> tuple[dict | None, bool]:
+def get_or_refresh_ow_both(ticker: str, lang: str = None) -> tuple[dict | None, bool]:
     """
     Retourne (cached_result, needs_refresh) sans jamais appeler le LLM.
     None si aucun cache — l'appelant doit faire un appel bloquant.
@@ -644,7 +644,7 @@ def get_news_stale(ticker: str, lang: str = None) -> tuple[dict | None, bool]:
     batch_mode = os.environ.get("BATCH_MODE") == "1"
     supa = _get_supabase()
 
-    cache = supa.table("stock_news_cache").select("*").eq("ticker", ticker).limit(1).execute()
+    cache = supa.table("ow_cache").select("*").eq("ticker", ticker).limit(1).execute()
     row = cache.data[0] if cache.data else None
 
     if row is None or not row.get("cached_at"):
@@ -657,7 +657,7 @@ def get_news_stale(ticker: str, lang: str = None) -> tuple[dict | None, bool]:
         try:
             exchange = yf.Ticker(ticker).fast_info.exchange or ""
             if exchange:
-                supa.table("stock_news_cache").update({"exchange": exchange}).eq("ticker", ticker).execute()
+                supa.table("ow_cache").update({"exchange": exchange}).eq("ticker", ticker).execute()
                 row["exchange"] = exchange
         except Exception:
             pass
@@ -668,13 +668,13 @@ def get_news_stale(ticker: str, lang: str = None) -> tuple[dict | None, bool]:
     return result, needs_refresh
 
 
-def get_news(ticker: str, lang: str = None, force_24h: bool = False) -> dict:
+def gen_ow_both(ticker: str, lang: str = None, force_24h: bool = False) -> dict:
     ticker = ticker.upper()
     lang = lang or os.environ.get("LLM_LANG", "en")
     batch_mode = os.environ.get("BATCH_MODE") == "1"
     supa = _get_supabase()
 
-    cache = supa.table("stock_news_cache").select("*").eq("ticker", ticker).limit(1).execute()
+    cache = supa.table("ow_cache").select("*").eq("ticker", ticker).limit(1).execute()
     row = cache.data[0] if cache.data else None
 
     now = datetime.now(timezone.utc)
@@ -725,7 +725,7 @@ def _build_response(ticker: str, articles: list, row: dict) -> dict:
 
 # ─── Cron hourly refresh ──────────────────────────────────────────────────────
 
-def _maybe_regen_weekly(ticker: str, supa, logger) -> None:
+def _regen_break_weekly_if_missing(ticker: str, supa, logger) -> None:
     """Si le résumé IA de la semaine courante est absent, le génère (1 call LLM max/semaine/ticker)."""
     try:
         now = datetime.now(timezone.utc)
@@ -733,7 +733,7 @@ def _maybe_regen_weekly(ticker: str, supa, logger) -> None:
         day = now.day
         current_wnum = 1 if day <= 7 else 2 if day <= 14 else 3 if day <= 21 else 4
         row = (
-            supa.table("article_week_summaries")
+            supa.table("breaks_weekly")
             .select("year_month, week_num, ai_summary")
             .eq("ticker", ticker)
             .order("year_month", desc=True)
@@ -752,11 +752,11 @@ def _maybe_regen_weekly(ticker: str, supa, logger) -> None:
         logger.warning(f"[hourly_refresh] weekly regen {ticker}: {e}")
 
 
-def run_hourly_news_refresh() -> list[str]:
+def hourly_ow_regen() -> list[str]:
     """
     Cron :15 chaque heure.
     Cible : tickers pinnés + visités récemment avec no_24h_news=True.
-    Si nouveaux articles 24h trouvés → get_news() déclenche Call 1 (DUMB + OW 24H).
+    Si nouveaux articles 24h trouvés → gen_ow_both() déclenche Call 1 (DUMB + OW 24H).
     Retourne la liste des tickers qui ont trouvé de nouvelles news.
     """
     import logging
@@ -769,11 +769,11 @@ def run_hourly_news_refresh() -> list[str]:
     pins = supa.table("pinned_stocks").select("ticker").execute()
     pinned = {r["ticker"] for r in (pins.data or [])}
 
-    recent = supa.table("stock_news_cache") \
+    recent = supa.table("ow_cache") \
         .select("ticker").eq("no_24h_news", True).gte("cached_at", six_h_ago).execute()
     recent_tickers = {r["ticker"] for r in (recent.data or [])}
 
-    pinned_no_news = supa.table("stock_news_cache") \
+    pinned_no_news = supa.table("ow_cache") \
         .select("ticker").eq("no_24h_news", True).in_("ticker", list(pinned)).execute()
     pinned_no_news_tickers = {r["ticker"] for r in (pinned_no_news.data or [])}
 
@@ -788,21 +788,21 @@ def run_hourly_news_refresh() -> list[str]:
         try:
             # Fetch Yahoo avant de lire la DB — sinon les tickers <3 users ne sont jamais mis à jour
             try:
-                from services.breakers_articles_service import _accumulate_yahoo
+                from services.breakers_articles_service import _yahoo_scrap_accumulate
                 current_ym = now.strftime("%Y-%m")
-                _accumulate_yahoo(ticker, current_ym, supa)
+                _yahoo_scrap_accumulate(ticker, current_ym, supa)
             except Exception as acc_err:
                 logger.debug(f"[hourly_refresh] yahoo accumulate {ticker}: {acc_err}")
 
             fresh_articles, _ = _fetch_news(ticker)
             articles_24h = _filter_24h(fresh_articles)
             if len(articles_24h) == 0:
-                supa.table("stock_news_cache").update({"cached_at": now.isoformat()}).eq("ticker", ticker).execute()
+                supa.table("ow_cache").update({"cached_at": now.isoformat()}).eq("ticker", ticker).execute()
                 logger.info(f"[hourly_refresh] {ticker} — toujours 0 news 24h")
                 continue
-            get_news(ticker, force_24h=True)
+            gen_ow_both(ticker, force_24h=True)
             logger.info(f"[hourly_refresh] ✓ {ticker} — {len(articles_24h)} articles 24h")
-            _maybe_regen_weekly(ticker, supa, logger)
+            _regen_break_weekly_if_missing(ticker, supa, logger)
             refreshed.append(ticker)
         except Exception as e:
             logger.warning(f"[hourly_refresh] ✗ {ticker}: {e}")

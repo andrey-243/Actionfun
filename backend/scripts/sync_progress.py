@@ -51,21 +51,21 @@ def _fetch_all(supa, table: str, select: str, page_size: int = 1000) -> list[dic
 
 def build_scrape_state(supa) -> set[str]:
     """Tickers with at least one row in articles_merged_finn_yahoo (source of truth for all regions)."""
-    rows = _fetch_all(supa, "articles_merged_finn_yahoo", "ticker")
+    rows = _fetch_all(supa, "articles", "ticker")
     return {r["ticker"] for r in rows}
 
 
 def build_enrich_state(supa, lang: str) -> set[str]:
     """Tickers with ai_summary_en / ai_summary not null."""
     col = "ai_summary_en" if lang == "en" else "ai_summary"
-    rows = _fetch_all(supa, "stock_news_cache", f"ticker,{col}")
+    rows = _fetch_all(supa, "ow_cache", f"ticker,{col}")
     return {r["ticker"] for r in rows if r.get(col)}
 
 
 def build_bubbles_state(supa, lang: str) -> set[str]:
     """Tickers with >= THRESHOLD cause_en / cause rows (proxy for 'all dots done')."""
     col = "cause_en" if lang == "en" else "cause"
-    rows = _fetch_all(supa, "event_causes", f"ticker,{col}")
+    rows = _fetch_all(supa, "bub_cache", f"ticker,{col}")
 
     counts: dict[str, int] = {}
     for r in rows:

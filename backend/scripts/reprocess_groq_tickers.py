@@ -47,7 +47,7 @@ def main():
 
     # 1. Reset ai_summary_en dans DB
     print("\n[1/3] Reset ai_summary_en dans stock_news_cache...")
-    supa.table("stock_news_cache").update({"ai_summary_en": None, "ai_summary_24h_en": None}) \
+    supa.table("ow_cache").update({"ai_summary_en": None, "ai_summary_24h_en": None}) \
         .in_("ticker", GROQ_TICKERS).execute()
     print(f"  ✓ {len(GROQ_TICKERS)} tickers resetés")
 

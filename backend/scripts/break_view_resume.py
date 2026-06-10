@@ -27,7 +27,7 @@ from services.breakers_articles_service import (
 
 def condense_weeks_for_month(ticker: str, year_month: str, supa) -> int:
     """Génère les weekly summaries manquants pour year_month. Retourne le nombre générés."""
-    row = supa.table("articles_merged_finn_yahoo") \
+    row = supa.table("articles") \
         .select("articles") \
         .eq("ticker", ticker) \
         .eq("year_month", year_month) \
@@ -41,7 +41,7 @@ def condense_weeks_for_month(ticker: str, year_month: str, supa) -> int:
     generated = 0
 
     for wnum in range(1, 5):
-        exists = supa.table("article_week_summaries") \
+        exists = supa.table("breaks_weekly") \
             .select("week_num") \
             .eq("ticker", ticker) \
             .eq("year_month", year_month) \
@@ -70,7 +70,7 @@ def condense_weeks_for_month(ticker: str, year_month: str, supa) -> int:
             top_articles = [_normalize_finnhub(a) for a in sorted(
                 week_articles, key=lambda x: len(x.get("summary", "")), reverse=True
             )[:10]]
-            supa.table("article_week_summaries").upsert({
+            supa.table("breaks_weekly").upsert({
                 "ticker":        ticker,
                 "year_month":    year_month,
                 "week_num":      wnum,
@@ -90,7 +90,7 @@ def condense_weeks_for_month(ticker: str, year_month: str, supa) -> int:
 
 def condense_month(ticker: str, year_month: str, supa) -> bool:
     """Génère le monthly summary depuis les weeklies. Retourne True si généré."""
-    exists = supa.table("article_month_summaries") \
+    exists = supa.table("breaks_monthly") \
         .select("year_month") \
         .eq("ticker", ticker) \
         .eq("year_month", year_month) \
@@ -100,7 +100,7 @@ def condense_month(ticker: str, year_month: str, supa) -> bool:
         print(f"  Monthly {year_month} déjà condensé — skip")
         return False
 
-    week_rows = supa.table("article_week_summaries") \
+    week_rows = supa.table("breaks_weekly") \
         .select("week_num, ai_summary, ai_summary_en, ai_summary_fr, article_count") \
         .eq("ticker", ticker) \
         .eq("year_month", year_month) \
@@ -119,7 +119,7 @@ def condense_month(ticker: str, year_month: str, supa) -> bool:
         summary = _llm_call(MONTH_CONDENSE_PROMPT.format(
             ticker=ticker, label=_month_label(year_month), weeks_text=weeks_text,
         ), max_tokens=500)
-        supa.table("article_month_summaries").upsert({
+        supa.table("breaks_monthly").upsert({
             "ticker":        ticker,
             "year_month":    year_month,
             _summary_col():  summary,

@@ -14,11 +14,11 @@ from supabase import create_client
 supa = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
 
 # Tickers déjà dans stock_news_cache avec exchange
-cache_rows = supa.table("stock_news_cache").select("ticker, exchange").execute().data or []
+cache_rows = supa.table("ow_cache").select("ticker, exchange").execute().data or []
 already_done = {r["ticker"] for r in cache_rows if r.get("exchange")}
 
 # Tous les tickers connus depuis articles_merged_finn_yahoo
-all_tickers_rows = supa.table("articles_merged_finn_yahoo").select("ticker").execute().data or []
+all_tickers_rows = supa.table("articles").select("ticker").execute().data or []
 all_tickers = {r["ticker"] for r in all_tickers_rows}
 
 to_fill = sorted(all_tickers - already_done)
@@ -29,7 +29,7 @@ for ticker in to_fill:
     try:
         exchange = yf.Ticker(ticker).fast_info.exchange or ""
         if exchange:
-            supa.table("stock_news_cache").upsert(
+            supa.table("ow_cache").upsert(
                 {"ticker": ticker, "exchange": exchange},
                 on_conflict="ticker"
             ).execute()

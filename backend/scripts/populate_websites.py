@@ -37,7 +37,7 @@ def run(tickers: list[str]):
     for i, ticker in enumerate(tickers, 1):
         domain = get_domain(ticker)
         if domain:
-            supa.table("stock_news_cache").update({"website": domain}).eq("ticker", ticker).execute()
+            supa.table("ow_cache").update({"website": domain}).eq("ticker", ticker).execute()
             print(f"  [{i}/{len(tickers)}] ✓ {ticker} → {domain}")
             ok += 1
         else:
@@ -58,6 +58,6 @@ if __name__ == "__main__":
     if args.ticker:
         run([args.ticker.upper()])
     else:
-        rows = supa.table("stock_news_cache").select("ticker").execute()
+        rows = supa.table("ow_cache").select("ticker").execute()
         tickers = [r["ticker"] for r in (rows.data or [])]
         run(tickers)

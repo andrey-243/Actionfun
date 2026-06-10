@@ -59,7 +59,7 @@ def _logo_url(domain: str) -> str:
 def _already_done(ticker: str, force: bool) -> bool:
     if force:
         return False
-    row = supa.table("stock_news_cache").select("website, logo_url").eq("ticker", ticker).limit(1).execute()
+    row = supa.table("ow_cache").select("website, logo_url").eq("ticker", ticker).limit(1).execute()
     if not row.data:
         return False
     r = row.data[0]
@@ -80,12 +80,12 @@ def run(tickers: list[str], force: bool = False):
             print(f"  [{i}/{len(tickers)}] — {ticker} : pas de website yfinance")
             no_domain += 1
             # Upsert minimal pour que la row existe
-            supa.table("stock_news_cache").upsert({"ticker": ticker}, on_conflict="ticker").execute()
+            supa.table("ow_cache").upsert({"ticker": ticker}, on_conflict="ticker").execute()
             time.sleep(0.3)
             continue
 
         logo = _logo_url(domain)
-        supa.table("stock_news_cache").upsert(
+        supa.table("ow_cache").upsert(
             {"ticker": ticker, "website": domain, "logo_url": logo},
             on_conflict="ticker",
         ).execute()

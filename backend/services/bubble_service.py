@@ -1,11 +1,11 @@
 """
 BUB — cause IA des événements chart (dots peaks/valleys).
 
-get_event_news(ticker, date, change_pct) :
+get_or_gen_bub(ticker, date, change_pct) :
   - Cherche articles Finnhub T-3→T+3 (fallback T-6→T+6 si 0 articles)
   - Envoie au LLM : prix T-5→T+3 + benchmark (S&P/CAC/DAX/FTSE selon exchange) + headlines
-  - Cache permanent dans event_causes (cause_en + cause_fr)
-  - Benchmark déterminé depuis stock_news_cache.exchange
+  - Cache permanent dans bub_cache (cause_en + cause_fr)
+  - Benchmark déterminé depuis ow_cache.exchange
 """
 import yfinance as yf
 import os
@@ -89,12 +89,12 @@ def _get_price_context(ticker: str, date: str, benchmark_ticker: str, benchmark_
         return ""
 
 
-def get_event_news(ticker: str, date: str, change_pct: float = 0.0) -> dict:
+def get_or_gen_bub(ticker: str, date: str, change_pct: float = 0.0) -> dict:
     ticker = ticker.upper()
     supa = _get_supabase()
 
     # Cache Supabase permanent
-    row = supa.table("event_causes") \
+    row = supa.table("bub_cache") \
         .select("articles, cause_fr, cause_en") \
         .eq("ticker", ticker) \
         .eq("date", date) \
@@ -108,7 +108,7 @@ def get_event_news(ticker: str, date: str, change_pct: float = 0.0) -> dict:
         if cause:
             return {"date": date, "articles": cached["articles"], "cause": cause}
 
-    # Lire articles_merged_finn_yahoo (merge Finn+Yahoo) pour la fenêtre T-3→T+3
+    # Lire articles (merge Finn+Yahoo) pour la fenêtre T-3→T+3
     dt = datetime.fromisoformat(date[:10])
     from_dt = dt - timedelta(days=3)
     to_dt   = dt + timedelta(days=3)
@@ -124,7 +124,7 @@ def get_event_news(ticker: str, date: str, change_pct: float = 0.0) -> dict:
 
     raw_articles: list[dict] = []
     for ym in sorted(year_months):
-        r = supa.table("articles_merged_finn_yahoo") \
+        r = supa.table("articles") \
             .select("articles") \
             .eq("ticker", ticker) \
             .eq("year_month", ym) \
@@ -156,7 +156,7 @@ def get_event_news(ticker: str, date: str, change_pct: float = 0.0) -> dict:
             year_months6.add(cursor.strftime("%Y-%m"))
             cursor = (cursor.replace(day=28) + timedelta(days=4)).replace(day=1)
         for ym in sorted(year_months6 - year_months):
-            r = supa.table("articles_merged_finn_yahoo") \
+            r = supa.table("articles") \
                 .select("articles") \
                 .eq("ticker", ticker) \
                 .eq("year_month", ym) \
@@ -206,7 +206,7 @@ def get_event_news(ticker: str, date: str, change_pct: float = 0.0) -> dict:
         "llm_source": llm_source,
         "cached_at": datetime.now(timezone.utc).isoformat(),
     }
-    supa.table("event_causes").upsert(upsert_data).execute()
+    supa.table("bub_cache").upsert(upsert_data).execute()
 
     return result
 
@@ -237,7 +237,7 @@ Intègre si le move est spécifique au titre ou corrélé au marché général.
 Commence directement par les faits, pas d'introduction."""
     try:
         from services.llm_service import llm_call
-        resp = llm_call([{"role": "user", "content": prompt}], groq_model=GROQ_LIGHT, max_tokens=280, timeout=25, caller="BUB", item_id=ticker)
+        resp = llm_call([{"role": "user", "content": prompt}], groq_model=GROQ_LIGHT, max_tokens=280, timeout=25, caller="BUB", item_id=ticker, cascade="bub_prod")
         return resp["choices"][0]["message"]["content"].strip(), resp.get("_llm_source")
     except Exception:
         return None, None
@@ -278,6 +278,7 @@ Commence directement par les faits, pas d'introduction."""
             timeout=25,
             caller="BUB",
             item_id=ticker,
+            cascade="bub_prod",
         )
     except Exception:
         return None

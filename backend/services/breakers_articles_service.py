@@ -2,17 +2,17 @@
 Breaks — articles par période et condensation IA (weekly / monthly / yearly).
 
 Fonctions principales :
-  get_period_articles(ticker, period)  → 1mo/6mo/1y : sections W1-W4 ou mois, résumé AI si dispo
-  get_all_available(ticker)            → 5Y : mois par mois, breaker si dispo sinon articles bruts
+  read_breaks_by_period(ticker, period)      → 1mo/6mo/1y : sections W1-W4 ou mois, résumé AI si dispo
+  read_breaks_periods_available(ticker)      → 5Y : mois par mois, breaker si dispo sinon articles bruts
 
 Crons de condensation (appelés depuis main.py) :
-  run_weekly_condensation()    → lundi 3h30 : weekly summaries → article_week_summaries
-  run_monthly_calendaire()     → 1er du mois 4h : monthly depuis weeklies → article_month_summaries
-  run_yearly_condensation()    → 1er jan 5h : yearly depuis monthlies → article_year_summaries
-  run_yahoo_accumulation()     → */3h : merge Yahoo → articles_merged_finn_yahoo + trigger OW
-  run_finnhub_refresh()        → */6h : merge Finnhub → articles_merged_finn_yahoo + trigger OW
+  gen_breaks_weekly()      → lundi 3h30 : weekly summaries → breaks_weekly
+  gen_breaks_monthly()     → 1er du mois 4h : monthly depuis weeklies → breaks_monthly
+  gen_breaks_yearly()      → 1er jan 5h : yearly depuis monthlies → breaks_yearly
+  yahoo_articles_scrap()   → */3h : merge Yahoo → articles + trigger OW
+  finnhub_articles_scrap() → */6h : merge Finnhub → articles + trigger OW
 
-Source de vérité articles : articles_merged_finn_yahoo (jamais article_archive).
+Source de vérité articles : articles (jamais article_archive).
 """
 import httpx
 import os
@@ -160,7 +160,7 @@ def _normalize_finnhub(a: dict) -> dict:
 
 
 def _normalize_yahoo(a: dict) -> dict:
-    """Yahoo articles sont déjà dans le bon format (stock_news_cache)."""
+    """Yahoo articles sont déjà dans le bon format (ow_cache)."""
     return a
 
 
@@ -200,11 +200,11 @@ def _fetch_finnhub_month(ticker: str, year_month: str) -> list[dict]:
 
 def _get_or_fetch_month(ticker: str, year_month: str, supa) -> tuple[list[dict], str]:
     """
-    Retourne (articles_raw, source) depuis articles_merged_finn_yahoo ou Finnhub.
+    Retourne (articles_raw, source) depuis articles ou Finnhub.
     Merge les nouveaux articles Finnhub avec l'existant (Yahoo inclus), pas d'écrasement.
     source = 'finnhub' | 'yahoo' | 'mixed'
     """
-    row = supa.table("articles_merged_finn_yahoo") \
+    row = supa.table("articles") \
         .select("articles, source, cached_at") \
         .eq("ticker", ticker) \
         .eq("year_month", year_month) \
@@ -226,7 +226,7 @@ def _get_or_fetch_month(ticker: str, year_month: str, supa) -> tuple[list[dict],
     if not raw:
         # Pas de données Finnhub : bump cached_at pour éviter des refetches constants
         if cached:
-            supa.table("articles_merged_finn_yahoo").update({
+            supa.table("articles").update({
                 "cached_at": datetime.now(timezone.utc).isoformat()
             }).eq("ticker", ticker).eq("year_month", year_month).execute()
             return existing, cached["source"]
@@ -236,7 +236,7 @@ def _get_or_fetch_month(ticker: str, year_month: str, supa) -> tuple[list[dict],
     merged = _dedup_by_headline(raw + existing)
     source = "mixed" if existing else "finnhub"
 
-    supa.table("articles_merged_finn_yahoo").upsert({
+    supa.table("articles").upsert({
         "ticker":     ticker,
         "year_month": year_month,
         "articles":   merged,
@@ -268,7 +268,7 @@ def _apply_density(articles: list[dict], slot_days: int, max_per_slot: int) -> l
 
 # ─── API principale ───────────────────────────────────────────────────────────
 
-def get_period_articles(ticker: str, period: str, company_name: str = "") -> dict:
+def read_breaks_by_period(ticker: str, period: str, company_name: str = "") -> dict:
     """
     1mo : sections par semaine (W1-W4) avec articles groupés par date.
     6mo / 1y : sections par mois avec articles groupés par year_month.
@@ -284,7 +284,7 @@ def get_period_articles(ticker: str, period: str, company_name: str = "") -> dic
         return _get_monthly_with_weeks(ticker, year_months, supa, company_name)
 
     # 6mo / 1y : récupérer month summaries AI (optionnel)
-    month_rows = supa.table("article_month_summaries") \
+    month_rows = supa.table("breaks_monthly") \
         .select("year_month, ai_summary, ai_summary_en, ai_summary_fr, article_count") \
         .eq("ticker", ticker) \
         .in_("year_month", year_months) \
@@ -366,7 +366,7 @@ def _ym_bounds(year_month: str) -> tuple[float, float]:
 
 def _get_monthly_with_weeks(ticker: str, year_months: list[str], supa, company_name: str = "") -> dict:
     """Pour 1mo : sections par semaine si distribution ok, sinon section merged avec warning."""
-    week_rows = supa.table("article_week_summaries") \
+    week_rows = supa.table("breaks_weekly") \
         .select("year_month, week_num, ai_summary, article_count") \
         .eq("ticker", ticker) \
         .in_("year_month", year_months) \
@@ -465,7 +465,7 @@ def _n_months_ago_ym(n: int) -> str:
     return f"{year:04d}-{month:02d}"
 
 
-def get_all_available(ticker: str) -> dict:
+def read_breaks_periods_available(ticker: str) -> dict:
     """
     5Y : Y breakers + M breakers uniquement — pas d'articles bruts.
     Header année avec yearly summary, puis mois avec monthly summary.
@@ -474,14 +474,14 @@ def get_all_available(ticker: str) -> dict:
     ticker = ticker.upper()
     supa = _get_supabase()
 
-    month_rows = supa.table("article_month_summaries") \
+    month_rows = supa.table("breaks_monthly") \
         .select("year_month, ai_summary, ai_summary_en, ai_summary_fr, article_count") \
         .eq("ticker", ticker) \
         .order("year_month", desc=True) \
         .execute()
     month_summary_map = {r["year_month"]: r for r in (month_rows.data or [])}
 
-    year_rows = supa.table("article_year_summaries") \
+    year_rows = supa.table("breaks_yearly") \
         .select("year, ai_summary, ai_summary_en, ai_summary_fr") \
         .eq("ticker", ticker) \
         .order("year", desc=True) \
@@ -589,7 +589,7 @@ def _summary_col() -> str:
     return "ai_summary_en" if _lang() == "en" else "ai_summary_fr"
 
 
-def _llm_call(prompt: str, max_tokens: int = 400, allow_groq: bool = True, item_id: str = "") -> str:
+def _llm_call(prompt: str, max_tokens: int = 400, allow_groq: bool = True, item_id: str = "", cascade: str = "default") -> str:
     from services.llm_service import llm_call
     resp = llm_call(
         [{"role": "user", "content": prompt}],
@@ -599,6 +599,7 @@ def _llm_call(prompt: str, max_tokens: int = 400, allow_groq: bool = True, item_
         allow_groq=allow_groq,
         caller="Breaks",
         item_id=item_id,
+        cascade=cascade,
     )
     _llm_call._last_source = resp.get("_llm_source")
     return resp["choices"][0]["message"]["content"].strip()
@@ -606,16 +607,16 @@ def _llm_call(prompt: str, max_tokens: int = 400, allow_groq: bool = True, item_
 _llm_call._last_source = None
 
 
-def run_weekly_condensation():
+def gen_breaks_weekly():
     """
     Lundi 3h : condense les semaines terminées de la semaine passée.
-    Seuil : ticker pinné par ≥ 3 users.
+    Seuil : ticker pinné par ≥ 1 user.
     """
     supa = _get_supabase()
     today = date.today()
 
-    # Tickers éligibles (≥ 3 users)
-    eligible = _get_eligible_tickers(supa, min_users=3)
+    # Tickers éligibles (≥ 1 user)
+    eligible = _get_eligible_tickers(supa, min_users=1)
     if not eligible:
         logger.info("Weekly condensation: no eligible tickers")
         return
@@ -640,7 +641,7 @@ def run_weekly_condensation():
 
     for ticker in eligible:
         # Déjà condensé ?
-        exists = supa.table("article_week_summaries") \
+        exists = supa.table("breaks_weekly") \
             .select("week_num") \
             .eq("ticker", ticker) \
             .eq("year_month", target_ym) \
@@ -651,7 +652,7 @@ def run_weekly_condensation():
             continue
 
         # Récupérer les articles de ce mois
-        row = supa.table("articles_merged_finn_yahoo") \
+        row = supa.table("articles") \
             .select("articles") \
             .eq("ticker", ticker) \
             .eq("year_month", target_ym) \
@@ -676,9 +677,9 @@ def run_weekly_condensation():
                 ticker=ticker,
                 label=label,
                 articles_text=articles_text,
-            ), item_id=ticker)
+            ), item_id=ticker, cascade="weekly_prod")
             top_articles = [_normalize_finnhub(a) for a in sorted(week_articles, key=lambda x: x.get("pub_date", ""), reverse=True)[:10]]
-            supa.table("article_week_summaries").upsert({
+            supa.table("breaks_weekly").upsert({
                 "ticker":        ticker,
                 "year_month":    target_ym,
                 "week_num":      target_wnum,
@@ -703,7 +704,7 @@ def run_weekly_condensation():
     logger.info(f"Weekly Pool2: semaine courante {current_ym} W{current_wnum} pour {len(all_pinned)} tickers")
     for ticker in all_pinned:
         try:
-            exists = supa.table("article_week_summaries") \
+            exists = supa.table("breaks_weekly") \
                 .select("week_num") \
                 .eq("ticker", ticker) \
                 .eq("year_month", current_ym) \
@@ -719,7 +720,7 @@ def run_weekly_condensation():
             logger.error(f"  ✗ Pool2 {ticker}: {e}")
 
 
-def run_monthly_condensation():
+def gen_breaks_monthly():
     """
     1er du mois à 4h : condense le mois terminé depuis les weekly summaries.
     Si les weekly summaries n'existent pas, condense depuis raw.
@@ -744,7 +745,7 @@ def run_monthly_condensation():
     logger.info(f"Monthly condensation: {target_ym} for {len(eligible)} tickers")
 
     for ticker in eligible:
-        exists = supa.table("article_month_summaries") \
+        exists = supa.table("breaks_monthly") \
             .select("year_month") \
             .eq("ticker", ticker) \
             .eq("year_month", target_ym) \
@@ -755,7 +756,7 @@ def run_monthly_condensation():
 
         try:
             # Essayer depuis les weekly summaries d'abord
-            week_rows = supa.table("article_week_summaries") \
+            week_rows = supa.table("breaks_weekly") \
                 .select("week_num, ai_summary, ai_summary_en, ai_summary_fr, article_count") \
                 .eq("ticker", ticker) \
                 .eq("year_month", target_ym) \
@@ -775,9 +776,9 @@ def run_monthly_condensation():
                     ticker=ticker,
                     label=_month_label(target_ym),
                     weeks_text=weeks_text,
-                ), max_tokens=500, item_id=ticker)
+                ), max_tokens=500, item_id=ticker, cascade="monthly_prod")
             else:
-                row = supa.table("articles_merged_finn_yahoo") \
+                row = supa.table("articles") \
                     .select("articles") \
                     .eq("ticker", ticker) \
                     .eq("year_month", target_ym) \
@@ -792,9 +793,9 @@ def run_monthly_condensation():
                     ticker=ticker,
                     label=_month_label(target_ym),
                     weeks_text=articles_text,
-                ), max_tokens=500, item_id=ticker)
+                ), max_tokens=500, item_id=ticker, cascade="monthly_prod")
 
-            supa.table("article_month_summaries").upsert({
+            supa.table("breaks_monthly").upsert({
                 "ticker":        ticker,
                 "year_month":    target_ym,
                 sc:              summary,
@@ -807,7 +808,7 @@ def run_monthly_condensation():
             logger.error(f"  ✗ Monthly {ticker} {target_ym}: {e}")
 
 
-def run_yearly_condensation():
+def gen_breaks_yearly():
     """
     1er janvier à 5h : condense l'année terminée depuis les monthly summaries.
     Seuil : ticker pinné par ≥ 3 users.
@@ -823,7 +824,7 @@ def run_yearly_condensation():
     logger.info(f"Yearly condensation: {target_year} for {len(eligible)} tickers")
 
     for ticker in eligible:
-        exists = supa.table("article_year_summaries") \
+        exists = supa.table("breaks_yearly") \
             .select("year") \
             .eq("ticker", ticker) \
             .eq("year", target_year) \
@@ -832,7 +833,7 @@ def run_yearly_condensation():
         if exists.data:
             continue
 
-        month_rows = supa.table("article_month_summaries") \
+        month_rows = supa.table("breaks_monthly") \
             .select("year_month, ai_summary, ai_summary_en, ai_summary_fr") \
             .eq("ticker", ticker) \
             .like("year_month", f"{target_year}-%") \
@@ -852,9 +853,9 @@ def run_yearly_condensation():
                 ticker=ticker,
                 year=target_year,
                 months_text=months_text,
-            ), max_tokens=600, item_id=ticker)
+            ), max_tokens=600, item_id=ticker, cascade="yearly_prod")
 
-            supa.table("article_year_summaries").upsert({
+            supa.table("breaks_yearly").upsert({
                 "ticker":       ticker,
                 "year":         target_year,
                 _summary_col(): summary,
@@ -864,7 +865,7 @@ def run_yearly_condensation():
             logger.info(f"  ✓ Yearly {ticker} {target_year}")
 
             # Purger les monthly calendaires de l'année générée
-            supa.table("article_month_summaries") \
+            supa.table("breaks_monthly") \
                 .delete() \
                 .eq("ticker", ticker) \
                 .like("year_month", f"{target_year}-%") \
@@ -875,7 +876,7 @@ def run_yearly_condensation():
             logger.error(f"  ✗ Yearly {ticker} {target_year}: {e}")
 
 
-def run_yahoo_accumulation() -> dict[str, int]:
+def yahoo_articles_scrap() -> dict[str, int]:
     """
     Cron 6h : accumule les articles Yahoo pour tous les tickers pinnés ≥ 3 users.
     Merge avec l'existant (Finnhub ou Yahoo), dedup par headline.
@@ -895,14 +896,14 @@ def run_yahoo_accumulation() -> dict[str, int]:
     results: dict[str, int] = {}
     for ticker in eligible:
         try:
-            added = _accumulate_yahoo(ticker, current_ym, supa)
+            added = _yahoo_scrap_accumulate(ticker, current_ym, supa)
             if added > 0:
                 results[ticker] = added
                 try:
-                    from services.overview_service import brutalise_new_articles, get_news
-                    n = brutalise_new_articles(ticker)
+                    from services.overview_service import gen_dumb, gen_ow_both
+                    n = gen_dumb(ticker, cascade="dumb_prod")
                     logger.info(f"  DUMB gen {ticker} ({n} articles brutalised)")
-                    get_news(ticker, force_24h=True)
+                    gen_ow_both(ticker, force_24h=True)
                     logger.info(f"  OW refresh triggered {ticker} (+{added} articles)")
                 except Exception as ow_err:
                     logger.warning(f"  DUMB+OW refresh failed {ticker}: {ow_err}")
@@ -912,7 +913,7 @@ def run_yahoo_accumulation() -> dict[str, int]:
     return results
 
 
-def _accumulate_yahoo(ticker: str, year_month: str, supa) -> int:
+def _yahoo_scrap_accumulate(ticker: str, year_month: str, supa) -> int:
     """Fetch Yahoo news, merge avec l'existant (Finnhub ou Yahoo), dedup par headline."""
     import yfinance as yf
     t = yf.Ticker(ticker)
@@ -941,7 +942,7 @@ def _accumulate_yahoo(ticker: str, year_month: str, supa) -> int:
     if not new_articles:
         return 0
 
-    row = supa.table("articles_merged_finn_yahoo") \
+    row = supa.table("articles") \
         .select("articles, source") \
         .eq("ticker", ticker) \
         .eq("year_month", year_month) \
@@ -959,7 +960,7 @@ def _accumulate_yahoo(ticker: str, year_month: str, supa) -> int:
 
     new_source = "mixed" if existing_source == "finnhub" else "yahoo"
     added = len(merged) - len(existing)
-    supa.table("articles_merged_finn_yahoo").upsert({
+    supa.table("articles").upsert({
         "ticker":     ticker,
         "year_month": year_month,
         "articles":   merged,
@@ -970,7 +971,7 @@ def _accumulate_yahoo(ticker: str, year_month: str, supa) -> int:
     return added
 
 
-def run_finnhub_refresh() -> dict[str, int]:
+def finnhub_articles_scrap() -> dict[str, int]:
     """
     Cron 12h : refresh Finnhub pour le mois courant sur tous les tickers pinnés ≥ 3 users.
     Merge avec l'existant via _get_or_fetch_month (TTL 12h).
@@ -997,10 +998,10 @@ def run_finnhub_refresh() -> dict[str, int]:
                 results[ticker] = len(articles)
             if added > 0:
                 try:
-                    from services.overview_service import brutalise_new_articles, get_news
-                    n = brutalise_new_articles(ticker)
+                    from services.overview_service import gen_dumb, gen_ow_both
+                    n = gen_dumb(ticker, cascade="dumb_prod")
                     logger.info(f"  DUMB gen {ticker} ({n} articles brutalised)")
-                    get_news(ticker, force_24h=True)
+                    gen_ow_both(ticker, force_24h=True)
                     logger.info(f"  OW refresh triggered {ticker} (+{added} articles)")
                 except Exception as ow_err:
                     logger.warning(f"  DUMB+OW refresh failed {ticker}: {ow_err}")
@@ -1011,7 +1012,7 @@ def run_finnhub_refresh() -> dict[str, int]:
 
 
 def _current_article_count(ticker: str, year_month: str, supa) -> int:
-    row = supa.table("articles_merged_finn_yahoo") \
+    row = supa.table("articles") \
         .select("articles") \
         .eq("ticker", ticker) \
         .eq("year_month", year_month) \
@@ -1035,7 +1036,7 @@ def _get_eligible_tickers(supa, min_users: int = 3) -> set[str]:
 
 def _purge_weeklies_for_month(ticker: str, year_month: str, supa) -> None:
     """Supprime tous les weekly summaries d'un year_month donné."""
-    supa.table("article_week_summaries") \
+    supa.table("breaks_weekly") \
         .delete() \
         .eq("ticker", ticker) \
         .eq("year_month", year_month) \
@@ -1045,7 +1046,7 @@ def _purge_weeklies_for_month(ticker: str, year_month: str, supa) -> None:
 
 def _purge_excess_weeklies(ticker: str, supa, max_weeks: int = 5) -> None:
     """Garde les max_weeks weeklies les plus récents, supprime le reste."""
-    rows = supa.table("article_week_summaries") \
+    rows = supa.table("breaks_weekly") \
         .select("year_month, week_num, condensed_at") \
         .eq("ticker", ticker) \
         .order("year_month", desc=True) \
@@ -1058,7 +1059,7 @@ def _purge_excess_weeklies(ticker: str, supa, max_weeks: int = 5) -> None:
 
     to_delete = all_weeks[max_weeks:]
     for w in to_delete:
-        supa.table("article_week_summaries") \
+        supa.table("breaks_weekly") \
             .delete() \
             .eq("ticker", ticker) \
             .eq("year_month", w["year_month"]) \
@@ -1093,7 +1094,7 @@ def run_monthly_calendaire(tickers: list[str] | None = None):
     logger.info(f"Monthly calendaire: {target_ym} for {len(tickers)} tickers")
 
     for ticker in tickers:
-        exists = supa.table("article_month_summaries") \
+        exists = supa.table("breaks_monthly") \
             .select("year_month") \
             .eq("ticker", ticker) \
             .eq("year_month", target_ym) \
@@ -1104,7 +1105,7 @@ def run_monthly_calendaire(tickers: list[str] | None = None):
             _purge_weeklies_for_month(ticker, target_ym, supa)
             continue
 
-        week_rows = supa.table("article_week_summaries") \
+        week_rows = supa.table("breaks_weekly") \
             .select("week_num, ai_summary, ai_summary_en, ai_summary_fr, article_count") \
             .eq("ticker", ticker) \
             .eq("year_month", target_ym) \
@@ -1124,9 +1125,9 @@ def run_monthly_calendaire(tickers: list[str] | None = None):
                 ticker=ticker,
                 label=_month_label(target_ym),
                 weeks_text=weeks_text,
-            ), max_tokens=500, item_id=ticker)
+            ), max_tokens=500, item_id=ticker, cascade="monthly_prod")
 
-            supa.table("article_month_summaries").upsert({
+            supa.table("breaks_monthly").upsert({
                 "ticker":        ticker,
                 "year_month":    target_ym,
                 _summary_col():  summary,
@@ -1146,13 +1147,13 @@ def run_monthly_calendaire(tickers: list[str] | None = None):
 
 def get_weekly_ondemand(ticker: str) -> str | None:
     """
-    Génère un résumé IA de la semaine en cours depuis stock_news_cache.news_raw (Yahoo 7j).
-    Stocke dans article_week_summaries et retourne le texte.
+    Génère un résumé IA de la semaine en cours depuis ow_cache.news_raw (Yahoo 7j).
+    Stocke dans breaks_weekly et retourne le texte.
     """
     ticker = ticker.upper()
     supa = _get_supabase()
 
-    row = supa.table("stock_news_cache").select("news_raw").eq("ticker", ticker).maybe_single().execute()
+    row = supa.table("ow_cache").select("news_raw").eq("ticker", ticker).maybe_single().execute()
     if not row or not row.data:
         return None
 
@@ -1181,12 +1182,12 @@ def get_weekly_ondemand(ticker: str) -> str | None:
     try:
         summary = _llm_call(_pick(WEEK_CONDENSE_PROMPT, WEEK_CONDENSE_PROMPT_EN).format(
             ticker=ticker, label=label, articles_text=articles_text,
-        ), max_tokens=400, item_id=ticker)
+        ), max_tokens=400, item_id=ticker, cascade="weekly_prod")
     except Exception as e:
         logger.error(f"Weekly ondemand {ticker}: {e}")
         return None
 
-    supa.table("article_week_summaries").upsert({
+    supa.table("breaks_weekly").upsert({
         "ticker":       ticker,
         "year_month":   year_month,
         "week_num":     week_num,
@@ -1198,7 +1199,7 @@ def get_weekly_ondemand(ticker: str) -> str | None:
     return summary
 
 
-def get_monthly_ondemand(ticker: str) -> str | None:
+def get_or_gen_breaks_monthly_ondemand(ticker: str) -> str | None:
     """
     Génère un résumé mensuel rolling depuis les 4 derniers weekly summaries.
     Appelé à la demande (premium CTA). Pas de cache persistant.
@@ -1206,7 +1207,7 @@ def get_monthly_ondemand(ticker: str) -> str | None:
     ticker = ticker.upper()
     supa = _get_supabase()
 
-    rows = supa.table("article_week_summaries") \
+    rows = supa.table("breaks_weekly") \
         .select("year_month, week_num, ai_summary, ai_summary_en, ai_summary_fr") \
         .eq("ticker", ticker) \
         .order("year_month", desc=True) \
@@ -1230,7 +1231,7 @@ def get_monthly_ondemand(ticker: str) -> str | None:
             ticker=ticker,
             label=label,
             weeks_text=weeks_text,
-        ), max_tokens=500, item_id=ticker)
+        ), max_tokens=500, item_id=ticker, cascade="monthly_prod")
     except Exception as e:
         logger.error(f"Monthly ondemand {ticker}: {e}")
         return None

@@ -30,7 +30,7 @@ import sys
 import time
 import threading
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from calendar import monthrange
 from datetime import date, datetime, timezone, timedelta
 from pathlib import Path
@@ -62,6 +62,9 @@ logger = logging.getLogger(__name__)
 
 NOTIFY_EVERY = 30
 FINNHUB_KEY = os.environ["FINNHUB_API_KEY"]
+
+# Event partagé entre les threads : set quand FreeTheAI épuise son quota daily
+_freetheai_monthly_stop = threading.Event()
 MIN_ARTICLES_FOR_WEEKLY = 2   # seuil min pour générer un weekly summary
 MIN_ARTICLES_FOR_MONTHLY = 3  # seuil min pour générer un monthly summary
 SKEW_RATIO = 2.5              # cluster si max_week > SKEW_RATIO * median des autres semaines
@@ -99,23 +102,25 @@ def _checkpoint_path(region: str, lang: str) -> Path:
     return SCRIPTS_DIR / f"refresh_breakers_{region.lower()}_{lang}.json"
 
 
-def _load_checkpoint(path: Path) -> tuple[set[str], set[str]]:
-    """Retourne (done, legacy) — legacy = traités avant enrichissement dumb+summary."""
+def _load_checkpoint(path: Path) -> tuple[set[str], set[str], set[str]]:
+    """Retourne (done, legacy, monthly_done)."""
     if path.exists():
         try:
             data = json.loads(path.read_text())
             done = set(data.get("done", []))
             legacy = set(data.get("legacy", []))
-            return done, legacy
+            monthly_done = set(data.get("monthly_done", []))
+            return done, legacy, monthly_done
         except Exception:
             pass
-    return set(), set()
+    return set(), set(), set()
 
 
-def _save_checkpoint(path: Path, done: set[str], legacy: set[str]):
+def _save_checkpoint(path: Path, done: set[str], legacy: set[str], monthly_done: set[str]):
     path.write_text(json.dumps({
-        "done":   sorted(done),
-        "legacy": sorted(legacy),
+        "done":         sorted(done),
+        "legacy":       sorted(legacy),
+        "monthly_done": sorted(monthly_done),
     }, indent=2))
 
 
@@ -249,7 +254,7 @@ def _scrape_and_upsert(ticker: str, year_month: str, supa) -> int:
     if not new_articles:
         return 0
 
-    row = supa.table("articles_merged_finn_yahoo") \
+    row = supa.table("articles") \
         .select("articles, source") \
         .eq("ticker", ticker) \
         .eq("year_month", year_month) \
@@ -266,7 +271,7 @@ def _scrape_and_upsert(ticker: str, year_month: str, supa) -> int:
         return 0
 
     new_source = "mixed" if existing_source == "finnhub" else "yahoo"
-    supa.table("articles_merged_finn_yahoo").upsert({
+    supa.table("articles").upsert({
         "ticker":     ticker,
         "year_month": year_month,
         "articles":   merged,
@@ -285,7 +290,7 @@ def _detect_finn_skew(ticker: str, months: list[str], supa) -> tuple[bool, int]:
     week_totals: dict[int, int] = defaultdict(int)
 
     for ym in months:
-        row = supa.table("articles_merged_finn_yahoo") \
+        row = supa.table("articles") \
             .select("articles") \
             .eq("ticker", ticker) \
             .eq("year_month", ym) \
@@ -319,7 +324,7 @@ def _detect_finn_skew(ticker: str, months: list[str], supa) -> tuple[bool, int]:
 
 # ─── LLM wrappers (reuse breakers_articles_service internals) ─────────────────
 
-def _llm_call(prompt: str, max_tokens: int = 400) -> tuple[str, str]:
+def _llm_call(prompt: str, max_tokens: int = 400, cascade: str = "default") -> tuple[str, str]:
     """Retourne (summary_text, llm_source)."""
     from services.llm_service import llm_call
     resp = llm_call(
@@ -327,6 +332,7 @@ def _llm_call(prompt: str, max_tokens: int = 400) -> tuple[str, str]:
         groq_model="llama-3.3-70b-versatile",
         max_tokens=max_tokens,
         timeout=45,
+        cascade=cascade,
     )
     src = resp.get("_llm_source", "unknown")
     return resp["choices"][0]["message"]["content"].strip(), src
@@ -399,10 +405,10 @@ def _gen_weekly(ticker: str, year_month: str, week_num: int,
     label = _week_label(year_month, week_num)
     articles_text = "\n".join(f"- {a['headline']}" for a in articles[:30])
     try:
-        summary, src = _llm_call(_week_prompt(ticker, label, articles_text), max_tokens=400)
+        summary, src = _llm_call(_week_prompt(ticker, label, articles_text), max_tokens=400, cascade="weekly_scrap")
         sc = _summary_col()
         top = sorted(articles, key=lambda x: x.get("datetime", 0), reverse=True)[:10]
-        supa.table("article_week_summaries").upsert({
+        supa.table("breaks_weekly").upsert({
             "ticker":        ticker,
             "year_month":    year_month,
             "week_num":      week_num,
@@ -434,7 +440,7 @@ def _process_weeklies(ticker: str, finn_skewed: bool, cluster_wnum: int,
 
         # Déjà existant ? (sauf si force_regen)
         if not force_regen:
-            exists = supa.table("article_week_summaries") \
+            exists = supa.table("breaks_weekly") \
                 .select("week_num") \
                 .eq("ticker", ticker) \
                 .eq("year_month", year_month) \
@@ -445,7 +451,7 @@ def _process_weeklies(ticker: str, finn_skewed: bool, cluster_wnum: int,
                 continue
 
         # Charger les articles de cette semaine
-        row = supa.table("articles_merged_finn_yahoo") \
+        row = supa.table("articles") \
             .select("articles") \
             .eq("ticker", ticker) \
             .eq("year_month", year_month) \
@@ -477,7 +483,7 @@ def _process_weeklies(ticker: str, finn_skewed: bool, cluster_wnum: int,
 
 def _gen_monthly_from_raw(ticker: str, year_month: str, supa) -> str | None | bool:
     """str=succès · None=skip (pas de data) · False=échec LLM."""
-    row = supa.table("articles_merged_finn_yahoo") \
+    row = supa.table("articles") \
         .select("articles") \
         .eq("ticker", ticker) \
         .eq("year_month", year_month) \
@@ -492,9 +498,9 @@ def _gen_monthly_from_raw(ticker: str, year_month: str, supa) -> str | None | bo
     label = _month_label(year_month)
     articles_text = "\n".join(f"- {a['headline']}" for a in raw[:40])
     try:
-        summary, src = _llm_call(_month_prompt(ticker, label, articles_text), max_tokens=500)
+        summary, src = _llm_call(_month_prompt(ticker, label, articles_text), max_tokens=500, cascade="monthly_scrap")
         sc = _summary_col()
-        supa.table("article_month_summaries").upsert({
+        supa.table("breaks_monthly").upsert({
             "ticker":        ticker,
             "year_month":    year_month,
             sc:              summary,
@@ -520,8 +526,8 @@ def _gen_monthly_from_weeklies(ticker: str, year_month: str,
     article_count = sum(r.get("article_count", 0) for r in week_rows)
     label = _month_label(year_month)
     try:
-        summary, src = _llm_call(_month_prompt(ticker, label, weeks_text), max_tokens=500)
-        supa.table("article_month_summaries").upsert({
+        summary, src = _llm_call(_month_prompt(ticker, label, weeks_text), max_tokens=500, cascade="monthly_scrap")
+        supa.table("breaks_monthly").upsert({
             "ticker":        ticker,
             "year_month":    year_month,
             sc:              summary,
@@ -539,14 +545,22 @@ def _gen_monthly_from_weeklies(ticker: str, year_month: str,
 def _process_monthlies(ticker: str, finn_skewed: bool,
                         months: list[str], supa,
                         force_regen: bool = False) -> tuple[int, list[str], int]:
-    """Génère les monthly summaries manquants. Retourne (nb généré, sources LLM, nb échecs)."""
+    """Génère les monthly summaries (FreeTheAI only). Retourne (nb généré, sources LLM, nb échecs)."""
+    from services.llm_service import FreeTheAIExhaustedError
     generated = 0
     sources: list[str] = []
     failures = 0
+
+    if _freetheai_monthly_stop.is_set():
+        return 0, [], 0
+
     for year_month in months:
+        if _freetheai_monthly_stop.is_set():
+            break
+
         # Déjà existant ? (sauf si force_regen)
         if not force_regen:
-            exists = supa.table("article_month_summaries") \
+            exists = supa.table("breaks_monthly") \
                 .select("year_month") \
                 .eq("ticker", ticker) \
                 .eq("year_month", year_month) \
@@ -555,99 +569,116 @@ def _process_monthlies(ticker: str, finn_skewed: bool,
             if exists.data:
                 continue
 
-        if finn_skewed:
-            src = _gen_monthly_from_raw(ticker, year_month, supa)
-        else:
-            week_rows = supa.table("article_week_summaries") \
-                .select("week_num, ai_summary, ai_summary_en, article_count") \
-                .eq("ticker", ticker) \
-                .eq("year_month", year_month) \
-                .order("week_num") \
-                .execute()
-
-            if week_rows.data and len(week_rows.data) >= 3:
-                src = _gen_monthly_from_weeklies(ticker, year_month, week_rows.data, supa)
-            else:
+        try:
+            if finn_skewed:
                 src = _gen_monthly_from_raw(ticker, year_month, supa)
+            else:
+                week_rows = supa.table("breaks_weekly") \
+                    .select("week_num, ai_summary, ai_summary_en, article_count") \
+                    .eq("ticker", ticker) \
+                    .eq("year_month", year_month) \
+                    .order("week_num") \
+                    .execute()
+
+                if week_rows.data and len(week_rows.data) >= 3:
+                    src = _gen_monthly_from_weeklies(ticker, year_month, week_rows.data, supa)
+                else:
+                    src = _gen_monthly_from_raw(ticker, year_month, supa)
+        except FreeTheAIExhaustedError:
+            _freetheai_monthly_stop.set()
+            logger.warning(f"  FreeTheAI épuisé — monthlies arrêtés ({ticker} {year_month})")
+            _telegram("🔴 *FreeTheAI quota daily épuisé*\nMonthlies arrêtés pour ce batch. Relancer demain avec la même commande.")
+            break
 
         if isinstance(src, str):
             generated += 1
             sources.append(src)
         elif src is False:
-            failures += 1  # LLM exception
-        # None = skip légitime (pas de data), pas un failure
+            failures += 1
         time.sleep(0.3)
 
     return generated, sources, failures
 
 
-# ─── Main per-ticker ──────────────────────────────────────────────────────────
+# ─── Main per-ticker (deux flows séparés) ─────────────────────────────────────
 
-def _process_ticker(ticker: str, year_month: str, sliding_weeks: list[tuple[str, int]],
-                    months: list[str], supa, lang: str = "en",
-                    force_regen: bool = False) -> dict:
+def _fmt_sources(sources: list[str]) -> str:
+    if not sources:
+        return "0"
+    counts: dict[str, int] = {}
+    for s in sources:
+        counts[s] = counts.get(s, 0) + 1
+    return " · ".join(f"{c} {s}" for s, c in sorted(counts.items()))
+
+
+def _process_ticker_ab(ticker: str, year_month: str, sliding_weeks: list[tuple[str, int]],
+                       months: list[str], supa, lang: str = "en",
+                       force_regen: bool = False) -> dict:
+    """Flow A+B : scrape + DUMB (Groq→Hapuppy) + weeklies (Hapuppy only)."""
     result = {
-        "ticker": ticker,
-        "new_articles": 0,
-        "weeklies": 0,
-        "monthlies": 0,
-        "failures": 0,
-        "skewed": False,
-        "error": None,
+        "ticker": ticker, "flow": "ab",
+        "new_articles": 0, "weeklies": 0,
+        "failures": 0, "skewed": False, "error": None,
     }
     try:
-        # 1. Scrape
         added = _scrape_and_upsert(ticker, year_month, supa)
         result["new_articles"] = added
         if added > 0:
             logger.info(f"  + {ticker}: {added} nouveaux articles")
 
-        # 1b. DUMB — génère dumb_en pour les articles sans DUMB avant condensation
         try:
-            from services.overview_service import brutalise_new_articles
-            n_dumb = brutalise_new_articles(ticker, lang)
+            from services.overview_service import gen_dumb
+            n_dumb = gen_dumb(ticker, lang, cascade="dumb_scrap")
             if n_dumb > 0:
                 logger.info(f"  DUMB {ticker}: {n_dumb} articles brutalised")
         except Exception as dumb_err:
             logger.warning(f"  DUMB {ticker} failed (non bloquant): {dumb_err}")
 
-        # 2. Détection skew sur les 3 derniers mois
         skew_months = months[:3]
         is_skewed, cluster_wnum = _detect_finn_skew(ticker, skew_months, supa)
         result["skewed"] = is_skewed
         if is_skewed:
             logger.info(f"  ⚠ {ticker}: Finnhub skew détecté W{cluster_wnum}")
 
-        # 3. Weeklies
         w_count, w_sources, w_failures = _process_weeklies(ticker, is_skewed, cluster_wnum, sliding_weeks, supa, force_regen=force_regen)
         result["weeklies"] = w_count
+        result["failures"] = w_failures
 
-        # 4. Monthlies
-        m_count, m_sources, m_failures = _process_monthlies(ticker, is_skewed, months, supa, force_regen=force_regen)
-        result["monthlies"] = m_count
-        result["failures"] = w_failures + m_failures
-
-        # 5. Récap sources LLM
-        if w_count or m_count:
-            def _fmt_sources(sources: list[str]) -> str:
-                if not sources:
-                    return "0"
-                counts: dict[str, int] = {}
-                for s in sources:
-                    k = str(s)
-                    counts[k] = counts.get(k, 0) + 1
-                return " · ".join(f"{c} {s}" for s, c in sorted(counts.items()))
-            parts = []
-            if w_count:
-                parts.append(f"{w_count}W [{_fmt_sources(w_sources)}]")
-            if m_count:
-                parts.append(f"{m_count}M [{_fmt_sources(m_sources)}]")
-            logger.info(f"  ↳ {ticker} — {' · '.join(parts)}")
+        if w_count:
+            logger.info(f"  ↳ {ticker} AB — {w_count}W [{_fmt_sources(w_sources)}]")
 
     except Exception as e:
         import traceback
         result["error"] = str(e)
-        logger.error(f"  ✗ {ticker}: {e}\n{traceback.format_exc()}")
+        logger.error(f"  ✗ {ticker} AB: {e}\n{traceback.format_exc()}")
+
+    return result
+
+
+def _process_ticker_monthly(ticker: str, months: list[str], supa,
+                             force_regen: bool = False) -> dict:
+    """Flow M : monthlies (FreeTheAI only). Skip si _freetheai_monthly_stop est set."""
+    result = {
+        "ticker": ticker, "flow": "monthly",
+        "monthlies": 0, "failures": 0, "error": None,
+    }
+    try:
+        # Détection skew (nécessaire pour choisir la stratégie monthly)
+        skew_months = months[:3]
+        # supa est thread-safe via le SDK Supabase
+        is_skewed, _ = _detect_finn_skew(ticker, skew_months, supa)
+
+        m_count, m_sources, m_failures = _process_monthlies(ticker, is_skewed, months, supa, force_regen=force_regen)
+        result["monthlies"] = m_count
+        result["failures"] = m_failures
+
+        if m_count:
+            logger.info(f"  ↳ {ticker} M — {m_count}M [{_fmt_sources(m_sources)}]")
+
+    except Exception as e:
+        import traceback
+        result["error"] = str(e)
+        logger.error(f"  ✗ {ticker} M: {e}\n{traceback.format_exc()}")
 
     return result
 
@@ -671,33 +702,38 @@ def main():
 
     cp_path = _checkpoint_path(args.region, args.lang)
     if args.no_resume:
-        done, legacy = set(), set()
+        done, legacy, monthly_done = set(), set(), set()
     else:
-        done, legacy = _load_checkpoint(cp_path)
+        done, legacy, monthly_done = _load_checkpoint(cp_path)
 
     # Tickers traités avant l'enrichissement dumb+summary → marquer comme legacy
     if done and not legacy:
         legacy = set(done)
-        _save_checkpoint(cp_path, done, legacy)
+        _save_checkpoint(cp_path, done, legacy, monthly_done)
         logger.info(f"{len(legacy)} tickers marqués legacy (pré-dumb enrichment)")
 
     if args.re_enrich_legacy:
-        todo = [t for t in tickers if t in legacy]
-        logger.info(f"Re-enrich legacy : {len(todo)} tickers")
+        todo_ab = [t for t in tickers if t in legacy]
+        logger.info(f"Re-enrich legacy : {len(todo_ab)} tickers")
     else:
-        # Legacy inclus même si dans done — génèrent DUMB + force-regen auto
-        todo = [t for t in tickers if t not in done or t in legacy]
-    total = len(todo)
+        todo_ab = [t for t in tickers if t not in done or t in legacy]
+
+    todo_monthly = [t for t in tickers if t not in monthly_done]
+    total_ab = len(todo_ab)
+    total_m = len(todo_monthly)
 
     now = datetime.now(timezone.utc)
     year_month = now.strftime("%Y-%m")
-    sliding = _sliding_weeks(n=5)    # 5 dernières semaines glissantes
-    months = _last_n_months(n=6)     # 6 derniers mois
+    sliding = _sliding_weeks(n=5)
+    months = _last_n_months(n=6)
 
-    logger.info(f"refresh_breakers — {args.region} {args.lang.upper()} — {total} tickers ({len(done)} done)")
+    logger.info(
+        f"refresh_breakers — {args.region} {args.lang.upper()} — "
+        f"AB: {total_ab} tickers ({len(done)} done) | M: {total_m} tickers ({len(monthly_done)} done)"
+    )
     _telegram(
         f"🔄 *refresh_breakers démarré — {args.region} {args.lang.upper()}*\n"
-        f"{total} tickers à traiter\n"
+        f"Flow AB: {total_ab} tickers | Flow M: {total_m} tickers\n"
         f"Fenêtre : {sliding[-1][0]} W{sliding[-1][1]} → {sliding[0][0]} W{sliding[0][1]}\n"
         f"Mois : {months[-1]} → {months[0]}"
     )
@@ -709,56 +745,98 @@ def main():
     total_new_arts = 0
     total_weeks_gen = 0
     total_months_gen = 0
+    cp_lock = threading.Lock()
+    completed_count = 0
 
-    for i, ticker in enumerate(todo, 1):
-        logger.info(f"[{i}/{total}] {ticker}")
-        # Les tickers legacy sont automatiquement force-regénérés (rows existantes réécrites)
-        is_legacy = ticker in legacy
-        res = _process_ticker(ticker, year_month, sliding, months, supa, lang=args.lang,
-                              force_regen=args.force_regen or is_legacy)
+    def _save_cp():
+        with cp_lock:
+            _save_checkpoint(cp_path, done, legacy, monthly_done)
 
-        if res["error"]:
-            batch_errors.append(ticker)
-        if res["skewed"]:
-            batch_skewed.append(ticker)
+    # ── Deux flux parallèles ─────────────────────────────────────────────────
+    # Flow AB (max 2 workers) : scrape + DUMB + weeklies
+    # Flow M  (max 1 worker)  : monthlies FreeTheAI only
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="ab") as ex_ab, \
+         ThreadPoolExecutor(max_workers=1, thread_name_prefix="m") as ex_m:
 
-        total_new_arts  += res["new_articles"]
-        total_weeks_gen += res["weeklies"]
-        total_months_gen += res["monthlies"]
+        futures_ab: dict = {
+            ex_ab.submit(
+                _process_ticker_ab, t, year_month, sliding, months, supa,
+                args.lang, args.force_regen or (t in legacy)
+            ): t
+            for t in todo_ab
+        }
+        futures_m: dict = {
+            ex_m.submit(_process_ticker_monthly, t, months, supa, args.force_regen): t
+            for t in todo_monthly
+        }
 
-        # Ne marquer done que si aucun échec LLM — sinon retenté au prochain batch
-        if not res["failures"] and not res["error"]:
-            done.add(ticker)
-            legacy.discard(ticker)
-            _save_checkpoint(cp_path, done, legacy)
-        else:
-            logger.warning(f"  ⚠ {ticker} non marqué done ({res['failures']} échec(s) LLM) — retenté au prochain batch")
+        all_futures = {**futures_ab, **futures_m}
 
-        if i % NOTIFY_EVERY == 0:
-            elapsed = int(time.time() - start_time)
-            mins, secs = divmod(elapsed, 60)
-            remaining = int((elapsed / i) * (total - i))
-            r_mins, r_secs = divmod(remaining, 60)
-            _telegram(
-                f"📊 *refresh_breakers — {args.region} {args.lang.upper()}*\n"
-                f"Checkpoint {i}/{total} ({i*100//total}%)\n"
-                f"⏱ {mins}m{secs:02d}s · ~{r_mins}m{r_secs:02d}s restant\n"
-                f"📰 +{total_new_arts} articles · 📅 {total_weeks_gen}W · 📆 {total_months_gen}M\n"
-                f"{'⚠ Skewed: ' + ', '.join(batch_skewed[-5:]) if batch_skewed else '✅ 0 skew'}\n"
-                f"{'❌ Errors: ' + ', '.join(batch_errors[-5:]) if batch_errors else '✅ 0 erreurs'}"
-            )
+        for f in as_completed(all_futures):
+            ticker = all_futures[f]
+            flow = "ab" if f in futures_ab else "monthly"
+            completed_count += 1
+
+            try:
+                res = f.result()
+            except Exception as e:
+                import traceback
+                logger.error(f"  ✗ {ticker} ({flow}) exception: {e}\n{traceback.format_exc()}")
+                batch_errors.append(ticker)
+                continue
+
+            if res.get("error"):
+                batch_errors.append(ticker)
+            if res.get("skewed"):
+                batch_skewed.append(ticker)
+
+            total_new_arts  += res.get("new_articles", 0)
+            total_weeks_gen += res.get("weeklies", 0)
+            total_months_gen += res.get("monthlies", 0)
+
+            if flow == "ab":
+                if not res["failures"] and not res["error"]:
+                    done.add(ticker)
+                    legacy.discard(ticker)
+                    _save_cp()
+                else:
+                    logger.warning(f"  ⚠ {ticker} AB non marqué done ({res['failures']} échec(s)) — retenté au prochain batch")
+            else:  # monthly
+                if not res["failures"] and not res["error"]:
+                    monthly_done.add(ticker)
+                    _save_cp()
+                elif res["failures"]:
+                    logger.warning(f"  ⚠ {ticker} M non marqué done ({res['failures']} échec(s)) — retenté au prochain batch")
+
+            if completed_count % NOTIFY_EVERY == 0:
+                elapsed = int(time.time() - start_time)
+                mins, secs = divmod(elapsed, 60)
+                total_all = total_ab + total_m
+                remaining = int((elapsed / completed_count) * (total_all - completed_count)) if completed_count else 0
+                r_mins, r_secs = divmod(remaining, 60)
+                _telegram(
+                    f"📊 *refresh_breakers — {args.region} {args.lang.upper()}*\n"
+                    f"Checkpoint {completed_count}/{total_all} ({completed_count*100//total_all}%)\n"
+                    f"⏱ {mins}m{secs:02d}s · ~{r_mins}m{r_secs:02d}s restant\n"
+                    f"📰 +{total_new_arts} articles · 📅 {total_weeks_gen}W · 📆 {total_months_gen}M\n"
+                    f"{'⚠ Skewed: ' + ', '.join(batch_skewed[-5:]) if batch_skewed else '✅ 0 skew'}\n"
+                    f"{'❌ Errors: ' + ', '.join(batch_errors[-5:]) if batch_errors else '✅ 0 erreurs'}"
+                )
 
     elapsed = int(time.time() - start_time)
     mins, secs = divmod(elapsed, 60)
+    m_status = "arrêtés (FreeTheAI épuisé)" if _freetheai_monthly_stop.is_set() else f"{total_months_gen} générés"
     _telegram(
         f"✅ *refresh_breakers terminé — {args.region} {args.lang.upper()}*\n"
-        f"{total} tickers · ⏱ {mins}m{secs:02d}s\n"
-        f"📰 +{total_new_arts} articles · 📅 {total_weeks_gen}W · 📆 {total_months_gen}M\n"
+        f"⏱ {mins}m{secs:02d}s\n"
+        f"📰 +{total_new_arts} articles · 📅 {total_weeks_gen}W · 📆 {total_months_gen}M ({m_status})\n"
         f"⚠ Skewed: {len(batch_skewed)} tickers\n"
         f"{'❌ Errors: ' + ', '.join(batch_errors) if batch_errors else '✅ 0 erreurs'}"
     )
-    logger.info(f"Done — {total} tickers · {mins}m{secs:02d}s · +{total_new_arts} arts · "
-                f"{total_weeks_gen}W · {total_months_gen}M · {len(batch_skewed)} skewed")
+    logger.info(
+        f"Done — {mins}m{secs:02d}s · +{total_new_arts} arts · "
+        f"{total_weeks_gen}W · {total_months_gen}M · {len(batch_skewed)} skewed"
+    )
 
 
 if __name__ == "__main__":

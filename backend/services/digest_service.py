@@ -1,8 +1,8 @@
 """
 Digest emails — Daily (18h30) & Weekly (vendredi 22h30).
 
-run_eod_digest_email()    : lit stock_news_cache (ai_summary_24h_en/fr) + articles 24h
-run_weekly_digest_email() : lit stock_news_cache (ai_summary_en/fr) + articles 7j (5 max)
+send_daily_digest()    : lit ow_cache (ai_summary_24h_en/fr) + articles 24h
+send_weekly_digest() : lit ow_cache (ai_summary_en/fr) + articles 7j (5 max)
 
 Langue par user : user_preferences.lang ('en' | 'fr', default 'fr').
 Zéro appel LLM — tout lu depuis le cache existant.
@@ -29,7 +29,7 @@ def _articles_window(supa, ticker: str, hours: int) -> list[dict]:
 
     raw = []
     for ym in sorted(year_months):
-        r = supa.table("articles_merged_finn_yahoo").select("articles") \
+        r = supa.table("articles").select("articles") \
             .eq("ticker", ticker).eq("year_month", ym).maybe_single().execute()
         if r and r.data and r.data.get("articles"):
             raw.extend(r.data["articles"])
@@ -47,7 +47,7 @@ def _ensure_fr_translations(supa, tickers: list[str], col_en: str, col_fr: str) 
     """Traduit les summaries EN→FR manquants avant snapshot. Écrit en DB."""
     from services.translation_service import translate_batch_to_fr
 
-    rows = supa.table("stock_news_cache").select(f"ticker, {col_en}, {col_fr}") \
+    rows = supa.table("ow_cache").select(f"ticker, {col_en}, {col_fr}") \
         .in_("ticker", tickers).execute()
 
     to_translate = [
@@ -63,7 +63,7 @@ def _ensure_fr_translations(supa, tickers: list[str], col_en: str, col_fr: str) 
         translated = translate_batch_to_fr(list(texts))
         for ticker, fr_text in zip(tickers_needed, translated):
             if fr_text:
-                supa.table("stock_news_cache").update({col_fr: fr_text}) \
+                supa.table("ow_cache").update({col_fr: fr_text}) \
                     .eq("ticker", ticker).execute()
         logger.info(f"Pre-digest FR translations: {len(tickers_needed)} tickers ({col_fr})")
     except Exception as e:
@@ -74,7 +74,7 @@ def _build_digests_daily(supa, tickers: list[str]) -> list[dict]:
     """Charge les données daily pour tous les tickers (les deux langues)."""
     result = []
     for ticker in tickers:
-        row = supa.table("stock_news_cache") \
+        row = supa.table("ow_cache") \
             .select("ai_summary_24h_en, ai_summary_24h_fr, ai_sentiment_24h") \
             .eq("ticker", ticker).maybe_single().execute()
         if not row or not row.data:
@@ -96,7 +96,7 @@ def _build_digests_weekly(supa, tickers: list[str]) -> list[dict]:
     """Charge les données weekly pour tous les tickers (les deux langues)."""
     result = []
     for ticker in tickers:
-        row = supa.table("stock_news_cache") \
+        row = supa.table("ow_cache") \
             .select("ai_summary_en, ai_summary_fr") \
             .eq("ticker", ticker).maybe_single().execute()
         if not row or not row.data:
@@ -161,8 +161,8 @@ def _send_emails(all_data: list[dict], supa, notify_field: str, period: str):
             logger.error(f"Email failed for user {uid}: {e}")
 
 
-def run_eod_digest_email():
-    """18h30 — envoie les digests daily depuis stock_news_cache."""
+def send_daily_digest():
+    """18h30 — envoie les digests daily depuis ow_cache."""
     supa = _get_supabase()
 
     pins = supa.table("pinned_stocks").select("ticker").execute()
@@ -181,8 +181,8 @@ def run_eod_digest_email():
     _send_emails(all_data, supa, notify_field="notify_email", period="daily")
 
 
-def run_weekly_digest_email():
-    """Vendredi 22h30 — envoie les digests weekly depuis stock_news_cache."""
+def send_weekly_digest():
+    """Vendredi 22h30 — envoie les digests weekly depuis ow_cache."""
     supa = _get_supabase()
 
     pins = supa.table("pinned_stocks").select("ticker").execute()

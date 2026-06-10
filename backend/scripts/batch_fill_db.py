@@ -227,7 +227,7 @@ def store_articles(ticker: str, articles: list[dict], source: str, supa):
     inserted = 0
     for ym, month_articles in by_month.items():
         # Lire existant pour dédupliquer
-        row = supa.table("articles_merged_finn_yahoo") \
+        row = supa.table("articles") \
             .select("articles") \
             .eq("ticker", ticker) \
             .eq("year_month", ym) \
@@ -243,7 +243,7 @@ def store_articles(ticker: str, articles: list[dict], source: str, supa):
 
         merged = sorted(existing + new_ones, key=lambda a: a.get("datetime", 0), reverse=True)[:50]
 
-        supa.table("articles_merged_finn_yahoo").upsert({
+        supa.table("articles").upsert({
             "ticker":     ticker,
             "year_month": ym,
             "articles":   merged,
@@ -335,7 +335,7 @@ def phase_enrich(tickers: list[str], region: str = "all"):
     Génère le news cache (24H + 7J summaries) pour chaque ticker.
     Respecte le concurrent limit FreeTheAI (séquentiel + délai).
     """
-    from services.overview_service import get_news
+    from services.overview_service import gen_ow_both
     from services.llm_service import GroqExhaustedError
 
     supa = _supa()
@@ -358,7 +358,7 @@ def phase_enrich(tickers: list[str], region: str = "all"):
     for i, ticker in enumerate(todo, 1):
         logger.info(f"[{i}/{total}] {ticker} — génération AI summary")
         try:
-            result = get_news(ticker)
+            result = gen_ow_both(ticker)
             summary_ok = bool(result.get("summary") or result.get("summary_24h"))
             src = result.get("llm_source", "unknown")
             batch_llm_sources[src] = batch_llm_sources.get(src, 0) + 1
@@ -373,7 +373,7 @@ def phase_enrich(tickers: list[str], region: str = "all"):
                 if raw_url:
                     domain = urlparse(raw_url).netloc.lstrip("www.")
                     if domain:
-                        supa.table("stock_news_cache").update({"website": domain}).eq("ticker", ticker).execute()
+                        supa.table("ow_cache").update({"website": domain}).eq("ticker", ticker).execute()
                         logger.info(f"  🌐 {ticker} → {domain}")
                 if info.get("regularMarketPrice") is None and info.get("currentPrice") is None:
                     delisted_tickers.append(ticker)
@@ -453,7 +453,7 @@ def phase_bubbles(tickers: list[str], region: str = "all"):
     Pré-génère event_causes pour les dots 6M+1Y de chaque ticker.
     Stable dans le temps — ne regénère pas si déjà en cache.
     """
-    from services.bubble_service import get_event_news
+    from services.bubble_service import get_or_gen_bub
 
     supa = _supa()
     progress = load_progress()
@@ -493,7 +493,7 @@ def phase_bubbles(tickers: list[str], region: str = "all"):
                     dt = dates[idx]
                     change_pct = (closes[idx] - closes[idx - 1]) / closes[idx - 1] * 100 if idx > 0 else 0.0
                     try:
-                        res = get_event_news(ticker, dt, round(change_pct, 2))
+                        res = get_or_gen_bub(ticker, dt, round(change_pct, 2))
                         if not res.get("articles"):
                             t_skipped.append(dt)
                             continue
@@ -586,7 +586,7 @@ def phase_translate_fr(tickers: list[str], region: str = "all"):
     # ── BUBBLES (event_causes) ─────────────────────────────────────────────────
     translated_bub = set(progress.get("translated_fr_bubbles", []))
 
-    cause_rows = supa.table("event_causes") \
+    cause_rows = supa.table("bub_cache") \
         .select("ticker, date, cause_en") \
         .in_("ticker", tickers) \
         .not_.is_("cause_en", "null") \
@@ -613,7 +613,7 @@ def phase_translate_fr(tickers: list[str], region: str = "all"):
             for ev in events:
                 try:
                     cause_fr = translate_to_fr(ev["cause_en"])
-                    supa.table("event_causes").update({"cause_fr": cause_fr}) \
+                    supa.table("bub_cache").update({"cause_fr": cause_fr}) \
                         .eq("ticker", ticker).eq("date", ev["date"]).execute()
                     bub_done += 1
                     logger.info(f"  ✓ {ticker} {ev['date']}")
@@ -640,9 +640,9 @@ def phase_translate_fr(tickers: list[str], region: str = "all"):
     from services.translation_service import translate_batch_to_fr
 
     for table, pk_fields, en_field in [
-        ("article_week_summaries",  ["year_month", "week_num"], "ai_summary"),
-        ("article_month_summaries", ["year_month"],             "ai_summary"),
-        ("article_year_summaries",  ["year"],                   "ai_summary"),
+        ("breaks_weekly",  ["year_month", "week_num"], "ai_summary"),
+        ("breaks_monthly", ["year_month"],             "ai_summary"),
+        ("breaks_yearly",  ["year"],                   "ai_summary"),
     ]:
         rows = supa.table(table) \
             .select(", ".join(["ticker"] + pk_fields + [en_field])) \
@@ -688,7 +688,7 @@ def phase_translate_fr_dumb(tickers: list[str], region: str = "all"):
     progress = load_progress()
     translated = set(progress.get("translated_fr_dumb", []))
 
-    rows = supa.table("stock_news_cache") \
+    rows = supa.table("ow_cache") \
         .select("ticker, news_raw") \
         .in_("ticker", tickers) \
         .not_.is_("news_raw", "null") \
@@ -739,7 +739,7 @@ def phase_translate_fr_dumb(tickers: list[str], region: str = "all"):
                 for idx, fr_text in zip(chunk_indices, translations):
                     articles[idx]["brutalised_fr"] = fr_text
 
-            supa.table("stock_news_cache").update({"news_raw": articles}).eq("ticker", ticker).execute()
+            supa.table("ow_cache").update({"news_raw": articles}).eq("ticker", ticker).execute()
             total_articles += len(to_translate)
             logger.info(f"  ✓ {ticker} ({len(to_translate)} articles traduits)")
             progress.setdefault("translated_fr_dumb", []).append(ticker)

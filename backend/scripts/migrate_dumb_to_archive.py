@@ -62,7 +62,7 @@ def main():
     supa = _supa()
 
     print("Chargement news_raw depuis stock_news_cache...")
-    cache_rows = _fetch_all(supa, "stock_news_cache", "ticker,news_raw")
+    cache_rows = _fetch_all(supa, "ow_cache", "ticker,news_raw")
 
     # Garder seulement les tickers avec au moins 1 dumb dans news_raw
     tickers_with_dumb = {

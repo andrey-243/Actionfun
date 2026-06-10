@@ -12,7 +12,7 @@ Enregistre tous les routers (/api/stock, /api/news, /api/search, /api/events,
   - monthly 1er 4h  : condensation monthly calendaire
   - yearly 1er jan  : condensation yearly summaries
   - re-enrich 22h30 : re-process records Groq → FreeTheAI
-  - purge lun 3h    : event_causes > 1 an
+  - purge lun 3h    : bub_cache > 1 an
 """
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -58,7 +58,7 @@ async def lifespan(app: FastAPI):
         id="daily_digest_email",
     )
     scheduler.add_job(
-        _run_weekly_digest_email,
+        _send_weekly_digest,
         trigger="cron",
         day_of_week="sat",
         hour=7,
@@ -66,49 +66,49 @@ async def lifespan(app: FastAPI):
         id="weekly_digest_email",
     )
     scheduler.add_job(
-        _run_weekly_condensation,
+        _gen_breaks_weekly,
         trigger="cron",
         day_of_week="mon",
         hour=3,
         minute=30,
-        id="weekly_condensation",
+        id="gen_breaks_weekly",
     )
     scheduler.add_job(
-        _run_monthly_condensation,
+        _gen_breaks_monthly,
         trigger="cron",
         day=1,
         hour=4,
         minute=0,
-        id="monthly_condensation",
+        id="gen_breaks_monthly",
     )
     scheduler.add_job(
-        _run_yearly_condensation,
+        _gen_breaks_yearly,
         trigger="cron",
         month=1,
         day=1,
         hour=5,
         minute=0,
-        id="yearly_condensation",
+        id="gen_breaks_yearly",
     )
     scheduler.add_job(
-        _run_yahoo_accumulation,
+        _yahoo_articles_scrap,
         trigger="cron",
         hour="*/3",
         minute=0,
-        id="yahoo_accumulation",
+        id="yahoo_articles_scrap",
     )
     scheduler.add_job(
-        _run_finnhub_refresh,
+        _finnhub_articles_scrap,
         trigger="cron",
         hour="*/6",
         minute=30,
-        id="finnhub_refresh",
+        id="finnhub_articles_scrap",
     )
     scheduler.add_job(
-        _run_hourly_news_refresh,
+        _hourly_ow_regen,
         trigger="cron",
         minute=15,
-        id="hourly_news_refresh",
+        id="hourly_ow_regen",
     )
     scheduler.add_job(
         _run_cold_start_translate_fr,
@@ -118,90 +118,90 @@ async def lifespan(app: FastAPI):
         id="cold_start_translate_fr",
     )
     scheduler.add_job(
-        _run_reenrich,
+        _reenrich_groq_to_better,
         trigger="cron",
         hour=22,
         minute=30,
-        id="reenrich_groq_to_freetheai",
+        id="reenrich_groq_to_better",
     )
     scheduler.start()
-    logger.info("Crons démarrés — daily digest 18h30, weekly digest ven 22h30, weekly lun 3h30, monthly 1er 4h, yearly 1er jan 5h, yahoo */3h, finnhub */6h, cold_start FR 19h, re-enrich 22h30, hourly_news :15")
+    logger.info("Crons démarrés — daily_digest 19h15, weekly_digest sam 7h, gen_breaks_weekly lun 3h30, gen_breaks_monthly 1er 4h, gen_breaks_yearly 1er jan 5h, yahoo_articles_scrap */3h, finnhub_articles_scrap */6h, cold_start_translate_fr 19h, reenrich_groq_to_better 22h30, hourly_ow_regen :15")
     yield
     scheduler.shutdown()
 
 
 def _run_digest_email():
     import time
-    from services.digest_service import run_eod_digest_email
+    from services.digest_service import send_daily_digest
     _tg("▶ *Daily Digest (1J) — envoi email* (18h30)")
     t = time.time()
     try:
-        run_eod_digest_email()
+        send_daily_digest()
         _tg(f"✅ *Daily Digest (1J) — email envoyé* ({int(time.time()-t)}s)")
     except Exception as e:
         logger.error(f"Daily digest email failed: {e}")
         _tg(f"❌ *Daily Digest (1J) — email* : `{e}`")
 
 
-def _run_weekly_digest_email():
+def _send_weekly_digest():
     import time
-    from services.digest_service import run_weekly_digest_email
+    from services.digest_service import send_weekly_digest
     _tg("▶ *Weekly Digest (7J) — envoi email* (sam 7h)")
     t = time.time()
     try:
-        run_weekly_digest_email()
+        send_weekly_digest()
         _tg(f"✅ *Weekly Digest (7J) — email envoyé* (sam 7h · {int(time.time()-t)}s)")
     except Exception as e:
         logger.error(f"Weekly digest email failed: {e}")
         _tg(f"❌ *Weekly Digest (7J) — email* : `{e}`")
 
 
-def _run_weekly_condensation():
+def _gen_breaks_weekly():
     import time
-    from services.breakers_articles_service import run_weekly_condensation
+    from services.breakers_articles_service import gen_breaks_weekly
     _tg("▶ *Weekly condensation* (lun 3h30)")
     t = time.time()
     try:
-        run_weekly_condensation()
+        gen_breaks_weekly()
         _tg(f"✅ *Weekly condensation terminée* ({int(time.time()-t)}s)")
     except Exception as e:
         logger.error(f"Weekly condensation failed: {e}")
         _tg(f"❌ *Weekly condensation* : `{e}`")
 
 
-def _run_monthly_condensation():
+def _gen_breaks_monthly():
     import time
-    from services.breakers_articles_service import run_monthly_condensation
+    from services.breakers_articles_service import gen_breaks_monthly
     _tg("▶ *Monthly condensation* (1er du mois 4h)")
     t = time.time()
     try:
-        run_monthly_condensation()
+        gen_breaks_monthly()
         _tg(f"✅ *Monthly condensation terminée* ({int(time.time()-t)}s)")
     except Exception as e:
         logger.error(f"Monthly condensation failed: {e}")
         _tg(f"❌ *Monthly condensation* : `{e}`")
 
 
-def _run_yearly_condensation():
+def _gen_breaks_yearly():
     import time
-    from services.breakers_articles_service import run_yearly_condensation
+    from services.breakers_articles_service import gen_breaks_yearly
     _tg("▶ *Yearly condensation* (1er jan 5h)")
     t = time.time()
     try:
-        run_yearly_condensation()
+        gen_breaks_yearly()
         _tg(f"✅ *Yearly condensation terminée* ({int(time.time()-t)}s)")
     except Exception as e:
         logger.error(f"Yearly condensation failed: {e}")
         _tg(f"❌ *Yearly condensation* : `{e}`")
 
 
-def _run_yahoo_accumulation():
+def _yahoo_articles_scrap():
     import time
-    from services.breakers_articles_service import run_yahoo_accumulation
+    from services.breakers_articles_service import yahoo_articles_scrap
     _tg("▶ *Yahoo accumulation* (*/3h)")
     t = time.time()
     try:
-        results = run_yahoo_accumulation()
+        results = yahoo_articles_scrap()
         detail = " · ".join(f"{tk} +{n}" for tk, n in sorted(results.items())) if results else "0 nouveaux articles"
         _tg(f"✅ *Yahoo accumulation terminée* ({int(time.time()-t)}s)\n{detail}")
     except Exception as e:
@@ -209,13 +209,13 @@ def _run_yahoo_accumulation():
         _tg(f"❌ *Yahoo accumulation* : `{e}`")
 
 
-def _run_finnhub_refresh():
+def _finnhub_articles_scrap():
     import time
-    from services.breakers_articles_service import run_finnhub_refresh
+    from services.breakers_articles_service import finnhub_articles_scrap
     _tg("▶ *Finnhub refresh* (*/6h)")
     t = time.time()
     try:
-        results = run_finnhub_refresh()
+        results = finnhub_articles_scrap()
         detail = " · ".join(f"{tk} {n}" for tk, n in sorted(results.items())) if results else "aucun ticker"
         _tg(f"✅ *Finnhub refresh terminé* ({int(time.time()-t)}s)\n{detail}")
     except Exception as e:
@@ -223,27 +223,27 @@ def _run_finnhub_refresh():
         _tg(f"❌ *Finnhub refresh* : `{e}`")
 
 
-def _run_reenrich():
+def _reenrich_groq_to_better():
     import time
-    from services.reenrich_service import run_reenrich
+    from services.reenrich_service import reenrich_groq_to_better
     _tg("▶ *Re-enrich Groq→FreeTheAI* (22h30)")
     t = time.time()
     try:
-        run_reenrich()
+        reenrich_groq_to_better()
         _tg(f"✅ *Re-enrich terminé* ({int(time.time()-t)}s)")
     except Exception as e:
         logger.error(f"Re-enrich failed: {e}")
         _tg(f"❌ *Re-enrich* : `{e}`")
 
 
-def _run_hourly_news_refresh():
-    from services.overview_service import run_hourly_news_refresh
+def _hourly_ow_regen():
+    from services.overview_service import hourly_ow_regen
     try:
-        refreshed = run_hourly_news_refresh()
+        refreshed = hourly_ow_regen()
         if refreshed:
             from datetime import datetime, timezone
             now_utc = datetime.now(timezone.utc).strftime("%H:%M UTC")
-            _tg(f"✅ *News refresh* — {' · '.join(sorted(refreshed))} sortis du pool no\\_news · {now_utc} · 📍 cron `hourly_news_refresh` (:15)")
+            _tg(f"✅ *News refresh* — {' · '.join(sorted(refreshed))} sortis du pool no\\_news · {now_utc} · 📍 cron `hourly_ow_regen` (:15)")
     except Exception as e:
         logger.error(f"Hourly news refresh failed: {e}")
         _tg(f"❌ *Hourly news refresh* (:15) : `{e}`")
@@ -271,10 +271,10 @@ def _purge_old_digests():
     try:
         supa = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
         cutoff_1y = (date.today() - timedelta(days=365)).isoformat()
-        r2 = supa.table("event_causes").delete().lt("date", cutoff_1y).execute()
+        r2 = supa.table("bub_cache").delete().lt("date", cutoff_1y).execute()
         n2 = len(r2.data or [])
-        logger.info(f"Purge event_causes > 1 an : {n2} rows supprimées")
-        _tg(f"✅ *Purge DB terminée* ({int(time.time()-t)}s)\nevent_causes: {n2}")
+        logger.info(f"Purge bub_cache > 1 an : {n2} rows supprimées")
+        _tg(f"✅ *Purge DB terminée* ({int(time.time()-t)}s)\nbub_cache: {n2}")
     except Exception as e:
         logger.error(f"Purge failed: {e}")
         _tg(f"❌ *Purge DB* : `{e}`")

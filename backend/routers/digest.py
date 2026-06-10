@@ -2,8 +2,8 @@
 GET /api/weekly/{ticker}  → OW 7J + articles 7j pour la page "Mes news"
 
 Lit depuis :
-  - stock_news_cache (même OW 7J que la page stock + cached_at + website)
-  - articles_merged_finn_yahoo (articles 7j bruts, normalisés)
+  - ow_cache (même OW 7J que la page stock + cached_at + website)
+  - articles (articles 7j bruts, normalisés)
 Zéro appel LLM à la volée.
 """
 from fastapi import APIRouter, HTTPException
@@ -25,7 +25,7 @@ def _articles_from_archive(supa, ticker: str, hours: int = 48) -> list[dict]:
 
     raw = []
     for ym in sorted(year_months):
-        r = supa.table("articles_merged_finn_yahoo").select("articles") \
+        r = supa.table("articles").select("articles") \
             .eq("ticker", ticker).eq("year_month", ym).maybe_single().execute()
         if r and r.data and r.data.get("articles"):
             raw.extend(r.data["articles"])
@@ -47,7 +47,7 @@ def _articles_from_archive(supa, ticker: str, hours: int = 48) -> list[dict]:
 
 
 def _week_articles_from_archive(supa, ticker: str, company_name: str = "") -> list[dict]:
-    """Retourne les articles de articles_merged_finn_yahoo des 7 derniers jours, triés desc."""
+    """Retourne les articles de articles des 7 derniers jours, triés desc."""
     raw = _articles_from_archive(supa, ticker, hours=7 * 24)
     return [
         {
@@ -69,7 +69,7 @@ async def weekly(ticker: str):
         supa = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
         t = ticker.upper()
 
-        cache = supa.table("stock_news_cache") \
+        cache = supa.table("ow_cache") \
             .select("ai_summary_en, ai_summary_fr, cached_at, website") \
             .eq("ticker", t).maybe_single().execute()
         row = (cache.data or {}) if cache and cache.data else {}
