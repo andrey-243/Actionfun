@@ -344,7 +344,7 @@ def _bench_context_line(ctx: dict, lang: str) -> str:
 
 def _brutalise(ticker: str, articles: list[dict], stock_context: str = "", lang: str = "fr", cascade: str = "default") -> dict:
     """Call lourd — abrutis par article + OW 7J."""
-    articles_text = "\n\n".join(f"[{i}] {a['title']}\n{a['summary']}" for i, a in enumerate(articles))
+    articles_text = "\n\n".join(f"[{i}] {a.get('title') or a.get('headline', '')}\n{a.get('summary', '')}" for i, a in enumerate(articles))
     prompt = (BRUTALIZE_PROMPT_EN if lang == "en" else BRUTALIZE_PROMPT).format(
         ticker=ticker, stock_context=stock_context, count=len(articles), articles_text=articles_text,
     )

@@ -398,6 +398,20 @@ def _fmt(idx):
 
 ---
 
+## 2026-06-11 · gen_dumb(cutoff_days=35) — KeyError 'title' dans _brutalise
+
+**Symptôme** : `✗ ECL: 'title'` / `✗ IFF: 'title'` — fix_missing DUMB MISS échouait silencieusement.
+
+**Cause** : `_fetch_news` normalise les articles et renomme `headline` → `title`. Quand `cutoff_days != 7`, `gen_dumb` bypasse `_fetch_news` et fetch les articles bruts depuis la table `articles` (JSONB) — ces articles gardent `headline`. `_brutalise` accédait à `a['title']` → KeyError.
+
+**Fix** : `_brutalise` utilise `a.get('title') or a.get('headline', '')` — couvre les deux formats.
+
+**Règle** : Les articles bruts DB ont `headline`. Les articles normalisés par `_fetch_news` ont `title`. Ne jamais accéder à `a['title']` sans fallback `a.get('headline')`.
+
+**Fichier** : `services/overview_service.py` — `_brutalise()`.
+
+---
+
 ## 2026-05-31 · Nouveau champ upsert Supabase — colonne manquante en DB
 
 **Symptôme** : `PGRST204 — Could not find the 'articles_hash' column of 'stock_news_cache' in the schema cache` → 500 sur `/api/news/{ticker}` → "Failed to fetch" côté frontend.
