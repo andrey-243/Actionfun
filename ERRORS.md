@@ -4,6 +4,13 @@ _Format : date · contexte · symptôme · cause · fix_
 
 ---
 
+## Règles de travail Claude
+
+- **Jamais de `git push`** sans confirmation explicite dans le message courant. Commit seul ne vaut pas autorisation de push.
+- **Jamais de `Co-Authored-By: Claude`** dans les messages de commit.
+
+---
+
 ## 2026-06-04 · digest — Management API 404 sur auth/users/{uid}
 
 **Symptôme** : `_send_emails` appelait `https://api.supabase.com/v1/projects/{ref}/auth/users/{uid}` pour récupérer l'email — 404 systématique. Aucun email envoyé, aucun log d'erreur visible (le `except` catchait silencieusement).

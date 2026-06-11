@@ -159,81 +159,89 @@ def _send_weekly_digest():
 def _gen_breaks_weekly():
     import time
     from services.breakers_articles_service import gen_breaks_weekly
-    _tg("▶ *Weekly condensation* (lun 3h30)")
+    _tg("▶ *Breaks weekly — gen* (lun 3h30)")
     t = time.time()
     try:
-        gen_breaks_weekly()
-        _tg(f"✅ *Weekly condensation terminée* ({int(time.time()-t)}s)")
+        r = gen_breaks_weekly()
+        llm = " · ".join(f"{k}:{v}" for k, v in r["llm"].items()) if r["llm"] else "—"
+        _tg(f"✅ *Breaks weekly — gen* ({int(time.time()-t)}s)\ndone:{r['done']} p2:{r['p2_done']} skip:{r['skipped']} err:{r['errors']} | {llm}")
     except Exception as e:
-        logger.error(f"Weekly condensation failed: {e}")
-        _tg(f"❌ *Weekly condensation* : `{e}`")
+        logger.error(f"Breaks weekly gen failed: {e}")
+        _tg(f"❌ *Breaks weekly — gen* : `{e}`")
 
 
 def _gen_breaks_monthly():
     import time
     from services.breakers_articles_service import gen_breaks_monthly
-    _tg("▶ *Monthly condensation* (1er du mois 4h)")
+    _tg("▶ *Breaks monthly — gen* (1er du mois 4h)")
     t = time.time()
     try:
-        gen_breaks_monthly()
-        _tg(f"✅ *Monthly condensation terminée* ({int(time.time()-t)}s)")
+        r = gen_breaks_monthly()
+        llm = " · ".join(f"{k}:{v}" for k, v in r["llm"].items()) if r["llm"] else "—"
+        _tg(f"✅ *Breaks monthly — gen* ({int(time.time()-t)}s)\ndone:{r['done']} skip:{r['skipped']} err:{r['errors']} | {llm}")
     except Exception as e:
-        logger.error(f"Monthly condensation failed: {e}")
-        _tg(f"❌ *Monthly condensation* : `{e}`")
+        logger.error(f"Breaks monthly gen failed: {e}")
+        _tg(f"❌ *Breaks monthly — gen* : `{e}`")
 
 
 def _gen_breaks_yearly():
     import time
     from services.breakers_articles_service import gen_breaks_yearly
-    _tg("▶ *Yearly condensation* (1er jan 5h)")
+    _tg("▶ *Breaks yearly — gen* (1er jan 5h)")
     t = time.time()
     try:
-        gen_breaks_yearly()
-        _tg(f"✅ *Yearly condensation terminée* ({int(time.time()-t)}s)")
+        r = gen_breaks_yearly()
+        llm = " · ".join(f"{k}:{v}" for k, v in r["llm"].items()) if r["llm"] else "—"
+        _tg(f"✅ *Breaks yearly — gen* ({int(time.time()-t)}s)\ndone:{r['done']} skip:{r['skipped']} err:{r['errors']} | {llm}")
     except Exception as e:
-        logger.error(f"Yearly condensation failed: {e}")
-        _tg(f"❌ *Yearly condensation* : `{e}`")
+        logger.error(f"Breaks yearly gen failed: {e}")
+        _tg(f"❌ *Breaks yearly — gen* : `{e}`")
 
 
 def _yahoo_articles_scrap():
     import time
     from services.breakers_articles_service import yahoo_articles_scrap
-    _tg("▶ *Yahoo accumulation* (*/3h)")
+    _tg("▶ *Yahoo — scrap + OW regen* (*/3h)")
     t = time.time()
     try:
         results = yahoo_articles_scrap()
-        detail = " · ".join(f"{tk} +{n}" for tk, n in sorted(results.items())) if results else "0 nouveaux articles"
-        _tg(f"✅ *Yahoo accumulation terminée* ({int(time.time()-t)}s)\n{detail}")
+        n_tickers = len(results)
+        n_articles = sum(results.values())
+        detail = " · ".join(f"{tk} +{n}" for tk, n in sorted(results.items())) if results else "rien de nouveau"
+        _tg(f"✅ *Yahoo — scrap + OW regen* ({int(time.time()-t)}s)\n{n_tickers} tickers · {n_articles} articles\n{detail}")
     except Exception as e:
-        logger.error(f"Yahoo accumulation failed: {e}")
-        _tg(f"❌ *Yahoo accumulation* : `{e}`")
+        logger.error(f"Yahoo articles scrap failed: {e}")
+        _tg(f"❌ *Yahoo — scrap + OW regen* : `{e}`")
 
 
 def _finnhub_articles_scrap():
     import time
     from services.breakers_articles_service import finnhub_articles_scrap
-    _tg("▶ *Finnhub refresh* (*/6h)")
+    _tg("▶ *Finnhub — scrap + OW regen* (*/6h)")
     t = time.time()
     try:
         results = finnhub_articles_scrap()
-        detail = " · ".join(f"{tk} {n}" for tk, n in sorted(results.items())) if results else "aucun ticker"
-        _tg(f"✅ *Finnhub refresh terminé* ({int(time.time()-t)}s)\n{detail}")
+        n_tickers = len(results)
+        n_articles = sum(results.values())
+        detail = " · ".join(f"{tk} {n}" for tk, n in sorted(results.items())) if results else "rien de nouveau"
+        _tg(f"✅ *Finnhub — scrap + OW regen* ({int(time.time()-t)}s)\n{n_tickers} tickers · {n_articles} articles\n{detail}")
     except Exception as e:
-        logger.error(f"Finnhub refresh failed: {e}")
-        _tg(f"❌ *Finnhub refresh* : `{e}`")
+        logger.error(f"Finnhub articles scrap failed: {e}")
+        _tg(f"❌ *Finnhub — scrap + OW regen* : `{e}`")
 
 
 def _reenrich_groq_to_better():
     import time
     from services.reenrich_service import reenrich_groq_to_better
-    _tg("▶ *Re-enrich Groq→FreeTheAI* (22h30)")
+    _tg("▶ *Re-enrich — Groq → Better* (22h30)")
     t = time.time()
     try:
-        reenrich_groq_to_better()
-        _tg(f"✅ *Re-enrich terminé* ({int(time.time()-t)}s)")
+        r = reenrich_groq_to_better()
+        stopped = f" | ⚠ stopped at {r['stopped_at']}" if r["stopped_at"] else ""
+        _tg(f"✅ *Re-enrich — Groq → Better* ({int(time.time()-t)}s)\now_cache:{r['ow_cache']} weekly:{r['weekly']} monthly:{r['monthly']}{stopped}")
     except Exception as e:
         logger.error(f"Re-enrich failed: {e}")
-        _tg(f"❌ *Re-enrich* : `{e}`")
+        _tg(f"❌ *Re-enrich — Groq → Better* : `{e}`")
 
 
 def _hourly_ow_regen():

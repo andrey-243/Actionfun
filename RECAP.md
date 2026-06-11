@@ -378,6 +378,17 @@ RLS activé sur toutes les tables. `service_role` a GRANT ALL explicite.
 
 **Règle** : Toute nouvelle table nécessite `GRANT ... TO authenticated` en plus des RLS policies.
 
+**Project ref** : `qxfbqzjkianxsuurgckd` · URL : `https://qxfbqzjkianxsuurgckd.supabase.co`
+Management token : `backend/.env` → `SUPABASE_MANAGEMENT_TOKEN`
+
+DDL direct (CREATE TABLE, ALTER, etc.) :
+```bash
+curl -s -X POST "https://api.supabase.com/v1/projects/qxfbqzjkianxsuurgckd/database/query" \
+  -H "Authorization: Bearer $(grep SUPABASE_MANAGEMENT_TOKEN backend/.env | cut -d= -f2)" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "<SQL>"}'
+```
+
 **Cold start — phases & timings :**
 
 | Phase | Contenu | ETA estimé | Banner |

@@ -607,19 +607,23 @@ def _llm_call(prompt: str, max_tokens: int = 400, allow_groq: bool = True, item_
 _llm_call._last_source = None
 
 
-def gen_breaks_weekly():
+def gen_breaks_weekly() -> dict:
     """
     Lundi 3h : condense les semaines terminées de la semaine passée.
     Seuil : ticker pinné par ≥ 1 user.
+    Retourne {"done": n, "p2_done": n, "skipped": n, "errors": n, "llm": {source: count}}.
     """
     supa = _get_supabase()
     today = date.today()
+
+    done, skipped, errors = 0, 0, 0
+    llm_counts: dict = {}
 
     # Tickers éligibles (≥ 1 user)
     eligible = _get_eligible_tickers(supa, min_users=1)
     if not eligible:
         logger.info("Weekly condensation: no eligible tickers")
-        return
+        return {"done": 0, "p2_done": 0, "skipped": 0, "errors": 0, "llm": {}}
 
     # On condense la semaine terminée : la semaine passée dans le mois précédent ou actuel
     # Calcul : semaine actuelle = week_num d'aujourd'hui, on condense week_num - 1
@@ -649,6 +653,7 @@ def gen_breaks_weekly():
             .maybe_single() \
             .execute()
         if exists.data:
+            skipped += 1
             continue
 
         # Récupérer les articles de ce mois
@@ -659,6 +664,7 @@ def gen_breaks_weekly():
             .maybe_single() \
             .execute()
         if not row.data:
+            skipped += 1
             continue
 
         # Filtrer par semaine
@@ -668,6 +674,7 @@ def gen_breaks_weekly():
             if _week_num(datetime.fromtimestamp(a.get("datetime", 0), tz=timezone.utc).day) == target_wnum
         ]
         if not week_articles:
+            skipped += 1
             continue
 
         try:
@@ -689,10 +696,14 @@ def gen_breaks_weekly():
                 "llm_source":    _llm_call._last_source,
                 "condensed_at":  datetime.now(timezone.utc).isoformat(),
             }).execute()
+            src = _llm_call._last_source or "unknown"
+            llm_counts[src] = llm_counts.get(src, 0) + 1
+            done += 1
             logger.info(f"  ✓ Weekly {ticker} {target_ym} W{target_wnum} ({len(week_articles)} articles)")
             # Purger les weeklies excédentaires (max 5)
             _purge_excess_weeklies(ticker, supa, max_weeks=5)
         except Exception as e:
+            errors += 1
             logger.error(f"  ✗ Weekly {ticker} {target_ym} W{target_wnum}: {e}")
 
     # Pool 2: générer la semaine courante pour tous les tickers pinnés sans summary
@@ -700,6 +711,7 @@ def gen_breaks_weekly():
     current_ym = f"{now.year:04d}-{now.month:02d}"
     current_wnum = _week_num(now.day)
     all_pinned = _get_eligible_tickers(supa, min_users=1)
+    p2_done = 0
 
     logger.info(f"Weekly Pool2: semaine courante {current_ym} W{current_wnum} pour {len(all_pinned)} tickers")
     for ticker in all_pinned:
@@ -715,24 +727,34 @@ def gen_breaks_weekly():
                 continue
             result = get_weekly_ondemand(ticker)
             if result:
+                src = _llm_call._last_source or "unknown"
+                llm_counts[src] = llm_counts.get(src, 0) + 1
+                p2_done += 1
                 logger.info(f"  ✓ Pool2 {ticker} {current_ym} W{current_wnum}")
         except Exception as e:
+            errors += 1
             logger.error(f"  ✗ Pool2 {ticker}: {e}")
 
+    return {"done": done, "p2_done": p2_done, "skipped": skipped, "errors": errors, "llm": llm_counts}
 
-def gen_breaks_monthly():
+
+def gen_breaks_monthly() -> dict:
     """
     1er du mois à 4h : condense le mois terminé depuis les weekly summaries.
     Si les weekly summaries n'existent pas, condense depuis raw.
     Seuil : ticker pinné par ≥ 3 users.
+    Retourne {"done": n, "skipped": n, "errors": n, "llm": {source: count}}.
     """
     supa = _get_supabase()
     today = date.today()
 
+    done, skipped, errors = 0, 0, 0
+    llm_counts: dict = {}
+
     eligible = _get_eligible_tickers(supa, min_users=3)
     if not eligible:
         logger.info("Monthly condensation: no eligible tickers")
-        return
+        return {"done": 0, "skipped": 0, "errors": 0, "llm": {}}
 
     # Mois à condenser : le mois précédent
     target_month = today.month - 1
@@ -752,6 +774,7 @@ def gen_breaks_monthly():
             .maybe_single() \
             .execute()
         if exists.data:
+            skipped += 1
             continue
 
         try:
@@ -785,6 +808,7 @@ def gen_breaks_monthly():
                     .maybe_single() \
                     .execute()
                 if not row.data or not row.data["articles"]:
+                    skipped += 1
                     continue
                 raw = row.data["articles"]
                 article_count = len(raw)
@@ -803,23 +827,33 @@ def gen_breaks_monthly():
                 "llm_source":    _llm_call._last_source,
                 "condensed_at":  datetime.now(timezone.utc).isoformat(),
             }).execute()
+            src = _llm_call._last_source or "unknown"
+            llm_counts[src] = llm_counts.get(src, 0) + 1
+            done += 1
             logger.info(f"  ✓ Monthly {ticker} {target_ym} ({article_count} articles)")
         except Exception as e:
+            errors += 1
             logger.error(f"  ✗ Monthly {ticker} {target_ym}: {e}")
 
+    return {"done": done, "skipped": skipped, "errors": errors, "llm": llm_counts}
 
-def gen_breaks_yearly():
+
+def gen_breaks_yearly() -> dict:
     """
     1er janvier à 5h : condense l'année terminée depuis les monthly summaries.
     Seuil : ticker pinné par ≥ 3 users.
+    Retourne {"done": n, "skipped": n, "errors": n, "llm": {source: count}}.
     """
     supa = _get_supabase()
     today = date.today()
     target_year = str(today.year - 1)
 
+    done, skipped, errors = 0, 0, 0
+    llm_counts: dict = {}
+
     eligible = _get_eligible_tickers(supa, min_users=3)
     if not eligible:
-        return
+        return {"done": 0, "skipped": 0, "errors": 0, "llm": {}}
 
     logger.info(f"Yearly condensation: {target_year} for {len(eligible)} tickers")
 
@@ -831,6 +865,7 @@ def gen_breaks_yearly():
             .maybe_single() \
             .execute()
         if exists.data:
+            skipped += 1
             continue
 
         month_rows = supa.table("breaks_monthly") \
@@ -841,7 +876,8 @@ def gen_breaks_yearly():
             .execute()
 
         if not month_rows.data or len(month_rows.data) < 6:
-            continue  # Pas assez de data pour une année complète
+            skipped += 1
+            continue
 
         try:
             src_col = "ai_summary_en" if _lang() == "en" else "ai_summary_fr"
@@ -862,6 +898,9 @@ def gen_breaks_yearly():
                 "llm_source":   _llm_call._last_source,
                 "condensed_at": datetime.now(timezone.utc).isoformat(),
             }).execute()
+            src = _llm_call._last_source or "unknown"
+            llm_counts[src] = llm_counts.get(src, 0) + 1
+            done += 1
             logger.info(f"  ✓ Yearly {ticker} {target_year}")
 
             # Purger les monthly calendaires de l'année générée
@@ -873,7 +912,10 @@ def gen_breaks_yearly():
             logger.info(f"  Purged monthly summaries {ticker} {target_year}")
 
         except Exception as e:
+            errors += 1
             logger.error(f"  ✗ Yearly {ticker} {target_year}: {e}")
+
+    return {"done": done, "skipped": skipped, "errors": errors, "llm": llm_counts}
 
 
 def yahoo_articles_scrap() -> dict[str, int]:

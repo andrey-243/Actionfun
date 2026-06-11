@@ -23,35 +23,32 @@ def _supa():
     return create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
 
 
-def reenrich_groq_to_better():
+def reenrich_groq_to_better() -> dict:
     """
     Point d'entrée cron 22h30.
     Re-enrichit dans l'ordre : ow_cache → breaks_weekly → breaks_monthly.
     S'arrête dès que FreeTheAI n'est plus dispo.
+    Retourne {"ow_cache": n, "weekly": n, "monthly": n, "stopped_at": str|None}.
     """
     os.environ["BATCH_MODE"] = "1"
     os.environ["LLM_LANG"] = "en"
 
     supa = _supa()
-    total = 0
-    failed = 0
-
     logger.info("[reenrich] Démarrage re-enrich Groq → FreeTheAI")
 
-    # 1. ow_cache — ai_summary générés par Groq
-    if not _reenrich_ow_cache_groq_to_better(supa):
-        logger.info(f"[reenrich] FreeTheAI quota atteint sur ow_cache — stop. {total} re-enrichis.")
-        return
+    ok, n_ow = _reenrich_ow_cache_groq_to_better(supa)
+    if not ok:
+        logger.info(f"[reenrich] FreeTheAI quota atteint sur ow_cache — stop. {n_ow} re-enrichis.")
+        return {"ow_cache": n_ow, "weekly": 0, "monthly": 0, "stopped_at": "ow_cache"}
 
-    # 2. breaks_weekly
-    if not _reenrich_break_weekly_groq_to_better(supa):
+    ok, n_weekly = _reenrich_break_weekly_groq_to_better(supa)
+    if not ok:
         logger.info(f"[reenrich] FreeTheAI quota atteint sur breaks_weekly — stop.")
-        return
+        return {"ow_cache": n_ow, "weekly": n_weekly, "monthly": 0, "stopped_at": "breaks_weekly"}
 
-    # 3. breaks_monthly
-    _reenrich_break_monthly_groq_to_better(supa)
-
-    logger.info(f"[reenrich] Terminé.")
+    _, n_monthly = _reenrich_break_monthly_groq_to_better(supa)
+    logger.info(f"[reenrich] Terminé. ow_cache={n_ow} weekly={n_weekly} monthly={n_monthly}")
+    return {"ow_cache": n_ow, "weekly": n_weekly, "monthly": n_monthly, "stopped_at": None}
 
 
 def _freetheai_ok() -> bool:
@@ -60,8 +57,8 @@ def _freetheai_ok() -> bool:
     return _freetheai_available()
 
 
-def _reenrich_ow_cache_groq_to_better(supa) -> bool:
-    """Re-enrichit ow_cache. Retourne False si FreeTheAI quota atteint."""
+def _reenrich_ow_cache_groq_to_better(supa) -> tuple[bool, int]:
+    """Re-enrichit ow_cache. Retourne (True, n) si terminé, (False, n) si quota atteint."""
     rows = (
         supa.table("ow_cache")
         .select("ticker, generated_by_fr, generated_by_en")
@@ -70,29 +67,29 @@ def _reenrich_ow_cache_groq_to_better(supa) -> bool:
         .execute()
     )
     if not rows.data:
-        return True
+        return True, 0
 
-    logger.info(f"[reenrich] news_cache: {len(rows.data)} tickers à re-enrichir (Groq ou EN manquant)")
-
+    logger.info(f"[reenrich] ow_cache: {len(rows.data)} tickers à re-enrichir (Groq ou EN manquant)")
+    done = 0
     for row in rows.data:
         if not _freetheai_ok():
-            return False
+            return False, done
         ticker = row["ticker"]
         try:
             from services.overview_service import gen_ow_both
             gen_ow_both(ticker)
-            logger.info(f"[reenrich] ✓ news_cache {ticker}")
+            done += 1
+            logger.info(f"[reenrich] ✓ ow_cache {ticker}")
         except RuntimeError:
-            # BATCH_MODE → FreeTheAI down → stop
-            return False
+            return False, done
         except Exception as e:
-            logger.warning(f"[reenrich] ✗ news_cache {ticker}: {e}")
+            logger.warning(f"[reenrich] ✗ ow_cache {ticker}: {e}")
 
-    return True
+    return True, done
 
 
-def _reenrich_break_weekly_groq_to_better(supa) -> bool:
-    """Re-enrichit breaks_weekly. Retourne False si FreeTheAI quota atteint."""
+def _reenrich_break_weekly_groq_to_better(supa) -> tuple[bool, int]:
+    """Re-enrichit breaks_weekly. Retourne (True, n) si terminé, (False, n) si quota atteint."""
     rows = (
         supa.table("breaks_weekly")
         .select("ticker, year_month, week_num, top_articles, article_count")
@@ -101,7 +98,7 @@ def _reenrich_break_weekly_groq_to_better(supa) -> bool:
         .execute()
     )
     if not rows.data:
-        return True
+        return True, 0
 
     logger.info(f"[reenrich] weekly: {len(rows.data)} semaines à re-enrichir (Groq ou EN manquant)")
 
@@ -109,9 +106,10 @@ def _reenrich_break_weekly_groq_to_better(supa) -> bool:
         _llm_call, WEEK_CONDENSE_PROMPT_EN, _week_label, _summary_col,
     )
 
+    done = 0
     for row in rows.data:
         if not _freetheai_ok():
-            return False
+            return False, done
         ticker = row["ticker"]
         ym = row["year_month"]
         wnum = row["week_num"]
@@ -128,17 +126,18 @@ def _reenrich_break_weekly_groq_to_better(supa) -> bool:
                 "llm_source": _llm_call._last_source,
                 "condensed_at": datetime.now(timezone.utc).isoformat(),
             }).eq("ticker", ticker).eq("year_month", ym).eq("week_num", wnum).execute()
+            done += 1
             logger.info(f"[reenrich] ✓ weekly {ticker} {ym} W{wnum}")
         except RuntimeError:
-            return False
+            return False, done
         except Exception as e:
             logger.warning(f"[reenrich] ✗ weekly {ticker} {ym} W{wnum}: {e}")
 
-    return True
+    return True, done
 
 
-def _reenrich_break_monthly_groq_to_better(supa) -> bool:
-    """Re-enrichit breaks_monthly. Retourne False si FreeTheAI quota atteint."""
+def _reenrich_break_monthly_groq_to_better(supa) -> tuple[bool, int]:
+    """Re-enrichit breaks_monthly. Retourne (True, n) si terminé, (False, n) si quota atteint."""
     rows = (
         supa.table("breaks_monthly")
         .select("ticker, year_month, article_count")
@@ -147,7 +146,7 @@ def _reenrich_break_monthly_groq_to_better(supa) -> bool:
         .execute()
     )
     if not rows.data:
-        return True
+        return True, 0
 
     logger.info(f"[reenrich] monthly: {len(rows.data)} mois Groq à re-enrichir")
 
@@ -155,13 +154,13 @@ def _reenrich_break_monthly_groq_to_better(supa) -> bool:
         _llm_call, MONTH_CONDENSE_PROMPT_EN, _month_label, _summary_col,
     )
 
+    done = 0
     for row in rows.data:
         if not _freetheai_ok():
-            return False
+            return False, done
         ticker = row["ticker"]
         ym = row["year_month"]
         try:
-            # Récupérer les weeklies pour reconstruire le monthly
             week_rows = (
                 supa.table("breaks_weekly")
                 .select("week_num, ai_summary_en, ai_summary")
@@ -185,10 +184,11 @@ def _reenrich_break_monthly_groq_to_better(supa) -> bool:
                 "llm_source": _llm_call._last_source,
                 "condensed_at": datetime.now(timezone.utc).isoformat(),
             }).eq("ticker", ticker).eq("year_month", ym).execute()
+            done += 1
             logger.info(f"[reenrich] ✓ monthly {ticker} {ym}")
         except RuntimeError:
-            return False
+            return False, done
         except Exception as e:
             logger.warning(f"[reenrich] ✗ monthly {ticker} {ym}: {e}")
 
-    return True
+    return True, done
