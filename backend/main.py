@@ -124,8 +124,14 @@ async def lifespan(app: FastAPI):
         minute=30,
         id="reenrich_groq_to_better",
     )
+    scheduler.add_job(
+        _reenrich_retry,
+        trigger="cron",
+        minute=35,
+        id="reenrich_retry",
+    )
     scheduler.start()
-    logger.info("Crons démarrés — daily_digest 19h15, weekly_digest sam 7h, gen_breaks_weekly lun 3h30, gen_breaks_monthly 1er 4h, gen_breaks_yearly 1er jan 5h, yahoo_articles_scrap */3h, finnhub_articles_scrap */6h, cold_start_translate_fr 19h, reenrich_groq_to_better 22h30, hourly_ow_regen :15")
+    logger.info("Crons démarrés — daily_digest 19h15, weekly_digest sam 7h, gen_breaks_weekly lun 3h30, gen_breaks_monthly 1er 4h, gen_breaks_yearly 1er jan 5h, yahoo_articles_scrap */3h, finnhub_articles_scrap */6h, cold_start_translate_fr 19h, reenrich_groq_to_better 22h30, reenrich_retry :35 (pending), hourly_ow_regen :15")
     yield
     scheduler.shutdown()
 
@@ -230,18 +236,57 @@ def _finnhub_articles_scrap():
         _tg(f"❌ *Finnhub — scrap + OW regen* : `{e}`")
 
 
-def _reenrich_groq_to_better():
+_reenrich_pending: bool = False
+
+
+def _run_reenrich(label: str):
+    """Lance reenrich_groq_to_better, met à jour _reenrich_pending. Retourne True si terminé."""
+    global _reenrich_pending
     import time
     from services.reenrich_service import reenrich_groq_to_better
-    _tg("▶ *Re-enrich — Groq → Better* (22h30)")
+    _tg(f"▶ *Re-enrich — Groq → Better* ({label})")
     t = time.time()
     try:
         r = reenrich_groq_to_better()
-        stopped = f" | ⚠ stopped at {r['stopped_at']}" if r["stopped_at"] else ""
-        _tg(f"✅ *Re-enrich — Groq → Better* ({int(time.time()-t)}s)\now_cache:{r['ow_cache']} weekly:{r['weekly']} monthly:{r['monthly']}{stopped}")
+        elapsed = int(time.time() - t)
+        if r["stopped_at"]:
+            _reenrich_pending = True
+            _tg(f"⏸ *Re-enrich* stoppé à `{r['stopped_at']}` ({elapsed}s) — retry à 2h+")
+            return False
+        _reenrich_pending = False
+        _tg(f"✅ *Re-enrich* ({elapsed}s) ow_cache:{r['ow_cache']} weekly:{r['weekly']} monthly:{r['monthly']}")
+        return True
     except Exception as e:
+        _reenrich_pending = True
         logger.error(f"Re-enrich failed: {e}")
-        _tg(f"❌ *Re-enrich — Groq → Better* : `{e}`")
+        _tg(f"❌ *Re-enrich* : `{e}` — retry à 2h+")
+        return False
+
+
+def _reenrich_groq_to_better():
+    global _reenrich_pending
+    from services.reenrich_service import _freetheai_ok
+    if not _freetheai_ok():
+        _reenrich_pending = True
+        _tg("⏸ *Re-enrich* — FreeTheAI indisponible à 22h30. Retry à partir de 2h.")
+        return
+    _run_reenrich("22h30")
+
+
+def _reenrich_retry():
+    """Tourne toutes les heures (:35). Agit uniquement si _reenrich_pending et heure >= 2h."""
+    global _reenrich_pending
+    if not _reenrich_pending:
+        return
+    from datetime import datetime
+    from services.reenrich_service import _freetheai_ok
+    now = datetime.now()
+    if now.hour < 2:
+        return  # freeze jusqu'à 2h du matin
+    if not _freetheai_ok():
+        logger.info(f"[reenrich_retry] FreeTheAI indisponible à {now.strftime('%Hh%M')} — retry dans 1h")
+        return  # freeze 1h naturel (prochain :35)
+    _run_reenrich(f"retry {now.strftime('%Hh%M')}")
 
 
 def _hourly_ow_regen():
