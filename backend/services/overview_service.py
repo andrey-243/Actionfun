@@ -451,18 +451,39 @@ def _write_dumb_to_archive(ticker: str, articles: list[dict], lang: str, supa) -
 
 # ─── Brutalise standalone — appelé par les crons dès nouveaux articles ────────
 
-def gen_dumb(ticker: str, lang: str = None, cascade: str = "default") -> int:
+def gen_dumb(ticker: str, lang: str = None, cascade: str = "default", cutoff_days: int = 7) -> int:
     """
     Génère dumb_en/fr pour tous les articles sans DUMB dans articles.
     Appelé par les crons Yahoo/Finnhub immédiatement après détection de nouveaux articles,
     indépendamment de la regen OW.
+    cutoff_days : fenêtre en jours depuis maintenant (défaut 7j). Passer 35 pour la fenêtre display www.
     Retourne le nombre d'articles brutalised.
     """
     lang = lang or os.environ.get("LLM_LANG", "en")
     dumb_field = "dumb_en" if lang == "en" else "dumb_fr"
     supa = _get_supabase()
 
-    fresh_articles, _ = _fetch_news(ticker)
+    if cutoff_days == 7:
+        fresh_articles, _ = _fetch_news(ticker)
+    else:
+        # Fenêtre custom : query directe sans passer par _fetch_news (hardcodé 7j)
+        now = datetime.now(timezone.utc)
+        cutoff_ts = int((now - timedelta(days=cutoff_days)).timestamp())
+        year_months: set[str] = set()
+        for d in range(0, cutoff_days + 7, 28):
+            ym = (now - timedelta(days=d)).strftime("%Y-%m")
+            year_months.add(ym)
+        raw: list[dict] = []
+        for ym in sorted(year_months):
+            r = supa.table("articles").select("articles") \
+                .eq("ticker", ticker).eq("year_month", ym).maybe_single().execute()
+            if r and r.data and r.data.get("articles"):
+                raw.extend(r.data["articles"])
+        fresh_articles = [
+            a for a in raw
+            if (a.get("datetime") or 0) >= cutoff_ts and (a.get("summary") or "").strip()
+        ]
+
     to_brutalise = [a for a in fresh_articles[:30] if not a.get(dumb_field)]
     if not to_brutalise:
         return 0

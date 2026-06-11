@@ -112,6 +112,8 @@ stock_app/
 │   ├── scripts/
 │   │   ├── batch_fill_db.py
 │   │   ├── refresh_breakers.py
+│   │   ├── fix_checkpoint_from_db.py   ← audit checkpoint vs DB · 5 catégories
+│   │   ├── fix_missing.py              ← répare DUMB/W/M manquants sans full batch
 │   │   ├── break_view_resume.py
 │   │   ├── refetch_finnhub.py
 │   │   ├── sync_progress.py
@@ -151,7 +153,7 @@ stock_app/
 |---|---|---|
 | `gen_ow_both()` | DUMB: `dumb_prod` Gemini→Hapuppy→Groq · OW 24H: `ow24h_prod` Gemini→Hapuppy · OW 7J: `ow7j_prod` FreeTheAI→Hapuppy | — |
 | `get_or_refresh_ow_both()` | → appelle `gen_ow_both()` si stale | — |
-| `gen_dumb()` | `dumb_prod` Gemini→Hapuppy→Groq | `dumb_scrap` Gemini→Groq→Hapuppy |
+| `gen_dumb(cutoff_days=7)` | `dumb_prod` Gemini→Hapuppy→Groq | `dumb_scrap` Groq→Hapuppy. `cutoff_days` : fenêtre articles (7j prod/crons · 35j batch fix scripts) |
 | `read_breaks_by_period()` | Lit `breaks_weekly/monthly/yearly` + `articles` | idem |
 | `read_breaks_periods_available()` | Lit `breaks_monthly/yearly` | idem |
 | `gen_breaks_weekly()` | `weekly_prod` Hapuppy→Gemini | `weekly_scrap` Hapuppy seul |
@@ -700,6 +702,49 @@ Threshold bubbles_done = 8 causes non-null.
 
 **Notifs TG batch** : `parse_mode: HTML` (Markdown v1 causait des 400 sur les underscores/accents). Conversion `*bold*` → `<b>bold</b>` et `_italic_` → `<i>italic</i>` dans `_telegram()`.
 
+**Checkpoint repair** — `backend/scripts/fix_checkpoint_from_db.py`
+
+Analyse la DB et catégorise les tickers `done` selon ce qui manque. Adaptable par région et date.
+
+```bash
+python scripts/fix_checkpoint_from_db.py --region US --lang en --dry-run
+python scripts/fix_checkpoint_from_db.py --region EU --lang en --dry-run
+python scripts/fix_checkpoint_from_db.py --region US --lang en --month 2026-06 --week-start 2026-06-09
+```
+
+Catégories détectées et actions checkpoint :
+- **RESCRAP** : aucun article ce mois → retiré de `done` + `legacy` + `monthly_done`
+- **W MISS** : articles ok mais breaks_weekly manquants → retiré de `done`
+- **DUMB MISS** : articles ok, weeklies ok, dumb_en manquants cette semaine → ajouté à `legacy` (reste dans `done`)
+- **W MISS + DUMB** : les deux → retiré de `done` + ajouté à `legacy`
+- **MONTHLY MISS** : pas de row dans `breaks_monthly` pour le mois courant → retiré de `monthly_done`
+
+**Fenêtres** :
+- Mois courant : `--month` (défaut : mois en cours)
+- Semaine DUMB : `--week-start` (défaut : lundi courant) — articles filtrés depuis ce lundi uniquement
+- Articles "faux ce mois" : filtrés par timestamp réel (`month_start <= datetime < month_end`), pas par `year_month` du row — évite les articles d'un batch débordant sur le mois stockés sous le mauvais `year_month`
+
+**Script ciblé** — `backend/scripts/fix_missing.py`
+
+Exécute uniquement les étapes manquantes par catégorie, sans passer par le full Flow AB.
+
+```bash
+python scripts/fix_missing.py --region US --lang en --dry-run
+python scripts/fix_missing.py --region EU --lang en
+python scripts/fix_missing.py --region US --lang en --month 2026-06 --week-start 2026-06-09
+```
+
+Catégories et actions :
+- **RESCRAP** → retire de `done`, message : lancer `refresh_breakers.py` manuellement
+- **W MISS** → scrap + `gen_dumb(cutoff_days=35)` + `gen_weekly` (semaines manquantes seulement)
+- **DUMB MISS** → scrap + `gen_dumb(cutoff_days=35)` ; retire de `legacy` si succès
+- **W+DUMB** → scrap + `gen_dumb(cutoff_days=35)` + `gen_weekly`
+- **MONTHLY MISS** → `gen_monthly` (weeklies si ≥3, sinon raw) ; ajoute à `monthly_done` si succès
+
+**`gen_dumb(cutoff_days=35)`** : fenêtre élargie pour couvrir les articles du mois entier en affichage (35j = max display window). Par défaut `cutoff_days=7` — comportement inchangé pour tous les appelants prod/crons.
+
+---
+
 **Script one-shot websites** : `backend/scripts/populate_websites.py`
 ```bash
 python scripts/populate_websites.py            # tous les tickers en ow_cache
@@ -766,8 +811,8 @@ python scripts/populate_websites.py --ticker AMZN
 | 1 | Bubbles 6M+1Y | US | ✅ |
 | 2 | Bubbles 6M+1Y | EU | ✅ |
 | 3 | Bubbles 6M+1Y | ASIA | ✅ (208 tickers · 2136 bubbles · 2026-06-03) |
-| 4 | Breakers weekly+monthly EN | US | ✅ (2026-06-09) |
-| 5 | Breakers weekly+monthly EN | EU | 🔄 en cours — `refresh_breakers.py --region EU --lang en` |
+| 4 | Breakers weekly+monthly EN | US | ✅ (2026-06-09) · checkpoint réparé 2026-06-11 (fix_checkpoint_from_db) |
+| 5 | Breakers weekly+monthly EN | EU | 🔄 en cours — checkpoint réparé 2026-06-11 · fix_missing à lancer |
 | 6 | Breakers weekly+monthly EN | ASIA | ⏳ |
 | 7 | Breakers weekly+monthly FR | US+EU+ASIA | ⏳ après migration colonnes `_fr` |
 | — | OW enrich (ai_summary_en) | EU · ASIA | ⏭ skip — se remplit via cron 3h + reenrich 22h30 |
@@ -838,3 +883,4 @@ python scripts/populate_websites.py --ticker AMZN
 | AI Overview toggle FR/EN | 🔜 | EN par défaut · toggle FR dans profile |
 | LLM5 routing par complexité | ⬜ | Calls légers → modèle rapide |
 | FE1 ArticleDrawer lien direct | ⬜ | `window.open(url)` si pas de `dumb_en/dumb_fr` |
+| Stocker `week_num` dans les articles JSONB | ⬜ | Calculer `(day-1)//7+1` au moment du merge dans `articles` — évite de recalculer depuis `datetime` à chaque fois (checkpoint, scripts) |
