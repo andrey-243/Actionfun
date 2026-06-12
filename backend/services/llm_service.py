@@ -313,12 +313,12 @@ def _try_gemini(payload_base: dict, timeout: int, trail: list[str]) -> dict | No
             }
         if r.status_code == 429:
             err = str(r.json()).lower()
-            if any(k in err for k in ("quota", "daily", "per_day", "exhausted")):
+            if any(k in err for k in ("daily", "per_day", "per_day_free_tier")):
                 _gemini_daily_exhausted = True
                 trail.append("Gemini : ✗ 429 quota daily épuisé")
             else:
-                _gemini_ratelimit_until = time.monotonic() + 60
-                trail.append("Gemini : ✗ 429 rate-limit (backoff 60s)")
+                _gemini_ratelimit_until = time.monotonic() + 90
+                trail.append("Gemini : ✗ 429 rate-limit (backoff 90s)")
             return None
         if r.status_code in (400, 403):
             _gemini_bad_key = True
@@ -345,13 +345,12 @@ def llm_call(
     cascade: str = "default",
 ) -> dict:
     """
-    Appel LLM avec cascade FreeTheAI → ZenithAI → Hapuppy → Groq.
+    Appel LLM avec cascade selon le mode.
 
-    cascade:
-      "default"        : cascade complète (FreeTheAI → Zenith → Hapuppy → Groq)
-      "monthly_scrap" : FreeTheAI seulement — raise FreeTheAIExhaustedError si daily/checkin
-      "weekly_scrap"   : Hapuppy seulement — raise si Hapuppy down
-      "dumb_scrap"     : Groq → Hapuppy (skip FreeTheAI + Zenith)
+    Prod  : ow24h → Gemini → Hapuppy | dumb → Gemini → Hapuppy → Groq
+            bub/weekly → Hapuppy → Gemini | ow7j → Hapuppy
+            monthly → FreeTheAI → Hapuppy | yearly → FreeTheAI
+    Scrap : weekly → Gemini → Hapuppy | dumb → Groq → Hapuppy | monthly → FreeTheAI
 
     Retourne le dict OpenAI complet (choices[0].message.content accessible).
     """
@@ -379,7 +378,7 @@ def llm_call(
 
     # ── FreeTheAI ──────────────────────────────────────────────────────────────
     # _freetheai_available() acquiert _freetheai_semaphore(1) si dispo — relâché en fin de bloc
-    if cascade not in ("weekly_scrap", "dumb_scrap") and freetheai_key and _freetheai_available():
+    if cascade in ("monthly_prod", "yearly_prod", "monthly_scrap") and freetheai_key and _freetheai_available():
         _freetheai_tried = True
         global _freetheai_fail_count, _freetheai_fail_freeze_until
         global _freetheai_429_count, _freetheai_429_freeze_until
@@ -448,7 +447,7 @@ def llm_call(
                 _freetheai_fail_freeze_until = time.monotonic() + FREETHEAI_FAIL_FREEZE_SECONDS
                 _freetheai_fail_count = 0
                 _send_cascade_notif("freetheai_down_frozen", trail, caller)
-    elif cascade not in ("weekly_scrap", "dumb_scrap"):
+    elif cascade in ("monthly_prod", "yearly_prod", "monthly_scrap"):
         trail.append("FreeTheAI : ⏭ skipped (checkin/quota/RPM/circuit breaker)")
 
     # monthly_scrap : ne jamais fallback vers d'autres providers
@@ -521,15 +520,15 @@ def llm_call(
     groq_reason = "openai_down"
 
     # ── Gemini — position "early" (ow24h, dumb_prod, dumb_scrap : avant Hapuppy) ──
-    if cascade in ("ow24h_prod", "dumb_prod", "dumb_scrap"):
+    if cascade in ("ow24h_prod", "dumb_prod", "weekly_scrap"):
         result = _try_gemini(payload_base, timeout, trail)
         if result:
             return result
 
-    # ── Hapuppy gpt-4.1-mini (cascade default + weekly_scrap, pas dumb_scrap) ───────
+    # ── Hapuppy gpt-4.1-mini ──────────────────────────────────────────────────────
     hapuppy_key = (
         os.environ.get("HAPUPPY_API_KEY", "")
-        if cascade in ("default", "weekly_scrap", "bub_prod", "ow7j_prod", "ow24h_prod", "weekly_prod", "monthly_prod", "dumb_prod") and os.environ.get("HAPUPPY_ENABLED", "1") != "0"
+        if cascade in ("default", "weekly_scrap", "hapuppy_only", "bub_prod", "ow7j_prod", "ow24h_prod", "weekly_prod", "monthly_prod", "dumb_prod") and os.environ.get("HAPUPPY_ENABLED", "1") != "0"
         else ""
     )
     if hapuppy_key:
@@ -650,9 +649,9 @@ def llm_call(
                         f"Hapuppy reset ~{_hap_dt.strftime('%Hh%M')} Paris · FreeTheAI reset {_fte_utc}.")
         _send_cascade_notif("both_quota", trail, caller, header_override=_both_header)
 
-    # weekly_scrap : on s'arrête ici (Groq pas autorisé)
-    if cascade == "weekly_scrap":
-        raise RuntimeError("LLM unavailable — weekly_scrap cascade exhausted")
+    # weekly_scrap / hapuppy_only : on s'arrête ici (Groq pas autorisé)
+    if cascade in ("weekly_scrap", "hapuppy_only"):
+        raise RuntimeError(f"LLM unavailable — {cascade} cascade exhausted")
 
     # ── Gemini — position "late" (bub, weekly_prod : après Hapuppy) ──────────────
     if cascade in ("bub_prod", "weekly_prod"):
@@ -761,7 +760,7 @@ def llm_call(
                 _send_cascade_notif("all_failed", trail, caller, item_id=item_id)
                 raise
 
-    # dumb_scrap : Groq a échoué → Hapuppy comme fallback
+    # dumb_scrap : Groq a échoué → Hapuppy comme fallback (sans Gemini)
     if cascade == "dumb_scrap":
         trail.append("Groq ✗ dumb_scrap → Hapuppy fallback")
         return llm_call(
@@ -774,7 +773,7 @@ def llm_call(
             allow_groq=False,
             caller=caller,
             item_id=item_id,
-            cascade="weekly_scrap",
+            cascade="hapuppy_only",
         )
 
     raise RuntimeError("LLM unreachable after all retries")

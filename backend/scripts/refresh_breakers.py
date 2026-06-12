@@ -96,6 +96,17 @@ def _supa():
     return create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
 
 
+def _exec(query, retries: int = 2):
+    """Retry Supabase .execute() on transient HTTP/2 server disconnects."""
+    for attempt in range(retries + 1):
+        try:
+            return query.execute()
+        except httpx.RemoteProtocolError:
+            if attempt == retries:
+                raise
+            time.sleep(0.3 * (attempt + 1))
+
+
 # ─── Checkpoint ───────────────────────────────────────────────────────────────
 
 def _checkpoint_path(region: str, lang: str) -> Path:
@@ -254,12 +265,11 @@ def _scrape_and_upsert(ticker: str, year_month: str, supa) -> int:
     if not new_articles:
         return 0
 
-    row = supa.table("articles") \
+    row = _exec(supa.table("articles") \
         .select("articles, source") \
         .eq("ticker", ticker) \
         .eq("year_month", year_month) \
-        .limit(1) \
-        .execute()
+        .limit(1))
 
     existing_row = row.data[0] if row.data else {}
     existing = existing_row.get("articles") or []
@@ -271,12 +281,12 @@ def _scrape_and_upsert(ticker: str, year_month: str, supa) -> int:
         return 0
 
     new_source = "mixed" if existing_source == "finnhub" else "yahoo"
-    supa.table("articles").upsert({
+    _exec(supa.table("articles").upsert({
         "ticker":     ticker,
         "year_month": year_month,
         "articles":   merged,
         "source":     new_source,
-    }).execute()
+    }))
     return added
 
 
@@ -290,12 +300,11 @@ def _detect_finn_skew(ticker: str, months: list[str], supa) -> tuple[bool, int]:
     week_totals: dict[int, int] = defaultdict(int)
 
     for ym in months:
-        row = supa.table("articles") \
+        row = _exec(supa.table("articles") \
             .select("articles") \
             .eq("ticker", ticker) \
             .eq("year_month", ym) \
-            .limit(1) \
-            .execute()
+            .limit(1))
         if not row.data:
             continue
         for a in (row.data[0].get("articles") or []):
@@ -408,7 +417,7 @@ def _gen_weekly(ticker: str, year_month: str, week_num: int,
         summary, src = _llm_call(_week_prompt(ticker, label, articles_text), max_tokens=400, cascade="weekly_scrap")
         sc = _summary_col()
         top = sorted(articles, key=lambda x: x.get("datetime", 0), reverse=True)[:10]
-        supa.table("breaks_weekly").upsert({
+        _exec(supa.table("breaks_weekly").upsert({
             "ticker":        ticker,
             "year_month":    year_month,
             "week_num":      week_num,
@@ -417,7 +426,7 @@ def _gen_weekly(ticker: str, year_month: str, week_num: int,
             "article_count": len(articles),
             "llm_source":    src,
             "condensed_at":  datetime.now(timezone.utc).isoformat(),
-        }).execute()
+        }))
         logger.info(f"  ✓ W {ticker} {year_month} W{week_num} ({len(articles)} arts) [{src}]")
         return src
     except Exception as e:
@@ -440,23 +449,21 @@ def _process_weeklies(ticker: str, finn_skewed: bool, cluster_wnum: int,
 
         # Déjà existant ? (sauf si force_regen)
         if not force_regen:
-            exists = supa.table("breaks_weekly") \
+            exists = _exec(supa.table("breaks_weekly") \
                 .select("week_num") \
                 .eq("ticker", ticker) \
                 .eq("year_month", year_month) \
                 .eq("week_num", week_num) \
-                .limit(1) \
-                .execute()
+                .limit(1))
             if exists.data:
                 continue
 
         # Charger les articles de cette semaine
-        row = supa.table("articles") \
+        row = _exec(supa.table("articles") \
             .select("articles") \
             .eq("ticker", ticker) \
             .eq("year_month", year_month) \
-            .limit(1) \
-            .execute()
+            .limit(1))
         if not row.data:
             continue
 
@@ -483,12 +490,11 @@ def _process_weeklies(ticker: str, finn_skewed: bool, cluster_wnum: int,
 
 def _gen_monthly_from_raw(ticker: str, year_month: str, supa) -> str | None | bool:
     """str=succès · None=skip (pas de data) · False=échec LLM."""
-    row = supa.table("articles") \
+    row = _exec(supa.table("articles") \
         .select("articles") \
         .eq("ticker", ticker) \
         .eq("year_month", year_month) \
-        .limit(1) \
-        .execute()
+        .limit(1))
     if not row.data:
         return None
     raw = row.data[0].get("articles") or []
@@ -500,14 +506,14 @@ def _gen_monthly_from_raw(ticker: str, year_month: str, supa) -> str | None | bo
     try:
         summary, src = _llm_call(_month_prompt(ticker, label, articles_text), max_tokens=500, cascade="monthly_scrap")
         sc = _summary_col()
-        supa.table("breaks_monthly").upsert({
+        _exec(supa.table("breaks_monthly").upsert({
             "ticker":        ticker,
             "year_month":    year_month,
             sc:              summary,
             "article_count": len(raw),
             "llm_source":    src,
             "condensed_at":  datetime.now(timezone.utc).isoformat(),
-        }).execute()
+        }))
         logger.info(f"  ✓ M {ticker} {year_month} raw ({len(raw)} arts) [{src}]")
         return src
     except Exception as e:
@@ -527,14 +533,14 @@ def _gen_monthly_from_weeklies(ticker: str, year_month: str,
     label = _month_label(year_month)
     try:
         summary, src = _llm_call(_month_prompt(ticker, label, weeks_text), max_tokens=500, cascade="monthly_scrap")
-        supa.table("breaks_monthly").upsert({
+        _exec(supa.table("breaks_monthly").upsert({
             "ticker":        ticker,
             "year_month":    year_month,
             sc:              summary,
             "article_count": article_count,
             "llm_source":    src,
             "condensed_at":  datetime.now(timezone.utc).isoformat(),
-        }).execute()
+        }))
         logger.info(f"  ✓ M {ticker} {year_month} weeklies ({len(week_rows)} W) [{src}]")
         return src
     except Exception as e:
@@ -560,12 +566,11 @@ def _process_monthlies(ticker: str, finn_skewed: bool,
 
         # Déjà existant ? (sauf si force_regen)
         if not force_regen:
-            exists = supa.table("breaks_monthly") \
+            exists = _exec(supa.table("breaks_monthly") \
                 .select("year_month") \
                 .eq("ticker", ticker) \
                 .eq("year_month", year_month) \
-                .limit(1) \
-                .execute()
+                .limit(1))
             if exists.data:
                 continue
 
@@ -573,12 +578,11 @@ def _process_monthlies(ticker: str, finn_skewed: bool,
             if finn_skewed:
                 src = _gen_monthly_from_raw(ticker, year_month, supa)
             else:
-                week_rows = supa.table("breaks_weekly") \
+                week_rows = _exec(supa.table("breaks_weekly") \
                     .select("week_num, ai_summary, ai_summary_en, article_count") \
                     .eq("ticker", ticker) \
                     .eq("year_month", year_month) \
-                    .order("week_num") \
-                    .execute()
+                    .order("week_num"))
 
                 if week_rows.data and len(week_rows.data) >= 3:
                     src = _gen_monthly_from_weeklies(ticker, year_month, week_rows.data, supa)
