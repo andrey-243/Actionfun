@@ -125,6 +125,8 @@ def get_or_gen_bub(ticker: str, date: str, change_pct: float = 0.0, cascade: str
         year_months.add(cursor.strftime("%Y-%m"))
         cursor = (cursor.replace(day=28) + timedelta(days=4)).replace(day=1)
 
+    _r2_enabled = bool(os.environ.get("R2_ENDPOINT_URL"))
+
     raw_articles: list[dict] = []
     for ym in sorted(year_months):
         r = supa.table("articles") \
@@ -134,7 +136,16 @@ def get_or_gen_bub(ticker: str, date: str, change_pct: float = 0.0, cascade: str
             .maybe_single() \
             .execute()
         if r and r.data and r.data.get("articles"):
-            raw_articles.extend(r.data["articles"])
+            ym_articles = r.data["articles"]
+            if _r2_enabled and ym_articles and not ym_articles[0].get("summary"):
+                try:
+                    from services.r2_articles import fetch_heavy, merge_heavy_into_articles
+                    heavy = fetch_heavy(ticker, ym)
+                    if heavy:
+                        ym_articles = merge_heavy_into_articles(ym_articles, heavy)
+                except Exception:
+                    pass
+            raw_articles.extend(ym_articles)
 
     articles = [
         {
