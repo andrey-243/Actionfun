@@ -432,3 +432,341 @@ httpx.post(f'https://api.supabase.com/v1/projects/{ref}/database/query',
 ```
 
 **Règle** : Quand on ajoute un champ à un upsert Supabase, créer la colonne DB en même temps (`ALTER TABLE ... ADD COLUMN IF NOT EXISTS`). Ne pas laisser la migration DB pour après.
+
+---
+
+## 2026-06-12 · llm_service — `_gemini_daily_exhausted` levé sur 429 RPM
+
+**Symptôme** : Après quelques 429 consécutifs sur Gemini (RPM), `_gemini_daily_exhausted=True` était posé en mémoire → Gemini skipé pour toute la session, même après restart VPN. Redémarrage du process requis pour récupérer Gemini.
+
+**Cause** : La vérification `_gemini_daily_exhausted` cherchait `"exhausted"` dans le message d'erreur Google. Google retourne `"RESOURCE_EXHAUSTED"` pour les 429 RPM → le keyword matchait → flag daily posé à tort.
+
+**Fix** : Keywords réduits à `("daily", "per_day", "per_day_free_tier")` — ne matchent que la vraie limite daily (500 RPD), pas les erreurs RPM.
+
+**Fichier** : `services/llm_service.py` — `_try_gemini()`.
+
+---
+
+## 2026-06-12 · llm_service — Gemini throttle absent + 3x429 sans freeze
+
+**Symptôme** : Gemini recevait des requêtes en rafale depuis les workers ThreadPoolExecutor → 429 RPM en boucle. RECAP mentionnait un min_interval de 6.5s mais rien n'était implémenté. Pas de mécanisme de freeze non plus après plusieurs 429 consécutifs.
+
+**Cause** : Throttle et freeze jamais codés malgré la note RECAP.
+
+**Fix** :
+- `threading.Lock(_gemini_lock)` + `GEMINI_MIN_INTERVAL=4.1s` — sérialise les appels Gemini entre workers. Sleep sorti du `with` pour ne pas bloquer tous les threads pendant l'attente.
+- `_gemini_consecutive_429` + `_gemini_freeze_until` : après 3× 429 RPM consécutifs → freeze jusqu'à minuit UTC. Probe 1h après expiry (si OK → reset ; sinon → +1h). Reset à 0 sur succès.
+- Notif TG `gemini_frozen` déclenchée à la pose du freeze.
+
+**Règle** : Sleep à l'intérieur d'un Lock bloque tous les autres threads qui attendent ce Lock — toujours sortir le sleep du bloc `with`.
+
+**Fichier** : `services/llm_service.py` — `_try_gemini()`, globals `_gemini_lock/_gemini_last_call/_gemini_freeze_until/_gemini_consecutive_429`.
+
+---
+
+## 2026-06-12 · llm_service — `_freetheai_exhausted` permanent bloquait monthly_scrap après VPN reset
+
+**Symptôme** : Après restart VPN (nouvelle IP), Flow M (`monthly_scrap`) ne tentait plus FreeTheAI — aucun call visible dans les logs, même après restart Python du batch.
+
+**Cause** : `_freetheai_exhausted` était un flag booléen permanent posé en mémoire et jamais réinitialisé dans la session. L'early-exit `monthly_scrap` vérifiait ce flag → skip systématique.
+
+**Fix** : Remplacé par `_freetheai_skip_until: datetime | None`. L'early-exit `monthly_scrap` vérifie `_freetheai_skip_until is not None and datetime.now(utc) < _freetheai_skip_until` — expiré après le délai configuré. Reset naturel sans restart.
+
+**Fichier** : `services/llm_service.py` — early-exit `monthly_scrap`, variable `_freetheai_skip_until`.
+
+---
+
+## 2026-06-12 · llm_service — Hapuppy 403 freeze agressif même sur erreurs RPM
+
+**Symptôme** : Hapuppy recevait un 403, freezait immédiatement jusqu'à 18h Paris — même si la cause était un rate-limit RPM et non un quota épuisé. Hapuppy est en crédits illimités : un 403 peut être un simple RPM.
+
+**Cause** : Code précédent freezait sur tout 403 sans lire le body.
+
+**Fix** : À la réception d'un 403, lire le body et vérifier les `_HAPUPPY_QUOTA_KEYWORDS`. Si keywords présents → freeze 18h. Sinon → backoff 12s (RPM, retry possible).
+
+**Fichier** : `services/llm_service.py` — bloc Hapuppy dans `_try_hapuppy()`.
+
+---
+
+## 2026-06-12 · refresh_breakers — Ctrl+C bloquant malgré except KeyboardInterrupt
+
+**Symptôme** : Ctrl+C pendant le batch → traceback `KeyboardInterrupt` dans `t.join()` → deuxième Ctrl+C requis → checkpoint jamais sauvegardé.
+
+**Cause** : Les executors étaient dans un `with ThreadPoolExecutor(...) as ex:`. Quand `KeyboardInterrupt` est levé à l'intérieur, Python appelle `__exit__` qui appelle `shutdown(wait=True)` → bloque sur `t.join()` en attendant que les threads sleeping terminent → deuxième Ctrl+C interrompt ce join → le `except KeyboardInterrupt` n'est jamais atteint.
+
+**Fix** : Créer les executors hors du `with` (`ex_ab = ThreadPoolExecutor(...)`). Dans `except KeyboardInterrupt` : `ex_ab.shutdown(wait=False, cancel_futures=True)` + `_save_checkpoint()` + `os._exit(0)`. Dans `else` (chemin normal) : `ex_ab.shutdown(wait=False)` (futures déjà terminées).
+
+**Règle** : Ne jamais utiliser `with ThreadPoolExecutor` quand un handler Ctrl+C propre est requis — `__exit__` appelle `shutdown(wait=True)` inconditionnellement.
+
+**Fichier** : `scripts/refresh_breakers.py` — boucle `as_completed` + handler `KeyboardInterrupt`.
+
+---
+
+## 2026-06-12 · refresh_breakers — `_build_state_from_db` : 0 M générés pour tickers sans articles
+
+**Symptôme** : `--phase m` avec VPN ON → 0 M générés pour 186 tickers en 7m35s. `todo_monthly` = 186 mais aucun monthly produit.
+
+**Cause** : `_build_state_from_db` calculait `monthly_done` uniquement depuis `breaks_monthly`. Les tickers sans articles dans `articles` (mois anciens, tickers ajoutés récemment) n'étaient pas marqués done → inclus dans `todo_monthly` → `_gen_monthly_from_raw` retournait `None` immédiatement (pas d'articles) sans LLM call. 186 tickers réels à générer étaient ~8, les 178 restants n'avaient simplement pas d'articles.
+
+**Fix** : `monthly_done` = tickers avec `breaks_monthly` OU sans articles pour ce mois (`have_articles - have_monthly` = les vraiment générables). Intersection sur tous les mois → seuls les tickers générables ET manquants entrent dans `todo_monthly`.
+
+**Fichier** : `scripts/refresh_breakers.py` — `_build_state_from_db()`.
+
+---
+
+## 2026-06-12 · refresh_breakers — `FreeTheAIExhaustedError` swallowé dans `_gen_monthly_from_raw`
+
+**Symptôme** : Flow M continuait à tourner après épuisement FreeTheAI au lieu de s'arrêter proprement. `_freetheai_monthly_stop` jamais posé → 186 tickers tentés inutilement.
+
+**Cause** : `_gen_monthly_from_raw` et `_gen_monthly_from_weeklies` avaient un `except Exception as e:` générique qui catchait `FreeTheAIExhaustedError` → `_freetheai_monthly_stop.set()` dans `_process_ticker_monthly` jamais atteint.
+
+**Fix** : Dans les deux fonctions, avant le handler générique : `if isinstance(e, FreeTheAIExhaustedError): raise` — laisse remonter pour que `_process_ticker_monthly` catch et pose le stop event.
+
+**Fichier** : `scripts/refresh_breakers.py` — `_gen_monthly_from_raw()`, `_gen_monthly_from_weeklies()`.
+
+---
+
+## 2026-06-12 · refresh_breakers — `done` check OR sur 2 semaines → W2 jamais généré
+
+**Symptôme** : Tickers avec W1 skippés pour W2 → `todo_ab` = ~45 au lieu de 253.
+
+**Cause** : `done` = ticker a un weekly pour l'une OU l'autre des 2 semaines glissantes. Un ticker avec W1 était marqué done → W2 jamais déclenché.
+
+**Fix** : `done` vérifie **uniquement `sliding_weeks[0]`** (la semaine la plus récente). Un ticker sans W2 est systématiquement retenu dans `todo_ab` même s'il a W1.
+
+**Fichier** : `scripts/refresh_breakers.py` — `_build_state_from_db()`.
+
+---
+
+## 2026-06-12 · llm_service — Hapuppy rate-limit 403 interprété comme quota épuisé sous charge
+
+**Symptôme** : Sous VPN (Groq 403 réseau → tous les D basculent en `hapuppy_only`), 253 threads frappent Hapuppy simultanément → Hapuppy retourne 403 avec "daily limit" dans le body (rate-limit) → `_hapuppy_quota_skip_until` posé → toutes les threads suivantes sautent Hapuppy → "hapuppy_only cascade exhausted" pour tous les D. Crédits intacts.
+
+**Cause** : Hapuppy retourne parfois "daily limit" dans les messages de rate-limit RPM, pas seulement sur les vrais épuisements de crédits. Sans throttle, 253 appels simultanés déclenchent ce comportement.
+
+**Fix** : `_hapuppy_adaptive_interval()` — rate-limiter global adaptatif (partagé tous cascades via `_hapuppy_rate_lock`) :
+- Groq down OU Gemini down → 0.25s entre chaque call (~4 req/s)
+- Les deux down → 0.5s (~2 req/s)
+- Aucun down → 0.0s (full speed)
+`HAPUPPY_MIN_INTERVAL` env var = override manuel prioritaire.
+
+**Règle** : Quand Groq est injoignable (IP block VPN), tous les D basculent en `hapuppy_only` — le throttle adaptatif empêche la saturation Hapuppy.
+
+**Fichier** : `services/llm_service.py` — `_hapuppy_adaptive_interval()`, bloc Hapuppy dans `llm_call()`.
+
+---
+
+## 2026-06-12 · breakers_articles_service — `_purge_excess_weeklies` et `run_monthly_calendaire` : status non sélectionné
+
+**Symptôme** : `_purge_excess_weeklies` sélectionnait `"year_month, week_num, condensed_at"` sans `status`. Le filtre `w.get("status") is None` retournait toujours `True` (clé absente = None) → les rows sparse/skew/error étaient incluses dans `all_weeks` et pouvaient être purgées. `run_monthly_calendaire` avait le même problème : select sans `status`, `len(week_rows.data) < 2` comptait toutes les rows, et `weeks_text` était buildé depuis les rows skew/error avec du texte vide/None.
+
+**Cause** : Colonne `status` ajoutée après coup. Seuls les flux principaux (`gen_breaks_weekly`, `gen_breaks_monthly`, `_build_state_from_db`) avaient été mis à jour.
+
+**Fix** :
+- `_purge_excess_weeklies` : ajout de `status` dans le select.
+- `run_monthly_calendaire` : ajout de `status` dans le select + `ok_weeks = [r for r in ... if r.get("status") is None]` + `len(ok_weeks) < 2` + boucle sur `ok_weeks`.
+
+**Règle** : Quand on ajoute une colonne gate (filtre EXISTS ou count), vérifier toutes les requêtes sur cette table, pas seulement les chemins principaux.
+
+**Fichier** : `services/breakers_articles_service.py` — `_purge_excess_weeklies()`, `run_monthly_calendaire()`.
+
+---
+
+## 2026-06-12 · refresh_breakers — EU batch 0W 0M silencieux (sparse coverage)
+
+**Symptôme** : Run EU (45 AB · 101 M tickers en todo) → 0 W générés, 0 M générés. Aucun log sur les skips Monthly.
+
+**Cause (0W)** : ~45 tickers EU avec < 2 articles/semaine → skip logué mais rien en DB. Comportement attendu (EU = Yahoo uniquement, accumulation lente). Pas un bug.
+
+**Cause (0M)** : `_gen_monthly_from_raw` retournait `None` silencieusement pour 101 tickers avec < 3 articles. Aucun log, aucune row DB. `_process_monthlies` comptait le None comme skipped sans remonter l'info dans le TG Done.
+
+**Fix** :
+- `_gen_monthly_from_raw` : log `logger.info(f"  ⏭ M {ticker} {year_month} — {len(raw)} arts < {MIN_ARTICLES_FOR_MONTHLY}")` + upsert `status="sparse"` (ou `"no_articles"` si row absente).
+- `_process_monthlies` : 4-tuple `(generated, sources, failures, skipped)`.
+- `main()` : `total_months_skip` accumulé. TG Done : `· N skipped (arts < 3)` si skipped > 0.
+
+**Note** : ~116 tickers EU/ASIA avec sparse coverage permanente. Chaque run écrit/re-écrit `status="sparse"` en DB (cheap : 0 LLM call). Permet le retry automatique si de nouveaux articles arrivent.
+
+**Fichier** : `scripts/refresh_breakers.py` — `_gen_monthly_from_raw()`, `_process_monthlies()`, `_process_ticker_monthly()`, `main()`.
+
+---
+
+## 2026-06-12 · breaks_monthly / breaks_weekly — upsert status='sparse' silencieusement ignoré (NOT NULL)
+
+**Symptôme** : Après un run EU/ASIA, aucune row `status='sparse'` ou `status='no_articles'` en DB malgré le code qui les écrit. TG affiche "33 skipped" mais DB vide.
+
+**Cause** : `ai_summary`, `article_count`, `condensed_at` étaient `NOT NULL` dans `breaks_monthly`. `ai_summary`, `top_articles`, `article_count`, `condensed_at` étaient `NOT NULL` dans `breaks_weekly`. Les upserts de status sans summary (sparse/no_articles/error/skew) violaient ces contraintes. supabase-py retourne l'erreur sans raise → ignoré silencieusement.
+
+**Fix** : Migration `breaks_nullable_status_columns` — DROP NOT NULL sur ces colonnes dans les deux tables.
+
+**Règle** : Quand on ajoute un upsert partiel (status only), vérifier que toutes les colonnes NOT NULL de la table sont fournies ou rendues nullable.
+
+---
+
+## 2026-06-12 · refresh_breakers — TG 400 silencieux sur runs avec skipped > 0
+
+**Symptôme** : Zéro notification TG pendant les runs EU/ASIA. US OK. `except Exception: pass` dans `_telegram()` — aucun log de l'erreur.
+
+**Cause** : `m_status` contenait `arts < {MIN_ARTICLES_FOR_MONTHLY}` (littéral `<`) quand `total_months_skip > 0`. En `parse_mode: HTML`, `<` doit être `&lt;` — Telegram retourne 400. Les runs US n'avaient pas de skipped, donc jamais de `<` dans le message, donc pas de 400.
+
+**Fix** :
+- `arts < N` → `arts &lt; N` dans `m_status` (checkpoint + Done).
+- `except Exception: pass` dans `_telegram()` → `logger.warning(f"TG send failed: {e}")`.
+
+**Règle** : Tout `<`, `>`, `&` dans le texte brut d'un message HTML Telegram doit être échappé. Tester les branches où des valeurs dynamiques sont injectées dans le message.
+
+**Fichier** : `scripts/refresh_breakers.py` — `_telegram()`, `main()` (m_status + m_skip_line).
+
+---
+
+## 2026-06-13 · refresh_breakers — `_build_targets` : N×M requêtes DB au lieu de M bulk
+
+**Symptôme** : Au lancement de `python scripts/refresh_breakers.py --region EU --lang en`, les logs montraient des centaines d'appels `articles?select=articles%2Ccached_at&ticker=eq.X&year_month=eq.Y` individuels avant le premier fetch d'article. EU RSS seul = 227 tickers × 12 mois = 2 724 requêtes. Total 4 sources = 7 224 requêtes DB juste pour le check freshness.
+
+**Cause** : `_build_targets` dans `_scrap_phase` appelait `_is_month_fresh(ticker, ym, supa)` dans une double boucle (tickers × year_months) — 1 requête DB par paire (ticker, year_month).
+
+**Fix** : Bulk query : 1 requête par `year_month` (`.eq("year_month", ym).execute()`) récupérant toutes les rows en une fois, puis filtrage en mémoire (`if t not in tickers_set: continue`). 28 requêtes total (12+1+3+12) au lieu de 7 224.
+
+**Règle** : Dans `_build_targets`, toujours bulk-query par `year_month` d'abord, filtrer les tickers en mémoire. Ne jamais appeler `_is_month_fresh` dans une double boucle tickers × months.
+
+**Fichier** : `scripts/refresh_breakers.py` — `_scrap_phase._build_targets()`.
+
+---
+
+## 2026-06-14 · refresh_breakers — "Server disconnected" persistant même à 2 workers (HTTP/2 GOAWAY)
+
+**Symptôme** : `Supabase transient error: Server disconnected` en boucle pendant le post-scrap, même avec 2 workers. Réduction des workers (25→15→9→5→2) n'éliminait pas les erreurs.
+
+**Cause** : postgrest-py hardcode `http2=True` dans `SyncPostgrestClient.create_session()`. PostgREST envoie des GOAWAY frames HTTP/2 pour fermer les connexions idle ou après N requêtes. httpx tente de réutiliser la connexion fermée → `RemoteProtocolError` / `ConnectionTerminated`. Pas lié à la concurrence, mais au protocole HTTP/2.
+
+**Fix** : Dans `_supa()`, après `create_client()`, remplacer `client.postgrest.session` par un `httpx.Client(http2=False, ...)` copiant les headers/timeout/base_url de l'ancien. Force HTTP/1.1 sans désinstaller `h2`.
+
+**Règle** : Si des "Server disconnected" / `ConnectionTerminated error_code:1` persistent peu importe le nombre de workers, vérifier HTTP/2. postgrest-py le force — toujours patcher `_supa()` avec `http2=False`.
+
+**Fichier** : `scripts/refresh_breakers.py` — `_supa()`.
+
+---
+
+## 2026-06-14 · refresh_breakers — `_gen_weekly` upsert sans `status=None` → pending count jamais décroît
+
+**Symptôme** : Pending W count identique entre deux runs successifs. Les `✓ W` apparaissaient dans les logs mais la DB conservait `status="less_10_articles"`. La même semaine était re-générée à chaque run indéfiniment.
+
+**Cause** : En run 1, une semaine avec peu d'articles upsertait `status="less_10_articles"`. En run 2, après scraping additionnel (plus d'articles), la semaine passait le seuil → `_gen_weekly` appelait LLM → upsertait `bw_en`, `top_articles`... mais **sans** `"status": None` dans le dict. Supabase upsert préserve les colonnes absentes → `status` restait `"less_10_articles"`. Le pending checker (`WHERE status IS NULL`) voyait la row comme non-traitée → boucle infinie.
+
+**Fix** : Ajouter `"status": None` dans le dict upsert de `_gen_weekly` pour forcer le reset à null après génération réussie.
+
+**Règle** : Tout upsert "succès" sur `breaks_weekly` doit inclure `"status": None` explicitement pour écraser un éventuel statut d'erreur antérieur.
+
+**Fichier** : `scripts/refresh_breakers.py` — `_gen_weekly()`.
+
+---
+
+## 2026-06-14 · llm_service — Hapuppy SSL EOF sur mass reset (promo gpt-5.5)
+
+**Symptôme** : `EOF occurred in violation of protocol (_ssl.c:2406)` sur plusieurs tickers simultanément à 00:26:50, puis `post-scrap error X: EOF`. Les tickers dont l'exception remontait jusqu'à `_process_ticker` perdaient tout leur traitement (pas de W ni M).
+
+**Cause** : Hapuppy droppait toutes les connexions SSL simultanément (mass reset côté serveur, probablement rate-limit ou restart infra). Le bloc `except Exception` dans la boucle Hapuppy ne retentait qu'1 fois (`range(2)`). `scrap_gen_monthly` et `gen_dumb` n'avaient pas de protection try/except → exception remontait au niveau ticker.
+
+**Fix** :
+1. Hapuppy retry : `range(2)` → `range(4)`, backoff `2^attempt + jitter` (1s→2s→4s→8s).
+2. `scrap_gen_monthly` : wrappé dans `try/except Exception` dans `_process_ticker` — un M raté ne tue plus le ticker.
+3. `_retry_call` : helper qui enveloppe `gen_dumb` et `scrap_gen_monthly` avec retry ×5 sur disconnect Supabase.
+
+**Fichier** : `services/llm_service.py` — boucle Hapuppy · `scripts/refresh_breakers.py` — `_process_ticker`, `_retry_call`.
+
+---
+
+## 2026-06-14 · scrap_gen_monthly — upsert sans `status=None` → M reprocessé à l'infini
+
+**Symptôme** : `M scrap ORA.PA 2026-05 (30 arts · ...)` identique dans deux runs successifs. Pending M count invariant entre runs malgré des `✓ M` dans les logs.
+
+**Cause** : Même bug que `_gen_weekly` (voir entrée précédente), mais pour les monthlies. `scrap_gen_monthly` check : `status IS NULL` → skip si déjà généré. En run 1, une row avec peu de W upsertait `status='less_3_articles'`. En run 2, après génération réussie, les deux chemins (`_gen_monthly_from_weeklies` et chemin raw) upserteaient `bm_en` sans inclure `"status": None` → `status` restait `'less_3_articles'` → check `status IS NULL` échouait → reprocessé à l'infini. Confirmé en DB : `bm_en IS NOT NULL` ET `status='less_3_articles'` sur 2 rows monthly + 1 row weekly.
+
+**Fix code** : `"status": None` ajouté dans les upserts de `_gen_monthly_from_weeklies` et `scrap_gen_monthly` (chemin raw).
+
+**Fix DB** : `UPDATE breaks_monthly SET status = NULL WHERE status IS NOT NULL AND bm_en IS NOT NULL` (2 rows) + idem `breaks_weekly` (1 row).
+
+**Règle** : Tout upsert "succès" sur `breaks_monthly` (les deux chemins) doit inclure `"status": None` explicitement.
+
+**Fichier** : `services/breakers_articles_service.py` — `_gen_monthly_from_weeklies()`, `scrap_gen_monthly()`.
+
+---
+
+## 2026-06-14 · refresh_breakers — Finnhub 429 en rafale + second passage sans skip
+
+**Symptôme** : Sur `--skip-rss-yahoo`, Finnhub recevait les 240 cibles US même si certaines avaient déjà été traitées au run précédent → 429 immédiat sur les mêmes tickers. "0 déjà taggés skippés" à chaque run.
+
+**Cause** : Finnhub n'avait pas de mécanisme de tracking cross-run (contrairement à P2 avec `p2_sources`). De plus, aucun throttle entre les calls → dépassement du rate limit free tier (60 req/min) sur les runs longs.
+
+**Fix** :
+- `_fetch_finnhub_month` : retourne `None` sur 429 (au lieu de raise).
+- Loop Finnhub : abort après 3 × 429 consécutives. Tag `"finnhub"` dans `p2_sources` après chaque call réussi (ou vide). Pas de tag sur 429 → retry au prochain run.
+- `time.sleep(1.0)` entre chaque call Finnhub → ~60 req/min, dans la limite free tier.
+
+**Règle** : Finnhub free = 60 calls/min. Sans throttle, 240 cibles déclenchent le rate limit en moins d'une minute. Le tag `p2_sources["finnhub"]` permet de skipper les paires déjà traitées sur un second passage.
+
+**Fichier** : `services/breakers_articles_service.py` — `_fetch_finnhub_month()` · `scripts/refresh_breakers.py` — loop Finnhub.
+
+---
+
+## 2026-06-14 · refresh_breakers — APIs P2 (NewsAPI/Marketaux/AV) : tag `p2_sources` posé même sur 429
+
+**Symptôme** : Après un run avec 429 massifs sur NewsAPI (97 targets, toutes 429), le prochain run affichait "97 déjà taggés skippés" — aucune retry malgré 0 articles ajoutés. Même comportement attendu pour Marketaux et AV.
+
+**Cause** : `_mark_p2_done` était appelé immédiatement après `_fetch_*_month()`, sans distinction entre "0 articles trouvés" et "429 rate-limit". Les fonctions `_fetch_*_month` catchaient la 429 dans un `except Exception` et retournaient `[]` — indiscernable d'un résultat vide.
+
+**Fix** :
+- `_fetch_newsapi_month`, `_fetch_marketaux_month`, `_fetch_av_month` : détection explicite de la 429 (HTTP) et du rate-limit AV (corps JSON `"Information"`) → retour `None` au lieu de `[]`.
+- Loop P2 dans `refresh_breakers.py` : `if raw is None: continue` (pas de `_mark_p2_done`) + compteur consécutif → abort après 3 × 429 pour NewsAPI/Marketaux, 2 × pour AV.
+- Fix DB one-shot : `UPDATE articles SET p2_sources = array_remove(p2_sources, 'newsapi') WHERE year_month = '2026-06' AND 'newsapi' = ANY(p2_sources)` — 96 rows nettoyées.
+
+**Règle** : `_mark_p2_done` ne doit être appelé que sur succès ou résultat vide légitime. Retourner `None` (pas `[]`) sur rate-limit pour que le caller puisse distinguer.
+
+**Fichier** : `services/breakers_articles_service.py` — `_fetch_newsapi_month()`, `_fetch_marketaux_month()`, `_fetch_av_month()` · `scripts/refresh_breakers.py` — loops NewsAPI, Marketaux, AV.
+
+---
+
+## 2026-06-12 · refresh_breakers — RemoteProtocolError HTTP/2 sur appels Supabase
+
+**Symptôme** : `httpx.RemoteProtocolError: peer closed connection without sending complete message body` sur certains appels `.execute()` Supabase dans `refresh_breakers.py`. Crash non retryé → ticker non traité.
+
+**Cause** : Supabase HTTP/2 ferme parfois la connexion entre deux calls en rafale (TCP keepalive). httpx ne retry pas automatiquement les erreurs de protocole.
+
+**Fix** : Wrapper `_exec(query, retries=2)` — retry jusqu'à 2× avec backoff 0.3s × (attempt+1) sur `RemoteProtocolError`. Toutes les `.execute()` dans le script passent par ce wrapper.
+
+**Fichier** : `scripts/refresh_breakers.py` — `_exec()`, tous les appels Supabase.
+
+---
+
+## 2026-06-15 · scrap scripts standalone — crash `len(None)` sur 429
+
+**Symptôme** : `TypeError: object of type 'NoneType' has no len()` dans `scrap_newsapi.py`, `scrap_marketaux.py`, `scrap_alphavantage.py` quand les APIs retournent un 429.
+
+**Cause** : Les fonctions de fetch (`_fetch_newsapi_month`, `_fetch_marketaux_month`, `_fetch_av_month`) retournent `None` sur 429 (comportement requis par `refresh_breakers.py` — voir entrée 2026-06-14). Les scrap scripts standalone faisaient `len(raw)` dans un `logger.info` avant le check `if not raw: continue` → crash sur `len(None)`.
+
+**Fix** : Guard `if raw is None: continue` ajouté dans les 3 scripts avant le `len()`. Le comportement `return None` du service est inchangé (requis pour la logique `p2_sources` de `refresh_breakers.py`).
+
+**Règle** : Les fonctions de fetch retournent `None` (429/rate-limit) OU `[]` (résultat vide légitime). Toujours distinguer les deux : `if raw is None` avant `len(raw)`, puis `if not raw` pour le skip liste vide.
+
+**Fichiers** : `scripts/scrap_newsapi.py` · `scripts/scrap_marketaux.py` · `scripts/scrap_alphavantage.py`.
+
+---
+
+## 2026-06-15 · `_write_dumb_to_archive` — DUMB non persisté pour articles sans `pub_date`
+
+**Symptôme** : `gen_dumb(ticker, cutoff_days=35)` (path batch) génère le DUMB en mémoire mais ne l'écrit jamais en DB. Les articles concernés n'ont jamais `dumb_en`/`dumb_fr` en DB malgré des runs répétés.
+
+**Cause** : `_write_dumb_to_archive` calcule le `year_month` depuis `a.get("pub_date", "")`. Les articles stockés dans la table `articles` (format interne) ont `datetime` (unix int), pas `pub_date`. `pub_date` est un champ du format frontend, reconstruit à la volée par `_fetch_news`. Dans le path `cutoff_days != 7`, les articles viennent directement de `articles` sans passer par `_fetch_news` → pas de `pub_date` → la fonction skippe tous les articles silencieusement.
+
+**Note** : Dans le path prod (cutoff_days=7), `_fetch_news` reconstruit `pub_date` depuis `datetime` avant de retourner les articles → pas impacté.
+
+**Fix** : Fallback sur `datetime` dans `_write_dumb_to_archive` :
+```python
+pub_date = a.get("pub_date", "")
+if not pub_date and a.get("datetime"):
+    pub_date = datetime.fromtimestamp(a["datetime"], tz=timezone.utc).isoformat()
+```
+
+**Règle** : `pub_date` (ISO string) n'existe que dans les articles normalisés par `_fetch_news`. Les articles bruts DB ont `datetime` (unix int). Ne jamais requérir `pub_date` sans fallback `datetime`.
+
+**Fichier** : `services/overview_service.py` — `_write_dumb_to_archive()`.

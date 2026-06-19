@@ -5,14 +5,15 @@ Usage :
   python scripts/batch_fill_db.py --phase scrape          # articles seulement
   python scripts/batch_fill_db.py --phase enrich          # AI news cache
   python scripts/batch_fill_db.py --phase all             # les deux
+  python scripts/batch_fill_db.py --phase bubbles         # génère causes BUB manquantes
+  python scripts/batch_fill_db.py --phase bubbles --force # régénère toutes les causes BUB
   python scripts/batch_fill_db.py --region US             # région spécifique
   python scripts/batch_fill_db.py --ticker AAPL           # ticker unique
 
-Reprend là où il s'est arrêté (progress.json).
+Progress : basé sur l'état Supabase — idempotent, relançable sans état local.
 """
 
 import argparse
-import json
 import os
 import sys
 import time
@@ -48,6 +49,8 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 NOTIFY_EVERY = 25  # notif Telegram tous les N tickers
 
@@ -76,7 +79,8 @@ def _notify_checkpoint(phase: str, i: int, total: int, region: str,
                         done_batch: list[str], errors_batch: list[str],
                         articles_batch: int, start_time: float,
                         llm_sources: dict[str, int] | None = None,
-                        skipped_info: str = ""):
+                        skipped_info: str = "",
+                        windows_info: str = ""):
     elapsed = int(time.time() - start_time)
     mins, secs = divmod(elapsed, 60)
     remaining = int((elapsed / i) * (total - i)) if i else 0
@@ -85,10 +89,11 @@ def _notify_checkpoint(phase: str, i: int, total: int, region: str,
     err_line = f"❌ Errors: {', '.join(errors_batch)}" if errors_batch else "✅ 0 erreurs"
     art_line = f"📰 Articles: +{articles_batch:,}" if articles_batch else ""
     skip_line = f"⏭ Skipped (no news): {skipped_info}" if skipped_info else ""
+    win_line = f"🪟 Fenêtres: {windows_info}" if windows_info else ""
 
     llm_line = ""
     if llm_sources:
-        _ICONS = {"freetheai": "🟢", "hapuppy": "🟡", "agentrouter": "🔵", "groq": "🟠", "unknown": "⚪"}
+        _ICONS = {"freetheai": "🟢", "hapuppy": "🟡", "agentrouter": "🔵", "groq": "🟠", "cache": "💾", "unknown": "⚪"}
         parts = [f"{_ICONS.get(k, '⚪')} {k}: {v}" for k, v in sorted(llm_sources.items(), key=lambda x: -x[1])]
         llm_line = "🤖 LLM: " + " · ".join(parts)
 
@@ -99,13 +104,13 @@ def _notify_checkpoint(phase: str, i: int, total: int, region: str,
         f"{err_line}\n"
         f"{art_line}\n"
         f"{skip_line}\n"
+        f"{win_line}\n"
         f"{llm_line}"
     ).strip()
 
     _telegram(msg)
     logger.info(f"[NOTIF] {i}/{total} — {len(errors_batch)} erreurs · LLM: {llm_sources}")
 
-PROGRESS_FILE = Path(__file__).parent / "batch_progress.json"  # overridden in main() per phase+region
 FINNHUB_KEY = os.environ["FINNHUB_API_KEY"]
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
@@ -118,24 +123,6 @@ FREETHEAI_DELAY = 6.0    # 60s / 10 RPM — on attend la réponse du call (sync)
 
 def _supa():
     return create_client(SUPABASE_URL, SUPABASE_KEY)
-
-
-# ─── Progress tracking ────────────────────────────────────────────────────────
-
-def load_progress() -> dict:
-    if PROGRESS_FILE.exists():
-        return json.loads(PROGRESS_FILE.read_text())
-    return {"scraped": [], "enriched": [], "failed_scrape": [], "failed_enrich": []}
-
-
-SAVE_EVERY = int(os.environ.get("BATCH_SAVE_EVERY", "5"))
-_save_call_count = 0
-
-def save_progress(p: dict, force: bool = False):
-    global _save_call_count
-    _save_call_count += 1
-    if force or _save_call_count % SAVE_EVERY == 0:
-        PROGRESS_FILE.write_text(json.dumps(p, indent=2))
 
 
 # ─── Finnhub fetch ────────────────────────────────────────────────────────────
@@ -258,23 +245,25 @@ def store_articles(ticker: str, articles: list[dict], source: str, supa):
 # ─── Phase scrape ────────────────────────────────────────────────────────────
 
 def phase_scrape(tickers: list[str], region: str = "all"):
-    progress = load_progress()
-    done = set(progress["scraped"])
-    failed = set(progress["failed_scrape"])
+    supa = _supa()
+    current_ym = date.today().strftime("%Y-%m")
 
-    todo = [t for t in tickers if t not in done and t not in failed]
+    # Skip tickers qui ont déjà des articles pour le mois courant
+    r = supa.table("articles").select("ticker").in_("ticker", tickers).eq("year_month", current_ym).execute()
+    done = {row["ticker"] for row in (r.data or [])}
+    todo = [t for t in tickers if t not in done]
     total = len(todo)
-    logger.info(f"SCRAPE: {total} tickers à traiter ({len(done)} déjà done, {len(failed)} failed)")
+    logger.info(f"SCRAPE: {total} tickers à traiter ({len(done)} déjà en DB pour {current_ym})")
 
     if not todo:
         return
 
     _telegram(f"🚀 *Batch SCRAPE démarré — {region}*\n{total} tickers à traiter\nCheckpoint toutes les {NOTIFY_EVERY} tickers")
 
-    supa = _supa()
     start_time = time.time()
     batch_errors: list[str] = []
     batch_articles = 0
+    n_done = 0
 
     for i, ticker in enumerate(todo, 1):
         logger.info(f"[{i}/{total}] {ticker}")
@@ -301,31 +290,25 @@ def phase_scrape(tickers: list[str], region: str = "all"):
                 logger.info(f"  Yahoo: {len(yahoo_articles)} articles, {n} nouveaux stockés")
 
             batch_articles += ticker_articles
-            progress["scraped"].append(ticker)
+            n_done += 1
 
         except Exception as e:
             logger.error(f"  FAILED {ticker}: {e}")
-            progress["failed_scrape"].append(ticker)
             batch_errors.append(ticker)
 
-        save_progress(progress)
-
         if i % NOTIFY_EVERY == 0:
-            save_progress(progress, force=True)
             _notify_checkpoint("scrape", i, total, region, batch_errors, [], batch_articles, start_time)
             batch_errors = []
             batch_articles = 0
 
-    # Notif finale
     elapsed = int(time.time() - start_time)
     mins, secs = divmod(elapsed, 60)
-    total_failed = len(progress["failed_scrape"])
     _telegram(
         f"✅ *Batch SCRAPE terminé — {region}*\n"
-        f"{len(progress['scraped'])} tickers done · {total_failed} failed\n"
+        f"{n_done} tickers done · {len(batch_errors)} failed\n"
         f"⏱ Durée totale : {mins}m{secs:02d}s"
     )
-    logger.info(f"SCRAPE terminé: {len(progress['scraped'])} done, {total_failed} failed")
+    logger.info(f"SCRAPE terminé: {n_done} done, {len(batch_errors)} failed")
 
 
 # ─── Phase enrich (AI news cache) ────────────────────────────────────────────
@@ -339,12 +322,13 @@ def phase_enrich(tickers: list[str], region: str = "all"):
     from services.llm_service import GroqExhaustedError
 
     supa = _supa()
-    progress = load_progress()
-    done = set(progress["enriched"])
+    # Skip tickers qui ont déjà un OW EN en cache
+    r = supa.table("ow_cache").select("ticker").in_("ticker", tickers).not_.is_("ow7d_en", "null").execute()
+    done = {row["ticker"] for row in (r.data or [])}
     todo = [t for t in tickers if t not in done]
     total = len(todo)
 
-    logger.info(f"ENRICH: {total} tickers à traiter ({len(done)} déjà done)")
+    logger.info(f"ENRICH: {total} tickers à traiter ({len(done)} déjà en DB)")
     if not todo:
         return
 
@@ -354,6 +338,7 @@ def phase_enrich(tickers: list[str], region: str = "all"):
     batch_errors: list[str] = []
     batch_llm_sources: dict[str, int] = {}
     delisted_tickers: list[str] = []
+    n_done = 0
 
     for i, ticker in enumerate(todo, 1):
         logger.info(f"[{i}/{total}] {ticker} — génération AI summary")
@@ -386,16 +371,15 @@ def phase_enrich(tickers: list[str], region: str = "all"):
                 else:
                     logger.warning(f"  website fetch failed for {ticker}: {we}")
 
-            progress["enriched"].append(ticker)
+            n_done += 1
 
         except GroqExhaustedError:
             elapsed = int(time.time() - start_time)
             mins, secs = divmod(elapsed, 60)
             remaining = total - i + 1
-            save_progress(progress)
             msg = (
                 f"🛑 *Batch ENRICH arrêté — quota Groq épuisé*\n"
-                f"Progress sauvegardé : {len(progress['enriched'])} done · {remaining} restants\n"
+                f"{n_done} done · {remaining} restants\n"
                 f"⏱ {mins}m{secs:02d}s · Relancer après minuit UTC"
             )
             _telegram(msg)
@@ -404,27 +388,22 @@ def phase_enrich(tickers: list[str], region: str = "all"):
 
         except Exception as e:
             logger.error(f"  ✗ {ticker}: {e}")
-            progress.setdefault("failed_enrich", []).append(ticker)
             batch_errors.append(ticker)
 
-        save_progress(progress)
-
         if i % NOTIFY_EVERY == 0:
-            save_progress(progress, force=True)
             _notify_checkpoint("enrich", i, total, region, batch_errors, [], 0, start_time, batch_llm_sources)
             batch_errors = []
             batch_llm_sources = {}
 
     elapsed = int(time.time() - start_time)
     mins, secs = divmod(elapsed, 60)
-    total_failed = len(progress.get("failed_enrich", []))
     delisted_line = f"\n⚠️ Delisted ({len(delisted_tickers)}) : {', '.join(delisted_tickers)}" if delisted_tickers else ""
     _telegram(
         f"✅ *Batch ENRICH terminé — {region}*\n"
-        f"{len(progress['enriched'])} tickers done · {total_failed} failed{delisted_line}\n"
+        f"{n_done} tickers done · {len(batch_errors)} failed{delisted_line}\n"
         f"⏱ Durée totale : {mins}m{secs:02d}s"
     )
-    logger.info(f"ENRICH terminé: {len(progress['enriched'])} done, {total_failed} failed, {len(delisted_tickers)} delisted: {delisted_tickers}")
+    logger.info(f"ENRICH terminé: {n_done} done, {len(batch_errors)} failed, {len(delisted_tickers)} delisted: {delisted_tickers}")
 
 
 # ─── Phase bubbles (pre-gen event_causes 6M+1Y) ──────────────────────────────
@@ -448,79 +427,184 @@ def _detect_peaks_valleys(closes: list[float], window: int, max_dots: int) -> li
     return candidates[:max_dots]
 
 
-def phase_bubbles(tickers: list[str], region: str = "all"):
+def phase_bubbles(tickers: list[str], region: str = "all", empty_only: bool = False,
+                  cleanup: bool = False, force: bool = False):
     """
     Pré-génère event_causes pour les dots 6M+1Y de chaque ticker.
-    Stable dans le temps — ne regénère pas si déjà en cache.
+    empty_only : tickers ayant ≥1 bub_en NULL en DB.
+    force      : régénère tous les dots existants dans bub_cache (depuis DB, sans re-détecter yfinance).
     """
     from services.bubble_service import get_or_gen_bub
 
     supa = _supa()
-    progress = load_progress()
-    done = set(progress.get("bubbles_done", [])) | set(progress.get("bubbles_no_data", []))
-    todo = [t for t in tickers if t not in done]
+    lang_col = "bub_en" if os.environ.get("LLM_LANG", "en") == "en" else "bub_fr"
+
+    if force:
+        # Tickers qui ont au moins un dot en bub_cache
+        r = supa.table("bub_cache").select("ticker").in_("ticker", tickers).execute()
+        tickers_with_dots = list({row["ticker"] for row in (r.data or [])})
+        todo = [t for t in tickers if t in tickers_with_dots]
+        logger.info(f"BUBBLES force: {len(todo)} tickers avec dots en bub_cache")
+    elif empty_only:
+        r = supa.table("bub_cache").select("ticker").in_("ticker", tickers).is_(lang_col, "null").execute()
+        tickers_with_empty = list({row["ticker"] for row in (r.data or [])})
+        todo = [t for t in tickers if t in tickers_with_empty]
+        logger.info(f"BUBBLES empty-only: {len(todo)} tickers avec ≥1 {lang_col} NULL")
+    else:
+        # Skip tickers dont tous les dots ont déjà une cause en DB
+        r = supa.table("bub_cache").select("ticker").in_("ticker", tickers).not_.is_(lang_col, "null").execute()
+        done = {row["ticker"] for row in (r.data or [])}
+        todo = [t for t in tickers if t not in done]
+        logger.info(f"BUBBLES: {len(todo)} tickers à traiter ({len(done)} déjà complets en DB)")
     total = len(todo)
 
-    logger.info(f"BUBBLES: {total} tickers à traiter ({len(done)} déjà done)")
+    logger.info(f"BUBBLES: {total} tickers à traiter")
     if not todo:
         return
 
-    _telegram(f"🫧 *Batch BUBBLES démarré — {region}*\n{total} tickers\nPériodes : 6M + 1Y")
+    mode_tag = "force" if force else ("empty-only" if empty_only else "normal")
+    lang_tag = os.environ.get("LLM_LANG", "en").upper()
+    n_done = len(tickers) - total
+    done_line = f"({n_done} déjà complets)" if n_done > 0 else ""
+    _telegram(
+        f"🫧 *Batch BUBBLES démarré — {region} [{mode_tag}]*\n"
+        f"{total} tickers à traiter {done_line}\n"
+        f"Lang : {lang_tag} | Périodes : 1W · 1M · 6M · 1Y\n"
+        f"📍 batch_fill_db"
+    )
 
+    # (period, interval, window, max_dots, col_key) — aligné frontend
     PERIODS = [
-        ("6mo", "1d", 4, 10),  # (period, interval, window, max_dots)
-        ("1y",  "1d", 5, 10),
+        ("5d",  "1h", 3,  5,  "1w"),
+        ("1mo", "1d", 2,  8,  "1m"),
+        ("6mo", "1d", 4, 10, "6m"),
+        ("1y",  "1d", 5, 10, "1y"),
     ]
 
     start_time = time.time()
     batch_errors: list[str] = []
     total_events = 0
-    batch_skipped = 0          # bubbles sans articles au niveau batch
-    batch_skipped_tickers: list[str] = []  # "TICKER×N" pour le TG
+    total_cached = 0
+    batch_llm_sources: dict[str, int] = {}
+    batch_skipped = 0
+    batch_skipped_tickers: list[str] = []
+    total_win_counts: dict[str, int] = {}  # "1w", "1m", "6m", "1y" → total
+    detected_dates_by_ticker: dict[str, set] = {}  # pour cleanup
 
     BUBBLES_WORKERS = int(os.environ.get("BUBBLES_WORKERS", "3"))
 
     def _process_ticker(ticker: str) -> dict:
         t_events, t_total, t_skipped = 0, 0, []
-        for period, interval, window, max_dots in PERIODS:
+        t_cached = 0
+        t_llm_sources: dict[str, int] = {}
+        t_win_counts: dict[str, int] = {}  # "1w", "1m", "6m", "1y" → count
+
+        # Pre-fetch tous les BUBs du ticker en 1 SELECT
+        prefetch_r = _supa().table("bub_cache").select("date,bub_en,bub_fr,in_1w,in_1m,in_6m,in_1y").eq("ticker", ticker).execute()
+        cache_by_date: dict[str, dict] = {r["date"]: r for r in (prefetch_r.data or [])}
+
+        if force:
+            # Mode force : dots depuis bub_cache, change_pct recalculé depuis yfinance
             try:
-                hist = yf.Ticker(ticker).history(period=period, interval=interval)
-                if len(hist) < window * 2 + 1:
+                hist = yf.Ticker(ticker).history(period="2y", interval="1d")
+            except Exception:
+                hist = None
+
+            def _change_pct_from_hist(dt_str: str) -> float:
+                if hist is None or hist.empty:
+                    return 0.0
+                try:
+                    closes = hist["Close"].tolist()
+                    dates = [d.strftime("%Y-%m-%d") for d in hist.index]
+                    idx = dates.index(dt_str)
+                    return round((closes[idx] - closes[idx - 1]) / closes[idx - 1] * 100 if idx > 0 else 0.0, 2)
+                except (ValueError, IndexError):
+                    return 0.0
+
+            all_dots = [
+                (r["date"], _change_pct_from_hist(r["date"]),
+                 {k.replace("in_", "") for k in ("in_1w", "in_1m", "in_6m", "in_1y") if r.get(k)})
+                for r in cache_by_date.values()
+            ]
+            logger.info(f"  {ticker} — {len(all_dots)} dots (force depuis bub_cache)")
+        else:
+            # Mode normal : détection dots depuis yfinance
+            dot_windows: dict[str, dict] = {}
+            for period, interval, window, max_dots, period_key in PERIODS:
+                try:
+                    hist = yf.Ticker(ticker).history(period=period, interval=interval)
+                    if len(hist) < window * 2 + 1:
+                        continue
+                    closes = hist["Close"].tolist()
+                    dates  = [d.strftime("%Y-%m-%d") for d in hist.index]
+                    for idx, _ in _detect_peaks_valleys(closes, window, max_dots):
+                        dt = dates[idx]
+                        change_pct = round((closes[idx] - closes[idx - 1]) / closes[idx - 1] * 100 if idx > 0 else 0.0, 2)
+                        if dt not in dot_windows:
+                            dot_windows[dt] = {"change_pct": change_pct, "windows": set()}
+                        dot_windows[dt]["windows"].add(period_key)
+                except Exception as e:
+                    logger.warning(f"  period {period} {ticker}: {e}")
+
+            all_dots = [(dt, info["change_pct"], info["windows"]) for dt, info in dot_windows.items()]
+            n_already_cached = sum(1 for dt, _, _ in all_dots if cache_by_date.get(dt, {}).get(lang_col))
+            logger.info(f"  {ticker} — {len(all_dots)} dots · {n_already_cached}/{len(all_dots)} cached")
+
+        n_dots = len(all_dots)
+        for dot_idx, (dt, change_pct, windows) in enumerate(all_dots, 1):
+            sign = "+" if change_pct >= 0 else ""
+            win_flags = {f"in_{w}": (w in windows) for w in ("1w", "1m", "6m", "1y")} if windows else {}
+            win_tag = ",".join(sorted(windows)) if windows else "?"
+            cached_row = cache_by_date.get(dt)
+            try:
+                res = get_or_gen_bub(ticker, dt, change_pct, cascade="zen",
+                                     prefetched_cache=cached_row, force_regen=force, **win_flags)
+                if not res.get("articles") and not res.get("cause"):
+                    t_skipped.append(dt)
                     continue
-                closes = hist["Close"].tolist()
-                dates  = [d.strftime("%Y-%m-%d") for d in hist.index]
-                for idx, _ in _detect_peaks_valleys(closes, window, max_dots):
-                    dt = dates[idx]
-                    change_pct = (closes[idx] - closes[idx - 1]) / closes[idx - 1] * 100 if idx > 0 else 0.0
-                    try:
-                        res = get_or_gen_bub(ticker, dt, round(change_pct, 2))
-                        if not res.get("articles"):
-                            t_skipped.append(dt)
-                            continue
-                        t_total += 1
-                        if res.get("cause"):
-                            t_events += 1
-                        else:
-                            logger.warning(f"  bubble {ticker} {dt}: cause=null (LLM failed)")
-                        time.sleep(0.5)
-                    except Exception as e:
-                        logger.warning(f"  bubble {ticker} {dt}: {e}")
+                t_total += 1
+                llm = res.get("llm_source")
+                if res.get("cause"):
+                    t_events += 1
+                    for w in windows:
+                        t_win_counts[w] = t_win_counts.get(w, 0) + 1
+                    if llm:
+                        t_llm_sources[llm] = t_llm_sources.get(llm, 0) + 1
+                        logger.info(f"  {ticker} [bub {dot_idx}/{n_dots}] {dt} {sign}{change_pct:.1f}% → ✓ {llm} [{win_tag}]")
+                    else:
+                        t_cached += 1
+                else:
+                    logger.warning(f"  {ticker} [bub {dot_idx}/{n_dots}] {dt} {sign}{change_pct:.1f}% → ✗ LLM failed ({llm})")
+                if llm:
+                    time.sleep(0.5)
             except Exception as e:
-                logger.warning(f"  period {period} {ticker}: {e}")
-        return {"ticker": ticker, "events": t_events, "total": t_total, "skipped": t_skipped}
+                logger.warning(f"  {ticker} [bub {dot_idx}/{n_dots}] {dt} {sign}{change_pct:.1f}% → ✗ {e}")
+
+        return {
+            "ticker": ticker, "events": t_events, "total": t_total, "skipped": t_skipped,
+            "cached": t_cached, "llm_sources": t_llm_sources,
+            "detected_dates": set(r["date"] for r in cache_by_date.values()) if force else set(dot_windows.keys() if not force else []),
+            "win_counts": t_win_counts,
+        }
 
     executor = ThreadPoolExecutor(max_workers=BUBBLES_WORKERS)
     futures = {executor.submit(_process_ticker, ticker): ticker for ticker in todo}
     try:
         for i, future in enumerate(as_completed(futures), 1):
             ticker = futures[future]
-            logger.info(f"[{i}/{total}] {ticker} — résultat reçu")
+            logger.info(f"[ticker {i}/{total}] {ticker} — résultat reçu")
             try:
                 r = future.result()
                 ticker_events, ticker_total = r["events"], r["total"]
                 ticker_skipped = r["skipped"]
 
                 total_events += ticker_events
+                total_cached += r.get("cached", 0)
+                for src, cnt in r.get("llm_sources", {}).items():
+                    batch_llm_sources[src] = batch_llm_sources.get(src, 0) + cnt
+                for w, cnt in r.get("win_counts", {}).items():
+                    total_win_counts[w] = total_win_counts.get(w, 0) + cnt
+                detected_dates_by_ticker[ticker] = r.get("detected_dates", set())
                 null_count = ticker_total - ticker_events
 
                 if ticker_skipped:
@@ -529,11 +613,9 @@ def phase_bubbles(tickers: list[str], region: str = "all"):
                     logger.info(f"  ⏭ {ticker} — {len(ticker_skipped)} dates sans articles")
 
                 if ticker_total == 0:
-                    logger.info(f"  ⏭ {ticker} — 0 bubbles avec articles → bubbles_no_data")
-                    progress.setdefault("bubbles_no_data", []).append(ticker)
+                    logger.info(f"  ⏭ {ticker} — 0 bubbles avec articles")
                 elif null_count == 0:
                     logger.info(f"  ✓ {ticker} — {ticker_events} bubbles avec cause")
-                    progress.setdefault("bubbles_done", []).append(ticker)
                 else:
                     logger.warning(f"  ⚠ {ticker} — {ticker_events} avec cause, {null_count} cause=null")
 
@@ -541,13 +623,13 @@ def phase_bubbles(tickers: list[str], region: str = "all"):
                 logger.error(f"  ✗ {ticker}: {e}")
                 batch_errors.append(ticker)
 
-            save_progress(progress)
-
             if i % NOTIFY_EVERY == 0:
-                save_progress(progress, force=True)
                 skip_info = f"{batch_skipped} bubbles — {', '.join(batch_skipped_tickers)}" if batch_skipped else ""
+                tg_llm = {**batch_llm_sources, "cache": total_cached} if (batch_llm_sources or total_cached) else None
+                win_info = " | ".join(f"{w}: {total_win_counts.get(w, 0)}" for w in ("1w", "1m", "6m", "1y"))
+                logger.info(f"  Fenêtres: {win_info}")
                 _notify_checkpoint("bubbles", i, total, region, batch_errors, [], 0, start_time,
-                                   skipped_info=skip_info)
+                                   llm_sources=tg_llm, skipped_info=skip_info, windows_info=win_info)
                 batch_errors = []
                 batch_skipped = 0
                 batch_skipped_tickers = []
@@ -555,49 +637,64 @@ def phase_bubbles(tickers: list[str], region: str = "all"):
     except KeyboardInterrupt:
         logger.info("Interruption — annulation des tâches en attente...")
         executor.shutdown(wait=False, cancel_futures=True)
-        save_progress(progress, force=True)
-        logger.info("Progress sauvegardé.")
         os._exit(0)
     finally:
         executor.shutdown(wait=False)
 
+    # Cleanup : supprimer les rows bub_cache qui ne sont plus dans aucune fenêtre
+    if cleanup and detected_dates_by_ticker:
+        logger.info("BUBBLES cleanup — suppression des rows orphelines (in_6m=false AND in_1y=false)...")
+        supa_clean = _supa()
+        cleaned_total = 0
+        for t, active_dates in detected_dates_by_ticker.items():
+            try:
+                existing_r = supa_clean.table("bub_cache").select("date").eq("ticker", t).execute()
+                all_dates = {row["date"] for row in (existing_r.data or [])}
+                orphan_dates = list(all_dates - active_dates)
+                if orphan_dates:
+                    supa_clean.table("bub_cache").delete().eq("ticker", t).in_("date", orphan_dates).execute()
+                    cleaned_total += len(orphan_dates)
+                    logger.info(f"  {t} — {len(orphan_dates)} rows orphelines supprimées")
+            except Exception as e:
+                logger.warning(f"  cleanup {t}: {e}")
+        logger.info(f"BUBBLES cleanup terminé — {cleaned_total} rows supprimées")
+        _telegram(f"🧹 *Cleanup bub_cache* — {cleaned_total} rows orphelines supprimées")
+
     elapsed = int(time.time() - start_time)
     mins, secs = divmod(elapsed, 60)
+    win_summary = " | ".join(f"{w}: {total_win_counts.get(w, 0)}" for w in ("1w", "1m", "6m", "1y"))
+    mode_tag = "force" if force else ("empty-only" if empty_only else "normal")
     _telegram(
-        f"✅ *Batch BUBBLES terminé — {region}*\n"
-        f"{len(progress.get('bubbles_done', []))} tickers · {total_events} bubbles\n"
+        f"✅ *Batch BUBBLES terminé — {region} [{mode_tag}]*\n"
+        f"{total_events} bubbles générés · {total} tickers\n"
+        f"🪟 {win_summary}\n"
         f"⏱ {mins}m{secs:02d}s"
     )
-    logger.info(f"BUBBLES terminé: {total_events} events générés")
+    logger.info(f"BUBBLES terminé: {total_events} events générés | {win_summary}")
 
 
 # ─── Phase translate-fr ───────────────────────────────────────────────────────
 
 def phase_translate_fr(tickers: list[str], region: str = "all"):
     """
-    event_causes : cause_en → cause (skip si cause déjà présent)
+    event_causes : bub_en → bub_fr (skip si bub_fr déjà présent)
     OW retiré — trop volatile (refresh 3h), traduit à la demande au launch.
     """
     from services.translation_service import translate_to_fr
 
     supa = _supa()
-    progress = load_progress()
 
     # ── BUBBLES (event_causes) ─────────────────────────────────────────────────
-    translated_bub = set(progress.get("translated_fr_bubbles", []))
-
     cause_rows = supa.table("bub_cache") \
-        .select("ticker, date, cause_en") \
+        .select("ticker, date, bub_en") \
         .in_("ticker", tickers) \
-        .not_.is_("cause_en", "null") \
-        .is_("cause_fr", "null") \
+        .not_.is_("bub_en", "null") \
+        .is_("bub_fr", "null") \
         .execute()
 
-    # Grouper par ticker pour le progress tracking
     causes_by_ticker: dict[str, list[dict]] = {}
     for r in (cause_rows.data or []):
-        if r["ticker"] not in translated_bub:
-            causes_by_ticker.setdefault(r["ticker"], []).append(r)
+        causes_by_ticker.setdefault(r["ticker"], []).append(r)
 
     total_bub = sum(len(v) for v in causes_by_ticker.values())
     logger.info(f"TRANSLATE-FR BUBBLES: {total_bub} event_causes sur {len(causes_by_ticker)} tickers")
@@ -612,8 +709,8 @@ def phase_translate_fr(tickers: list[str], region: str = "all"):
             ticker_ok = True
             for ev in events:
                 try:
-                    cause_fr = translate_to_fr(ev["cause_en"])
-                    supa.table("bub_cache").update({"cause_fr": cause_fr}) \
+                    cause_fr = translate_to_fr(ev["bub_en"])
+                    supa.table("bub_cache").update({"bub_fr": cause_fr}) \
                         .eq("ticker", ticker).eq("date", ev["date"]).execute()
                     bub_done += 1
                     logger.info(f"  ✓ {ticker} {ev['date']}")
@@ -622,9 +719,6 @@ def phase_translate_fr(tickers: list[str], region: str = "all"):
                     bub_errors.append(f"{ticker}:{ev['date']}")
                     ticker_ok = False
 
-            if ticker_ok:
-                progress.setdefault("translated_fr_bubbles", []).append(ticker)
-            save_progress(progress)
 
         elapsed = int(time.time() - start_time)
         mins, secs = divmod(elapsed, 60)
@@ -639,16 +733,16 @@ def phase_translate_fr(tickers: list[str], region: str = "all"):
     # ── BREAKS (week / month / year summaries) ────────────────────────────────
     from services.translation_service import translate_batch_to_fr
 
-    for table, pk_fields, en_field in [
-        ("breaks_weekly",  ["year_month", "week_num"], "ai_summary"),
-        ("breaks_monthly", ["year_month"],             "ai_summary"),
-        ("breaks_yearly",  ["year"],                   "ai_summary"),
+    for table, pk_fields, en_field, fr_field in [
+        ("breaks_weekly",  ["year_month", "week_num"], "ai_summary", "bw_fr"),
+        ("breaks_monthly", ["year_month"],             "ai_summary", "bm_fr"),
+        ("breaks_yearly",  ["year"],                   "ai_summary", "by_fr"),
     ]:
         rows = supa.table(table) \
             .select(", ".join(["ticker"] + pk_fields + [en_field])) \
             .in_("ticker", tickers) \
             .not_.is_(en_field, "null") \
-            .is_("ai_summary_fr", "null") \
+            .is_(fr_field, "null") \
             .execute()
         todo_breaks = rows.data or []
         logger.info(f"TRANSLATE-FR {table}: {len(todo_breaks)} lignes à traduire")
@@ -664,7 +758,7 @@ def phase_translate_fr(tickers: list[str], region: str = "all"):
 
         for r, fr in zip(todo_breaks, translations):
             try:
-                q = supa.table(table).update({"ai_summary_fr": fr})
+                q = supa.table(table).update({fr_field: fr})
                 for pk in pk_fields:
                     q = q.eq(pk, r[pk])
                 q.eq("ticker", r["ticker"]).execute()
@@ -685,8 +779,6 @@ def phase_translate_fr_dumb(tickers: list[str], region: str = "all"):
     from services.translation_service import translate_batch_to_fr, DUMB_BATCH_SIZE
 
     supa = _supa()
-    progress = load_progress()
-    translated = set(progress.get("translated_fr_dumb", []))
 
     rows = supa.table("ow_cache") \
         .select("ticker, news_raw") \
@@ -694,12 +786,9 @@ def phase_translate_fr_dumb(tickers: list[str], region: str = "all"):
         .not_.is_("news_raw", "null") \
         .execute()
 
-    todo = [
-        r for r in (rows.data or [])
-        if r["ticker"] not in translated and r.get("news_raw")
-    ]
+    todo = [r for r in (rows.data or []) if r.get("news_raw")]
     total = len(todo)
-    logger.info(f"TRANSLATE-FR DUMB: {total} tickers à traiter ({len(translated)} déjà fait)")
+    logger.info(f"TRANSLATE-FR DUMB: {total} tickers à traiter")
 
     if not todo:
         logger.info("Rien à traduire.")
@@ -722,8 +811,6 @@ def phase_translate_fr_dumb(tickers: list[str], region: str = "all"):
         ]
 
         if not to_translate:
-            progress.setdefault("translated_fr_dumb", []).append(ticker)
-            save_progress(progress)
             continue
 
         logger.info(f"[DUMB {i}/{total}] {ticker} — {len(to_translate)} articles")
@@ -731,7 +818,6 @@ def phase_translate_fr_dumb(tickers: list[str], region: str = "all"):
             indices = [idx for idx, _ in to_translate]
             texts = [a["brutalised"] for _, a in to_translate]
 
-            # Batch par tranches de DUMB_BATCH_SIZE
             for chunk_start in range(0, len(texts), DUMB_BATCH_SIZE):
                 chunk_texts = texts[chunk_start:chunk_start + DUMB_BATCH_SIZE]
                 chunk_indices = indices[chunk_start:chunk_start + DUMB_BATCH_SIZE]
@@ -742,23 +828,20 @@ def phase_translate_fr_dumb(tickers: list[str], region: str = "all"):
             supa.table("ow_cache").update({"news_raw": articles}).eq("ticker", ticker).execute()
             total_articles += len(to_translate)
             logger.info(f"  ✓ {ticker} ({len(to_translate)} articles traduits)")
-            progress.setdefault("translated_fr_dumb", []).append(ticker)
         except Exception as e:
             logger.error(f"  ✗ {ticker}: {e}")
             batch_errors.append(ticker)
 
-        save_progress(progress)
-
         if i % NOTIFY_EVERY == 0:
-            save_progress(progress, force=True)
             _notify_checkpoint("translate-fr-dumb", i, total, region, batch_errors, [], 0, start_time)
             batch_errors = []
 
     elapsed = int(time.time() - start_time)
     mins, secs = divmod(elapsed, 60)
+    n_done = total - len(batch_errors)
     _telegram(
         f"✅ *Batch TRANSLATE-FR DUMB terminé — {region}*\n"
-        f"{len(progress.get('translated_fr_dumb', []))} tickers · {total_articles} articles\n"
+        f"{n_done} tickers · {total_articles} articles\n"
         f"⏱ {mins}m{secs:02d}s"
     )
 
@@ -770,32 +853,18 @@ def main():
     parser.add_argument("--phase", choices=["scrape", "enrich", "all", "translate-fr", "translate-fr-dumb", "bubbles"], default="scrape")
     parser.add_argument("--region", choices=["US", "EU", "ASIA", "all"], default="all")
     parser.add_argument("--ticker", type=str, default=None, help="Ticker unique")
-    parser.add_argument("--reset", action="store_true", help="Remet le progress à zéro")
     parser.add_argument("--lang", choices=["fr", "en"], default=None,
                         help="Langue de génération LLM (fr=default, en=EN-first)")
     parser.add_argument("--translate-fr", action="store_true",
-                        help="Traduit EN→FR après génération (pour EU/ASIA qui n'ont pas encore de FR)")
-    parser.add_argument("--progress-file", type=str, default=None,
-                        help="Fichier de progress custom (défaut: batch_progress.json)")
+                        help="Traduit EN→FR après génération")
+    parser.add_argument("--empty-only", action="store_true",
+                        help="Bubbles : tickers ayant ≥1 BUB vide en DB")
+    parser.add_argument("--force", action="store_true",
+                        help="Bubbles : régénère toutes les causes existantes dans bub_cache")
+    parser.add_argument("--cleanup", action="store_true",
+                        help="Bubbles : supprime les rows bub_cache orphelines après le run")
     args = parser.parse_args()
 
-    # Progress file : custom > auto-namé par phase+region pour éviter les dirty writes concurrents
-    global PROGRESS_FILE
-    if args.progress_file:
-        PROGRESS_FILE = Path(args.progress_file)
-    else:
-        region_slug = args.region.lower()
-        lang_slug = (args.lang or os.environ.get("LLM_LANG", "en")).lower()
-        if args.phase in ("enrich", "bubbles"):
-            PROGRESS_FILE = Path(__file__).parent / f"batch_progress_{args.phase}_{region_slug}_{lang_slug}.json"
-        elif args.phase == "translate-fr-dumb":
-            PROGRESS_FILE = Path(__file__).parent / f"batch_progress_translate_fr_dumb_{region_slug}.json"
-        elif args.phase == "translate-fr":
-            PROGRESS_FILE = Path(__file__).parent / f"batch_progress_translate_fr_{region_slug}.json"
-        else:
-            PROGRESS_FILE = Path(__file__).parent / f"batch_progress_{args.phase}_{region_slug}.json"
-
-    # Appliquer la langue via env var (lu par tous les services)
     if args.lang:
         os.environ["LLM_LANG"] = args.lang
         logger.info(f"LLM_LANG={args.lang}")
@@ -803,10 +872,6 @@ def main():
     if args.translate_fr:
         os.environ["TRANSLATE_TO_FR"] = "true"
         logger.info("TRANSLATE_TO_FR=true — traduction EN→FR activée")
-
-    if args.reset:
-        PROGRESS_FILE.unlink(missing_ok=True)
-        logger.info("Progress remis à zéro")
 
     if args.ticker:
         tickers = [args.ticker.upper()]
@@ -830,7 +895,8 @@ def main():
         phase_translate_fr_dumb(tickers, region=args.region)
 
     if args.phase == "bubbles":
-        phase_bubbles(tickers, region=args.region)
+        phase_bubbles(tickers, region=args.region, empty_only=args.empty_only,
+                      cleanup=args.cleanup, force=args.force)
 
 
 if __name__ == "__main__":

@@ -61,8 +61,8 @@ def _reenrich_ow_cache_groq_to_better(supa) -> tuple[bool, int]:
     """Re-enrichit ow_cache. Retourne (True, n) si terminé, (False, n) si quota atteint."""
     rows = (
         supa.table("ow_cache")
-        .select("ticker, generated_by_fr, generated_by_en")
-        .or_("generated_by_fr.eq.groq,generated_by_en.eq.groq,ai_summary_en.is.null")
+        .select("ticker, llm_source_fr, llm_source_en")
+        .or_("llm_source_fr.eq.groq,llm_source_en.eq.groq,ow7d_en.is.null")
         .limit(50)
         .execute()
     )
@@ -93,7 +93,7 @@ def _reenrich_break_weekly_groq_to_better(supa) -> tuple[bool, int]:
     rows = (
         supa.table("breaks_weekly")
         .select("ticker, year_month, week_num, top_articles, article_count")
-        .or_("llm_source.eq.groq,ai_summary_en.is.null")
+        .or_("llm_source.eq.groq,bw_en.is.null")
         .limit(30)
         .execute()
     )
@@ -121,9 +121,9 @@ def _reenrich_break_weekly_groq_to_better(supa) -> tuple[bool, int]:
             label = _week_label(ym, wnum)
             summary = _llm_call(WEEK_CONDENSE_PROMPT_EN.format(ticker=ticker, label=label, articles_text=articles_text), cascade="weekly_prod")
             supa.table("breaks_weekly").update({
-                _summary_col(): summary,
-                "ai_summary_en": summary,
-                "llm_source": _llm_call._last_source,
+                _summary_col("breaks_weekly"): summary,
+                "bw_en": summary,
+                "llm_source_en": _llm_call._last_source,
                 "condensed_at": datetime.now(timezone.utc).isoformat(),
             }).eq("ticker", ticker).eq("year_month", ym).eq("week_num", wnum).execute()
             done += 1
@@ -141,7 +141,7 @@ def _reenrich_break_monthly_groq_to_better(supa) -> tuple[bool, int]:
     rows = (
         supa.table("breaks_monthly")
         .select("ticker, year_month, article_count")
-        .eq("llm_source", "groq")
+        .eq("llm_source_en", "groq")
         .limit(20)
         .execute()
     )
@@ -163,25 +163,26 @@ def _reenrich_break_monthly_groq_to_better(supa) -> tuple[bool, int]:
         try:
             week_rows = (
                 supa.table("breaks_weekly")
-                .select("week_num, ai_summary_en, ai_summary")
+                .select("week_num, bw_en, ai_summary, status")
                 .eq("ticker", ticker)
                 .eq("year_month", ym)
                 .order("week_num")
                 .execute()
             )
-            if not week_rows.data or len(week_rows.data) < 2:
+            ok_weeks = [r for r in (week_rows.data or []) if r.get("status") is None]
+            if len(ok_weeks) < 2:
                 continue
             weeks_text = "\n".join(
-                f"W{r['week_num']}: {r.get('ai_summary_en') or r.get('ai_summary', '')}"
-                for r in week_rows.data
+                f"W{r['week_num']}: {r.get('bw_en') or r.get('ai_summary', '')}"
+                for r in ok_weeks
             )
             summary = _llm_call(MONTH_CONDENSE_PROMPT_EN.format(
                 ticker=ticker, label=_month_label(ym), weeks_text=weeks_text,
             ), max_tokens=500, cascade="monthly_prod")
             supa.table("breaks_monthly").update({
-                _summary_col(): summary,
-                "ai_summary_en": summary,
-                "llm_source": _llm_call._last_source,
+                _summary_col("breaks_monthly"): summary,
+                "bm_en": summary,
+                "llm_source_en": _llm_call._last_source,
                 "condensed_at": datetime.now(timezone.utc).isoformat(),
             }).eq("ticker", ticker).eq("year_month", ym).execute()
             done += 1

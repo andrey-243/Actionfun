@@ -7,7 +7,7 @@ import { sourceStyle } from "../components/ArticleDrawer";
 import { NavBrand, BackButton, HEADER_STYLE, HEADER_INNER } from "../components/Navbar";
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
-interface DigestArticle {
+interface MyNews1DArticle {
   title: string;
   source: string;
   url: string;
@@ -16,18 +16,18 @@ interface DigestArticle {
   dumb_fr?: string;
 }
 
-interface Digest {
+interface MyNews1DTicker {
   ticker: string;
   summary_24h: string;
   sentiment_24h: string;
   summary?: string;
   no_24h_news?: boolean;
-  articles?: DigestArticle[];
+  articles?: MyNews1DArticle[];
   website?: string | null;
   cached_at?: string | null;
 }
 
-interface WeeklyArticle {
+interface MyNews1WArticle {
   title: string;
   url: string;
   source?: string;
@@ -36,10 +36,10 @@ interface WeeklyArticle {
   dumb_fr?: string;
 }
 
-interface Weekly {
+interface MyNews1WTicker {
   ticker: string;
   ai_summary: string;
-  top_articles: WeeklyArticle[];
+  top_articles: MyNews1WArticle[];
   website?: string | null;
   cached_at?: string | null;
   generating?: boolean;
@@ -189,7 +189,7 @@ function shortAge(ms: number): string {
 const DAILY_LIMIT = 5;
 const WEEKLY_LIMIT = 10;
 
-function DigestCard({ digest }: { digest: Digest }) {
+function DigestCard({ digest }: { digest: MyNews1DTicker }) {
   const router = useRouter();
   const [expanded, setExpanded] = useState(false);
   const [showAll, setShowAll] = useState(false);
@@ -331,7 +331,7 @@ function DigestCard({ digest }: { digest: Digest }) {
   );
 }
 
-function WeeklyCard({ weekly }: { weekly: Weekly }) {
+function WeeklyCard({ weekly }: { weekly: MyNews1WTicker }) {
   const router = useRouter();
   const [expanded, setExpanded] = useState(false);
   const [showAll, setShowAll] = useState(false);
@@ -451,8 +451,8 @@ export default function MyNewsPage() {
   const router = useRouter();
   const [pins, setPins] = useState<string[]>([]);
   const [tab, setTab] = useState<Tab>("daily");
-  const [digests, setDigests] = useState<Digest[]>([]);
-  const [weeklies, setWeeklies] = useState<Weekly[]>([]);
+  const [myNews1DTickers, setMyNews1DTickers] = useState<MyNews1DTicker[]>([]);
+  const [myNews1WTickers, setMyNews1WTickers] = useState<MyNews1WTicker[]>([]);
   const [loadingDaily, setLoadingDaily] = useState(true);
   const [loadingWeekly, setLoadingWeekly] = useState(false);
   const [weeklyFetched, setWeeklyFetched] = useState(false);
@@ -484,7 +484,7 @@ export default function MyNewsPage() {
             .then((r) => r.json())
             .then((d) => {
               if (d && d.ticker && d.summary_24h) {
-                setDigests((prev) => [...prev, d]);
+                setMyNews1DTickers((prev) => [...prev, d]);
                 if (!firstArrived) { firstArrived = true; setLoadingDaily(false); }
               }
             })
@@ -505,7 +505,7 @@ export default function MyNewsPage() {
           .then((r) => r.json())
           .then((w) => {
             if (w && w.ticker) {
-              setWeeklies((prev) => [...prev, w]);
+              setMyNews1WTickers((prev) => [...prev, w]);
               if (!firstArrived) { firstArrived = true; setLoadingWeekly(false); }
             }
           })
@@ -598,7 +598,7 @@ export default function MyNewsPage() {
             </p>
           </div>
         ) : tab === "daily" ? (
-          digests.length === 0 ? (
+          myNews1DTickers.length === 0 ? (
             <div style={{ textAlign: "center", padding: "60px 0", color: "var(--color-text-muted)", fontSize: "13px" }}>
               Pas de news disponible aujourd'hui pour tes actions.
             </div>
@@ -607,7 +607,7 @@ export default function MyNewsPage() {
               <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "16px" }}>
                 <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
                   <span style={{ fontSize: "11px", fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase", color: "var(--color-text-muted)" }}>
-                    {new Set(digests.map(d => d.ticker)).size} action{new Set(digests.map(d => d.ticker)).size > 1 ? "s" : ""} · digest du jour
+                    {new Set(myNews1DTickers.map(d => d.ticker)).size} action{new Set(myNews1DTickers.map(d => d.ticker)).size > 1 ? "s" : ""} · digest du jour
                   </span>
                   <span style={{
                     padding: "1px 6px", borderRadius: "4px", fontSize: "9px", fontWeight: 700,
@@ -619,7 +619,7 @@ export default function MyNewsPage() {
                   {new Date().toLocaleDateString("fr-FR", { weekday: "long", day: "numeric", month: "long" })}
                 </span>
               </div>
-              {[...new Map(digests.map(d => [d.ticker, d])).values()]
+              {[...new Map(myNews1DTickers.map(d => [d.ticker, d])).values()]
                 .sort((a, b) => {
                   const aMs = a.articles?.[0]?.pub_date ? new Date(a.articles[0].pub_date).getTime() : 0;
                   const bMs = b.articles?.[0]?.pub_date ? new Date(b.articles[0].pub_date).getTime() : 0;
@@ -629,7 +629,7 @@ export default function MyNewsPage() {
             </>
           )
         ) : (
-          weeklies.length === 0 ? (
+          myNews1WTickers.length === 0 ? (
             <div style={{ textAlign: "center", padding: "60px 0", color: "var(--color-text-muted)", fontSize: "13px" }}>
               Pas de résumé hebdomadaire disponible pour tes actions.
             </div>
@@ -637,13 +637,14 @@ export default function MyNewsPage() {
             <>
               <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "16px" }}>
                 <span style={{ fontSize: "11px", fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase", color: "var(--color-text-muted)" }}>
-                  {new Set(weeklies.map(w => w.ticker)).size} action{new Set(weeklies.map(w => w.ticker)).size > 1 ? "s" : ""} · recap de la semaine
+                  {new Set(myNews1WTickers.map(w => w.ticker)).size} action{new Set(myNews1WTickers.map(w => w.ticker)).size > 1 ? "s" : ""} · recap de la semaine
                 </span>
                 <span style={{ fontSize: "11px", color: "var(--color-text-muted)", fontFamily: "var(--font-mono)" }}>
                   {getCurrentWeekLabel()}
                 </span>
               </div>
-              {[...new Map(weeklies.map(w => [w.ticker, w])).values()]
+              {[...new Map(myNews1WTickers.map(w => [w.ticker, w])).values()]
+                .filter(w => (w.top_articles?.length ?? 0) > 0)
                 .sort((a, b) => {
                   const aMs = a.top_articles?.[0]?.pub_date ? new Date(a.top_articles[0].pub_date).getTime() : 0;
                   const bMs = b.top_articles?.[0]?.pub_date ? new Date(b.top_articles[0].pub_date).getTime() : 0;

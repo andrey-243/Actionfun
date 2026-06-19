@@ -1,8 +1,8 @@
 """
 Digest emails — Daily (18h30) & Weekly (vendredi 22h30).
 
-send_daily_digest()    : lit ow_cache (ai_summary_24h_en/fr) + articles 24h
-send_weekly_digest() : lit ow_cache (ai_summary_en/fr) + articles 7j (5 max)
+send_daily_digest()    : lit ow_cache (ow1d_en/fr) + articles 24h
+send_weekly_digest() : lit ow_cache (ow7d_en/fr) + articles 7j (5 max)
 
 Langue par user : user_preferences.lang ('en' | 'fr', default 'fr').
 Zéro appel LLM — tout lu depuis le cache existant.
@@ -75,18 +75,18 @@ def _build_digests_daily(supa, tickers: list[str]) -> list[dict]:
     result = []
     for ticker in tickers:
         row = supa.table("ow_cache") \
-            .select("ai_summary_24h_en, ai_summary_24h_fr, ai_sentiment_24h") \
+            .select("ow1d_en, ow1d_fr, ow1d_sentiment") \
             .eq("ticker", ticker).maybe_single().execute()
         if not row or not row.data:
             continue
-        if not row.data.get("ai_summary_24h_en") and not row.data.get("ai_summary_24h_fr"):
+        if not row.data.get("ow1d_en") and not row.data.get("ow1d_fr"):
             continue
         articles = _articles_window(supa, ticker, hours=24)[:12]
         result.append({
             "ticker": ticker,
-            "summary_en": row.data.get("ai_summary_24h_en", ""),
-            "summary_fr": row.data.get("ai_summary_24h_fr", ""),
-            "sentiment": row.data.get("ai_sentiment_24h", "NEUTRAL"),
+            "summary_en": row.data.get("ow1d_en", ""),
+            "summary_fr": row.data.get("ow1d_fr", ""),
+            "sentiment": row.data.get("ow1d_sentiment", "NEUTRAL"),
             "articles": articles,
         })
     return result
@@ -97,17 +97,17 @@ def _build_digests_weekly(supa, tickers: list[str]) -> list[dict]:
     result = []
     for ticker in tickers:
         row = supa.table("ow_cache") \
-            .select("ai_summary_en, ai_summary_fr") \
+            .select("ow7d_en, ow7d_fr") \
             .eq("ticker", ticker).maybe_single().execute()
         if not row or not row.data:
             continue
-        if not row.data.get("ai_summary_en") and not row.data.get("ai_summary_fr"):
+        if not row.data.get("ow7d_en") and not row.data.get("ow7d_fr"):
             continue
         articles = _articles_window(supa, ticker, hours=7 * 24)[:5]
         result.append({
             "ticker": ticker,
-            "summary_en": row.data.get("ai_summary_en", ""),
-            "summary_fr": row.data.get("ai_summary_fr", ""),
+            "summary_en": row.data.get("ow7d_en", ""),
+            "summary_fr": row.data.get("ow7d_fr", ""),
             "sentiment": None,
             "articles": articles,
         })
@@ -171,7 +171,7 @@ def send_daily_digest():
         logger.info("Daily digest — aucun ticker pinné")
         return
 
-    _ensure_fr_translations(supa, tickers, "ai_summary_24h_en", "ai_summary_24h_fr")
+    _ensure_fr_translations(supa, tickers, "ow1d_en", "ow1d_fr")
     all_data = _build_digests_daily(supa, tickers)  # snapshot post-translation
     if not all_data:
         logger.info("Daily digest — aucun summary disponible")
@@ -191,7 +191,7 @@ def send_weekly_digest():
         logger.info("Weekly digest — aucun ticker pinné")
         return
 
-    _ensure_fr_translations(supa, tickers, "ai_summary_en", "ai_summary_fr")
+    _ensure_fr_translations(supa, tickers, "ow7d_en", "ow7d_fr")
     all_data = _build_digests_weekly(supa, tickers)  # snapshot post-translation
     if not all_data:
         logger.info("Weekly digest — aucun summary disponible")

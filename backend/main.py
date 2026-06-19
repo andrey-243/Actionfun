@@ -5,6 +5,9 @@ Enregistre tous les routers (/api/stock, /api/news, /api/search, /api/events,
 /api/articles, /api/weekly, /api/ticker) et démarre APScheduler avec les crons :
   - yahoo */3h      : merge articles + trigger OW si nouveaux articles
   - finnhub */6h    : idem côté Finnhub
+  - google_rss */3h : merge Google RSS (tous pinnés) + trigger OW
+  - marketaux */6h  : merge Marketaux EU+ASIA + trigger OW
+  - newsapi */6h    : merge NewsAPI EU+ASIA + trigger OW
   - hourly :15      : refresh OW pour tickers no_24h_news
   - email 19h15     : Daily digest Resend (1J)
   - email sam 7h00  : Weekly digest Resend (7J)
@@ -105,6 +108,27 @@ async def lifespan(app: FastAPI):
         id="finnhub_articles_scrap",
     )
     scheduler.add_job(
+        _google_rss_articles_scrap,
+        trigger="cron",
+        hour="*/3",
+        minute=45,
+        id="google_rss_articles_scrap",
+    )
+    scheduler.add_job(
+        _marketaux_articles_scrap,
+        trigger="cron",
+        hour="*/6",
+        minute=15,
+        id="marketaux_articles_scrap",
+    )
+    scheduler.add_job(
+        _newsapi_articles_scrap,
+        trigger="cron",
+        hour="*/6",
+        minute=20,
+        id="newsapi_articles_scrap",
+    )
+    scheduler.add_job(
         _hourly_ow_regen,
         trigger="cron",
         minute=15,
@@ -131,7 +155,7 @@ async def lifespan(app: FastAPI):
         id="reenrich_retry",
     )
     scheduler.start()
-    logger.info("Crons démarrés — daily_digest 19h15, weekly_digest sam 7h, gen_breaks_weekly lun 3h30, gen_breaks_monthly 1er 4h, gen_breaks_yearly 1er jan 5h, yahoo_articles_scrap */3h, finnhub_articles_scrap */6h, cold_start_translate_fr 19h, reenrich_groq_to_better 22h30, reenrich_retry :35 (pending), hourly_ow_regen :15")
+    logger.info("Crons démarrés — daily_digest 19h15, weekly_digest sam 7h, gen_breaks_weekly lun 3h30, gen_breaks_monthly 1er 4h, gen_breaks_yearly 1er jan 5h, yahoo_articles_scrap */3h, finnhub_articles_scrap */6h, google_rss_articles_scrap */3h:45, marketaux_articles_scrap */6h:15, newsapi_articles_scrap */6h:20, cold_start_translate_fr 19h, reenrich_groq_to_better 22h30, reenrich_retry :35 (pending), hourly_ow_regen :15")
     yield
     scheduler.shutdown()
 
@@ -234,6 +258,54 @@ def _finnhub_articles_scrap():
     except Exception as e:
         logger.error(f"Finnhub articles scrap failed: {e}")
         _tg(f"❌ *Finnhub — scrap + OW regen* : `{e}`")
+
+
+def _google_rss_articles_scrap():
+    import time
+    from services.breakers_articles_service import google_rss_articles_scrap
+    _tg("▶ *Google RSS — scrap + OW regen* (*/3h)")
+    t = time.time()
+    try:
+        results = google_rss_articles_scrap()
+        n_tickers = len(results)
+        n_articles = sum(results.values())
+        detail = " · ".join(f"{tk} +{n}" for tk, n in sorted(results.items())) if results else "rien de nouveau"
+        _tg(f"✅ *Google RSS — scrap + OW regen* ({int(time.time()-t)}s)\n{n_tickers} tickers · {n_articles} articles\n{detail}")
+    except Exception as e:
+        logger.error(f"Google RSS articles scrap failed: {e}")
+        _tg(f"❌ *Google RSS — scrap + OW regen* : `{e}`")
+
+
+def _marketaux_articles_scrap():
+    import time
+    from services.breakers_articles_service import marketaux_articles_scrap
+    _tg("▶ *Marketaux — scrap EU+ASIA* (*/6h)")
+    t = time.time()
+    try:
+        results = marketaux_articles_scrap()
+        n_tickers = len(results)
+        n_articles = sum(results.values())
+        detail = " · ".join(f"{tk} +{n}" for tk, n in sorted(results.items())) if results else "rien de nouveau"
+        _tg(f"✅ *Marketaux — scrap EU+ASIA* ({int(time.time()-t)}s)\n{n_tickers} tickers · {n_articles} articles\n{detail}")
+    except Exception as e:
+        logger.error(f"Marketaux articles scrap failed: {e}")
+        _tg(f"❌ *Marketaux — scrap EU+ASIA* : `{e}`")
+
+
+def _newsapi_articles_scrap():
+    import time
+    from services.breakers_articles_service import newsapi_articles_scrap
+    _tg("▶ *NewsAPI — scrap EU+ASIA* (*/6h)")
+    t = time.time()
+    try:
+        results = newsapi_articles_scrap()
+        n_tickers = len(results)
+        n_articles = sum(results.values())
+        detail = " · ".join(f"{tk} +{n}" for tk, n in sorted(results.items())) if results else "rien de nouveau"
+        _tg(f"✅ *NewsAPI — scrap EU+ASIA* ({int(time.time()-t)}s)\n{n_tickers} tickers · {n_articles} articles\n{detail}")
+    except Exception as e:
+        logger.error(f"NewsAPI articles scrap failed: {e}")
+        _tg(f"❌ *NewsAPI — scrap EU+ASIA* : `{e}`")
 
 
 _reenrich_pending: bool = False

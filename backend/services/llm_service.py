@@ -15,10 +15,13 @@ import time
 import os
 import json
 import random
+import logging
 import threading
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
+
+_logger = logging.getLogger(__name__)
 
 _USAGE_LOG = Path.home() / "llm-stack" / "token_usage.jsonl"
 _FAILED_LOG = Path.home() / "llm-stack" / "logs" / "llm_cascade_failures.jsonl"
@@ -91,7 +94,11 @@ GEMINI_MODEL = "gemini-3.1-flash-lite"
 FREETHEAI_PRIMARY = "bbl/gpt-4.1"
 FREETHEAI_SECONDARY = "bbl/gpt-5.4-mini"
 OPENAI_MODEL = "openai/gpt-5.5"
-HAPUPPY_MODELS = ["gpt-4.1-mini"]
+ZEN_MODELS = ["free/gpt-5.5", "free/claude-sonnet-4.6"]  # ZEN PROMO — modèles gratuits en waterfall
+ZEN_MIN_INTERVAL = float(os.environ.get("ZEN_MIN_INTERVAL", "10.0"))  # secondes entre calls zen
+_zen_last_call: float = 0.0
+_zen_lock = threading.Lock()
+HAPUPPY_MODELS = ["hapuppy/gpt-5.5", "hapuppy/gpt-5.4"]
 
 # Désactive FreeTheAI jusqu'au prochain minuit UTC quand checkin/quota daily
 _freetheai_skip_until: datetime | None = None
@@ -99,7 +106,7 @@ _freetheai_skip_until: datetime | None = None
 # Circuit breaker FreeTheAI 502/503/timeout — par round (pas par tentative modèle)
 _freetheai_fail_count: int = 0
 _freetheai_fail_freeze_until: float | None = None  # monotonic timestamp
-FREETHEAI_FAIL_THRESHOLD = 3
+FREETHEAI_FAIL_THRESHOLD = 10
 FREETHEAI_FAIL_FREEZE_SECONDS = 1800  # 30 min
 
 # Freeze 3h après 3 × 429 consécutifs (RPM saturé)
@@ -114,7 +121,7 @@ FREETHEAI_CONCURRENCY = int(os.environ.get("FREETHEAI_CONCURRENCY", "1"))
 _freetheai_semaphore = threading.Semaphore(FREETHEAI_CONCURRENCY)
 
 # ZenithAI — 2 clés en cascade (key1 = OPENAI_API_KEY, key2 = ZENITH_API_KEY2)
-ZENITH_KEYS_ENV = ["OPENAI_API_KEY", "ZENITH_API_KEY2"]
+ZENITH_KEYS_ENV = ["ZENLLM_API_KEY", "ZENITH_API_KEY2"]
 ZENITH_CONCURRENCY = int(os.environ.get("ZENITH_CONCURRENCY", "1"))
 _zenith_semaphore = threading.Semaphore(ZENITH_CONCURRENCY)
 ZENITH_ERROR_THRESHOLD = 3
@@ -125,8 +132,11 @@ _zenith_freeze_until: list[float | None] = [None, None]
 _zenith_bad_key: list[bool] = [False, False]
 
 # Hapuppy — concurrence limitée (semaphore partagé entre threads)
-HAPUPPY_CONCURRENCY = int(os.environ.get("HAPUPPY_CONCURRENCY", "15"))
+HAPUPPY_CONCURRENCY = int(os.environ.get("HAPUPPY_CONCURRENCY", "25"))
 _hapuppy_semaphore = threading.Semaphore(HAPUPPY_CONCURRENCY)
+# Rate-limiter adaptatif : interval calculé dynamiquement selon l'état de Groq et Gemini
+_hapuppy_rate_lock = threading.Lock()
+_hapuppy_rate_last: float = 0.0
 
 # Hapuppy — freeze quota (1min) vs rate-limit (backoff global partagé entre threads)
 HAPUPPY_QUOTA_FREEZE_SECONDS = int(os.environ.get("HAPUPPY_QUOTA_FREEZE_SECONDS", "0"))
@@ -134,7 +144,7 @@ HAPUPPY_RATELIMIT_BACKOFF_SECONDS = int(os.environ.get("HAPUPPY_RATELIMIT_BACKOF
 _hapuppy_quota_skip_until: float | None = None  # monotonic timestamp
 _hapuppy_ratelimit_until: float = 0.0            # backoff global partagé entre threads
 _hapuppy_last_attempt: float = 0.0
-HAPUPPY_MIN_INTERVAL = float(os.environ.get("HAPUPPY_MIN_INTERVAL", "0.0"))  # pas de throttle par défaut
+HAPUPPY_MIN_INTERVAL = float(os.environ.get("HAPUPPY_MIN_INTERVAL", "0.0"))  # override manuel
 
 _HAPUPPY_QUOTA_KEYWORDS = ("quota", "credit", "budget", "exhausted", "daily limit")
 
@@ -149,9 +159,16 @@ _groq_exhausted: bool = False  # True quand 3 x 429 consécutifs → quota daily
 _groq_bad_key: bool = False    # 403 → clé invalide/expirée, skip pour toute la session
 _last_llm_source: str = "unknown"  # mis à jour par llm_call() après chaque succès
 
-_gemini_bad_key: bool = False
-_gemini_daily_exhausted: bool = False
-_gemini_ratelimit_until: float = 0.0
+GEMINI_KEYS_ENV = ["GEMINI_API_KEY", "GEMINI_API_KEY_2", "GEMINI_API_KEY_3"]
+_N_GEMINI = len(GEMINI_KEYS_ENV)
+_gemini_bad_key:         list[bool]             = [False] * _N_GEMINI
+_gemini_daily_exhausted: list[bool]             = [False] * _N_GEMINI
+_gemini_ratelimit_until: list[float]            = [0.0]   * _N_GEMINI
+_gemini_last_call:       list[float]            = [0.0]   * _N_GEMINI
+_gemini_consecutive_429: list[int]              = [0]     * _N_GEMINI
+_gemini_freeze_until:    list[datetime | None]  = [None]  * _N_GEMINI
+_gemini_lock = threading.Lock()
+GEMINI_MIN_INTERVAL: float = 4.1  # secondes entre calls par clé (15 RPM → 4s min)
 
 
 class GroqExhaustedError(RuntimeError):
@@ -259,21 +276,10 @@ def _is_daily_limit_error(r: httpx.Response) -> bool:
 
 
 def _try_gemini(payload_base: dict, timeout: int, trail: list[str]) -> dict | None:
-    """Tente Gemini natif. Retourne dict OpenAI-compatible ou None."""
-    global _gemini_bad_key, _gemini_daily_exhausted, _gemini_ratelimit_until, _last_llm_source
-    gemini_key = os.environ.get("GEMINI_API_KEY", "")
-    if not gemini_key or _gemini_bad_key or _gemini_daily_exhausted:
-        if gemini_key and _gemini_bad_key:
-            trail.append("Gemini : ⏭ skipped (clé invalide)")
-        elif gemini_key and _gemini_daily_exhausted:
-            trail.append("Gemini : ⏭ skipped (quota daily épuisé)")
-        return None
+    """Tente Gemini natif avec rotation des clés. Retourne dict OpenAI-compatible ou None."""
+    global _last_llm_source
 
-    wait = _gemini_ratelimit_until - time.monotonic()
-    if wait > 0:
-        time.sleep(wait)
-
-    # Convertir messages OpenAI → format Gemini
+    # Convertir messages OpenAI → format Gemini (fait une seule fois)
     contents = []
     system_instruction = None
     for msg in payload_base.get("messages", []):
@@ -297,38 +303,110 @@ def _try_gemini(payload_base: dict, timeout: int, trail: list[str]) -> dict | No
         body["system_instruction"] = system_instruction
 
     url = GEMINI_URL.format(model=GEMINI_MODEL)
-    try:
-        r = httpx.post(url, params={"key": gemini_key}, json=body, timeout=timeout)
-        if r.status_code == 200:
-            data = r.json()
-            text = data["candidates"][0]["content"]["parts"][0]["text"]
-            usage = data.get("usageMetadata", {})
-            _log_usage(GEMINI_MODEL, usage.get("promptTokenCount", 0), usage.get("candidatesTokenCount", 0), provider="google", vendor="gemini")
-            _last_llm_source = "gemini"
-            trail.append(f"Gemini `{GEMINI_MODEL}` : ✓")
-            return {
-                "choices": [{"message": {"content": text, "role": "assistant"}}],
-                "_llm_source": "gemini",
-                "usage": {"prompt_tokens": usage.get("promptTokenCount", 0), "completion_tokens": usage.get("candidatesTokenCount", 0)},
-            }
-        if r.status_code == 429:
-            err = str(r.json()).lower()
-            if any(k in err for k in ("daily", "per_day", "per_day_free_tier")):
-                _gemini_daily_exhausted = True
-                trail.append("Gemini : ✗ 429 quota daily épuisé")
+
+    for i, env_name in enumerate(GEMINI_KEYS_ENV):
+        gemini_key = os.environ.get(env_name, "")
+        if not gemini_key:
+            continue
+        if _gemini_bad_key[i]:
+            trail.append(f"Gemini k{i+1} : ⏭ clé invalide")
+            continue
+        if _gemini_daily_exhausted[i]:
+            trail.append(f"Gemini k{i+1} : ⏭ daily épuisé")
+            continue
+        # Freeze 3x429 : skip jusqu'à minuit UTC, probe toutes les 1h ensuite
+        if _gemini_freeze_until[i] is not None:
+            now_utc = datetime.now(timezone.utc)
+            if now_utc < _gemini_freeze_until[i]:
+                trail.append(f"Gemini k{i+1} : ⏭ frozen (reset {_gemini_freeze_until[i].strftime('%Hh%M UTC')})")
+                continue
             else:
-                _gemini_ratelimit_until = time.monotonic() + 90
-                trail.append("Gemini : ✗ 429 rate-limit (backoff 90s)")
+                _gemini_freeze_until[i] = now_utc + timedelta(hours=1)
+
+        with _gemini_lock:
+            now = time.monotonic()
+            wait = max(
+                _gemini_ratelimit_until[i] - now,
+                GEMINI_MIN_INTERVAL - (now - _gemini_last_call[i]),
+            )
+            _gemini_last_call[i] = now + wait if wait > 0 else now
+        if wait > 0:
+            time.sleep(wait)
+
+        try:
+            r = httpx.post(url, params={"key": gemini_key}, json=body, timeout=timeout)
+            if r.status_code == 200:
+                data = r.json()
+                text = data["candidates"][0]["content"]["parts"][0]["text"]
+                usage = data.get("usageMetadata", {})
+                _log_usage(GEMINI_MODEL, usage.get("promptTokenCount", 0), usage.get("candidatesTokenCount", 0), provider="google", vendor="gemini")
+                _last_llm_source = "gemini"
+                _gemini_consecutive_429[i] = 0
+                _gemini_freeze_until[i] = None
+                trail.append(f"Gemini `{GEMINI_MODEL}` : ✓")
+                return {
+                    "choices": [{"message": {"content": text, "role": "assistant"}}],
+                    "_llm_source": "gemini",
+                    "usage": {"prompt_tokens": usage.get("promptTokenCount", 0), "completion_tokens": usage.get("candidatesTokenCount", 0)},
+                }
+            if r.status_code == 429:
+                err = str(r.json()).lower()
+                if any(k in err for k in ("daily", "per_day", "per_day_free_tier")):
+                    _gemini_daily_exhausted[i] = True
+                    _gemini_consecutive_429[i] = 0
+                    trail.append(f"Gemini k{i+1} : ✗ 429 daily épuisé → rotation")
+                    continue  # essaie la clé suivante
+                else:
+                    _gemini_consecutive_429[i] += 1
+                    if _gemini_consecutive_429[i] >= 3:
+                        _gemini_freeze_until[i] = _next_utc_midnight()
+                        _gemini_consecutive_429[i] = 0
+                        trail.append(f"Gemini k{i+1} : ✗ 429 x3 → frozen → rotation")
+                        continue  # essaie la clé suivante
+                    else:
+                        _gemini_ratelimit_until[i] = time.monotonic() + 90
+                        trail.append(f"Gemini k{i+1} : ✗ 429 rate-limit ({_gemini_consecutive_429[i]}/3) → rotation")
+                        continue  # essaie la clé suivante
+            if r.status_code in (400, 403):
+                _gemini_bad_key[i] = True
+                trail.append(f"Gemini k{i+1} : ✗ {r.status_code} clé invalide → rotation")
+                continue
+            trail.append(f"Gemini k{i+1} : ✗ {r.status_code}")
             return None
-        if r.status_code in (400, 403):
-            _gemini_bad_key = True
-            trail.append(f"Gemini : ✗ {r.status_code} clé invalide")
+        except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError):
+            trail.append(f"Gemini k{i+1} : ✗ timeout/connexion")
             return None
-        trail.append(f"Gemini : ✗ {r.status_code}")
-        return None
-    except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError):
-        trail.append("Gemini : ✗ timeout/connexion")
-        return None
+
+    return None
+
+
+def _hapuppy_adaptive_interval() -> float:
+    """Interval minimum entre appels Hapuppy selon l'état des autres providers.
+
+    Hapuppy = 100 req/min max. Intervals calculés pour rester sous ~75 RPM (marge 25%).
+
+    Groq down + Gemini up  → 0.8s  (~75 RPM, D charge Hapuppy)
+    Groq up  + Gemini down → 0.8s  (~75 RPM, W charge Hapuppy)
+    Les deux down          → 1.2s  (~50 RPM, D + W chargent Hapuppy)
+    Aucun down             → 0.0s  (Hapuppy full speed, charge normale)
+    Override manuel via HAPUPPY_MIN_INTERVAL (prioritaire si > 0).
+    """
+    if HAPUPPY_MIN_INTERVAL > 0:
+        return HAPUPPY_MIN_INTERVAL
+    groq_down = _groq_bad_key or _groq_exhausted
+    now_utc = datetime.now(timezone.utc)
+    gemini_down = all(
+        _gemini_bad_key[i]
+        or _gemini_daily_exhausted[i]
+        or (_gemini_freeze_until[i] is not None and now_utc < _gemini_freeze_until[i])
+        or not os.environ.get(GEMINI_KEYS_ENV[i], "")
+        for i in range(_N_GEMINI)
+    )
+    if groq_down and gemini_down:
+        return 1.2
+    if groq_down or gemini_down:
+        return 0.8
+    return 0.0
 
 
 def llm_call(
@@ -351,22 +429,24 @@ def llm_call(
             bub/weekly → Hapuppy → Gemini | ow7j → Hapuppy
             monthly → FreeTheAI → Hapuppy | yearly → FreeTheAI
     Scrap : weekly → Gemini → Hapuppy | dumb → Groq → Hapuppy | monthly → FreeTheAI
+    Promo : Gemini → raise
 
     Retourne le dict OpenAI complet (choices[0].message.content accessible).
     """
     global _freetheai_skip_until, _freetheai_exhausted
     # _zenith_* sont des listes mutées en place, pas besoin de global
 
-    # ── monthly_scrap : exit rapide si déjà exhausted ─────────────────────────
-    if cascade == "monthly_scrap" and _freetheai_exhausted:
+    # ── monthly_scrap : exit rapide si skip_until pas encore expiré ──────────
+    if cascade == "monthly_scrap" and _freetheai_skip_until is not None and datetime.now(timezone.utc) < _freetheai_skip_until:
         raise FreeTheAIExhaustedError("FreeTheAI exhausted (flag session actif)")
 
     freetheai_key = os.environ.get("FREETHEAI_API_KEY", "")
     payload_base = {
         "messages": messages,
-        "max_tokens": max_tokens,
         "temperature": temperature,
     }
+    if cascade != "promo":
+        payload_base["max_tokens"] = max_tokens
     if response_format:
         payload_base["response_format"] = response_format
 
@@ -378,7 +458,7 @@ def llm_call(
 
     # ── FreeTheAI ──────────────────────────────────────────────────────────────
     # _freetheai_available() acquiert _freetheai_semaphore(1) si dispo — relâché en fin de bloc
-    if cascade in ("monthly_prod", "yearly_prod", "monthly_scrap") and freetheai_key and _freetheai_available():
+    if cascade in ("monthly_prod", "yearly_prod", "monthly_scrap", "monthly_scrap_ext", "bub_batch") and freetheai_key and _freetheai_available():
         _freetheai_tried = True
         global _freetheai_fail_count, _freetheai_fail_freeze_until
         global _freetheai_429_count, _freetheai_429_freeze_until
@@ -447,7 +527,7 @@ def llm_call(
                 _freetheai_fail_freeze_until = time.monotonic() + FREETHEAI_FAIL_FREEZE_SECONDS
                 _freetheai_fail_count = 0
                 _send_cascade_notif("freetheai_down_frozen", trail, caller)
-    elif cascade in ("monthly_prod", "yearly_prod", "monthly_scrap"):
+    elif cascade in ("monthly_prod", "yearly_prod", "monthly_scrap", "monthly_scrap_ext", "bub_batch"):
         trail.append("FreeTheAI : ⏭ skipped (checkin/quota/RPM/circuit breaker)")
 
     # monthly_scrap : ne jamais fallback vers d'autres providers
@@ -455,6 +535,38 @@ def llm_call(
         if _freetheai_exhausted:
             raise FreeTheAIExhaustedError("FreeTheAI exhausted (daily/checkin limit hit)")
         raise RuntimeError(f"FreeTheAI unavailable ({groq_reason}) — monthly_scrap mode")
+
+    # ── ZenLLM zen promo : free/gpt-5.5 → free/claude-sonnet-4.6 → raise ─────────
+    if cascade == "zen" and os.environ.get("ZENITH_ENABLED", "1") != "0":
+        zen_key = os.environ.get("ZENLLM_API_KEY", "")
+        if zen_key:
+            global _zen_last_call
+            with _zen_lock:
+                wait = ZEN_MIN_INTERVAL - (time.monotonic() - _zen_last_call)
+                if wait > 0:
+                    time.sleep(wait)
+                _zen_last_call = time.monotonic()
+            for zen_model in ZEN_MODELS:
+                try:
+                    r = httpx.post(
+                        OPENAI_URL,
+                        headers={"Authorization": f"Bearer {zen_key}", "Content-Type": "application/json"},
+                        json={**payload_base, "model": zen_model, "temperature": 1},
+                        timeout=timeout,
+                    )
+                    if r.status_code == 200:
+                        result = r.json()
+                        result["_llm_source"] = f"zenllm/{zen_model}"
+                        _last_llm_source = f"zenllm/{zen_model}"
+                        u = result.get("usage", {})
+                        _log_usage(zen_model, u.get("prompt_tokens", 0), u.get("completion_tokens", 0), provider="openai", vendor="zenllm")
+                        trail.append(f"ZenLLM `{zen_model}` : ✓")
+                        return result
+                    _logger.warning(f"ZenLLM `{zen_model}` : {r.status_code} — {r.text[:80]}")
+                    trail.append(f"ZenLLM `{zen_model}` : ✗ {r.status_code}")
+                except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError) as e:
+                    _logger.warning(f"ZenLLM `{zen_model}` : timeout/connexion — {e}")
+                    trail.append(f"ZenLLM `{zen_model}` : ✗ timeout")
 
     # ── ZenithAI key1 → key2 (waterfall, 3 retries chacune) ──────────────────────
     for zen_idx in range(len(ZENITH_KEYS_ENV) if os.environ.get("ZENITH_ENABLED", "1") != "0" and cascade == "default" else 0):
@@ -519,8 +631,8 @@ def llm_call(
 
     groq_reason = "openai_down"
 
-    # ── Gemini — position "early" (ow24h, dumb_prod, dumb_scrap : avant Hapuppy) ──
-    if cascade in ("ow24h_prod", "dumb_prod", "weekly_scrap"):
+    # ── Gemini — position "early" (ow24h, ow7j, weekly_scrap : avant Hapuppy) ──
+    if cascade in ("ow24h_prod", "ow7j_prod", "weekly_scrap", "bub_prod", "promo", "bub_batch"):
         result = _try_gemini(payload_base, timeout, trail)
         if result:
             return result
@@ -528,7 +640,7 @@ def llm_call(
     # ── Hapuppy gpt-4.1-mini ──────────────────────────────────────────────────────
     hapuppy_key = (
         os.environ.get("HAPUPPY_API_KEY", "")
-        if cascade in ("default", "weekly_scrap", "hapuppy_only", "bub_prod", "ow7j_prod", "ow24h_prod", "weekly_prod", "monthly_prod", "dumb_prod") and os.environ.get("HAPUPPY_ENABLED", "1") != "0"
+        if cascade in ("default", "weekly_scrap", "bub_prod", "ow7j_prod", "ow24h_prod", "weekly_prod", "monthly_prod", "monthly_scrap_ext", "dumb_prod") and os.environ.get("HAPUPPY_ENABLED", "1") != "0"
         else ""
     )
     if hapuppy_key:
@@ -544,23 +656,25 @@ def llm_call(
                 hapuppy_key = ""
 
     if hapuppy_key:
-        global _hapuppy_ratelimit_until
-        if HAPUPPY_MIN_INTERVAL > 0:
-            wait = HAPUPPY_MIN_INTERVAL - (time.monotonic() - _hapuppy_last_attempt)
-            if wait > 0:
-                trail.append(f"Hapuppy : ⏳ RPM throttle ({wait:.1f}s)")
-                time.sleep(wait)
+        global _hapuppy_ratelimit_until, _hapuppy_rate_last
+        _hap_interval = _hapuppy_adaptive_interval()
+        if _hap_interval > 0:
+            with _hapuppy_rate_lock:
+                wait = _hap_interval - (time.monotonic() - _hapuppy_rate_last)
+                if wait > 0:
+                    time.sleep(wait)
+                _hapuppy_rate_last = time.monotonic()
         _hap_quota_break = False
         for hap_model in HAPUPPY_MODELS:
             if _hap_quota_break:
                 break
-            for attempt in range(2):
+            for attempt in range(4):
                 try:
                     wait = _hapuppy_ratelimit_until - time.monotonic()
                     if wait > 0:
                         time.sleep(wait + random.uniform(0, 2))
                     _hapuppy_last_attempt = time.monotonic()
-                    _hapuppy_timeout = httpx.Timeout(connect=5.0, read=15.0, write=5.0, pool=5.0)
+                    _hapuppy_timeout = httpx.Timeout(connect=5.0, read=120.0, write=5.0, pool=5.0)
                     chunks: list[bytes] = []
                     status_code = None
                     with _hapuppy_semaphore:
@@ -590,17 +704,30 @@ def llm_call(
                             _send_cascade_notif(groq_reason, trail)
                         return result
                     elif status_code == 403:
-                        _hap_secs = _seconds_until_hapuppy_reset()
-                        _hapuppy_quota_skip_until = time.monotonic() + _hap_secs
-                        trail.append(f"Hapuppy `{hap_model}` : ✗ 403 crédits épuisés")
-                        _hap_dt = datetime.now(ZoneInfo("Europe/Paris")) + timedelta(seconds=_hap_secs)
-                        _hap_h, _hap_m = int(_hap_secs // 3600), int((_hap_secs % 3600) // 60)
-                        _hap_header = (f"🔴 *Hapuppy `{hap_model}` — crédits épuisés (403)*\n"
-                                       f"Recharger les crédits. Reset {_hap_dt.strftime('%Hh%M')} Paris (dans {_hap_h}h{_hap_m:02d}m).")
-                        _send_cascade_notif("hapuppy_quota", trail, caller, header_override=_hap_header)
-                        _hapuppy_quota_notif_sent = True
-                        _hap_quota_break = True
-                        break
+                        try:
+                            body_403 = json.loads(b"".join(chunks)).get("error", {}).get("message", "").lower()
+                        except Exception:
+                            body_403 = ""
+                        is_credits = any(k in body_403 for k in _HAPUPPY_QUOTA_KEYWORDS)
+                        if is_credits:
+                            _hap_secs = _seconds_until_hapuppy_reset()
+                            _hapuppy_quota_skip_until = time.monotonic() + _hap_secs
+                            trail.append(f"Hapuppy `{hap_model}` : ✗ 403 crédits épuisés")
+                            _hap_dt = datetime.now(ZoneInfo("Europe/Paris")) + timedelta(seconds=_hap_secs)
+                            _hap_h, _hap_m = int(_hap_secs // 3600), int((_hap_secs % 3600) // 60)
+                            _hap_header = (f"🔴 *Hapuppy `{hap_model}` — crédits épuisés (403)*\n"
+                                           f"Recharger les crédits. Reset {_hap_dt.strftime('%Hh%M')} Paris (dans {_hap_h}h{_hap_m:02d}m).")
+                            _send_cascade_notif("hapuppy_quota", trail, caller, header_override=_hap_header)
+                            _hapuppy_quota_notif_sent = True
+                            _hap_quota_break = True
+                            break
+                        else:
+                            backoff = HAPUPPY_RATELIMIT_BACKOFF_SECONDS * (attempt + 1)
+                            _hapuppy_ratelimit_until = time.monotonic() + backoff
+                            trail.append(f"Hapuppy `{hap_model}` : ✗ 403 rate-limit (attempt {attempt + 1}/2, backoff {backoff}s)")
+                            if attempt < 1:
+                                time.sleep(backoff + random.uniform(0, 3))
+                            continue
                     elif status_code == 429:
                         try:
                             body_text = json.loads(b"".join(chunks)).get("error", {}).get("message", "").lower()
@@ -630,9 +757,9 @@ def llm_call(
                         trail.append(f"Hapuppy `{hap_model}` : ✗ {status_code} → modèle suivant")
                         break
                 except Exception:
-                    trail.append(f"Hapuppy `{hap_model}` : ✗ timeout/connexion (attempt {attempt + 1}/2)")
-                    if attempt < 1:
-                        time.sleep(2 ** attempt)
+                    trail.append(f"Hapuppy `{hap_model}` : ✗ timeout/connexion (attempt {attempt + 1}/4)")
+                    if attempt < 3:
+                        time.sleep(2 ** attempt + random.uniform(0, 1))
                     continue
                 break
 
@@ -650,11 +777,14 @@ def llm_call(
         _send_cascade_notif("both_quota", trail, caller, header_override=_both_header)
 
     # weekly_scrap / hapuppy_only : on s'arrête ici (Groq pas autorisé)
-    if cascade in ("weekly_scrap", "hapuppy_only"):
+    if cascade in ("weekly_scrap", "promo", "bub_batch", "zen"):
+        if cascade == "promo" and groq_reason == "hapuppy_down" and not _hapuppy_quota_notif_sent:
+            _send_cascade_notif("hapuppy_down", trail, caller,
+                header_override="🔴 *Hapuppy promo — modèles ne répondent plus (502/timeout)*\nVérifier le serveur Hapuppy.")
         raise RuntimeError(f"LLM unavailable — {cascade} cascade exhausted")
 
-    # ── Gemini — position "late" (bub, weekly_prod : après Hapuppy) ──────────────
-    if cascade in ("bub_prod", "weekly_prod"):
+    # ── Gemini — position "late" (bub, weekly_prod, dumb_prod : après Hapuppy) ──────────────
+    if cascade in ("weekly_prod", "dumb_prod"):
         result = _try_gemini(payload_base, timeout, trail)
         if result:
             return result
@@ -666,13 +796,13 @@ def llm_call(
         raise RuntimeError(f"FreeTheAI unavailable ({groq_reason}) — yearly_prod mode")
 
     # Cascades prod sans Groq : FreeTheAI → Hapuppy [→ Gemini] → raise
-    if cascade in ("bub_prod", "weekly_prod", "ow7j_prod", "monthly_prod"):
+    if cascade in ("bub_prod", "weekly_prod", "ow7j_prod", "monthly_prod", "monthly_scrap_ext"):
         raise RuntimeError(f"LLM unavailable — cascade {cascade} exhausted")
 
     # ── Groq (fallback final, ou premier essai pour dumb_scrap) ───────────────
     # TODO PROD : réactiver la restriction BATCH_MODE pour préserver le quota Groq prod
     # if not allow_groq or os.environ.get("BATCH_MODE") == "1":
-    if cascade in ("bub_prod", "weekly_prod", "ow7j_prod", "monthly_prod", "yearly_prod", "ow24h_prod"):
+    if cascade in ("bub_prod", "weekly_prod", "ow7j_prod", "monthly_prod", "monthly_scrap_ext", "yearly_prod", "ow24h_prod"):
         raise RuntimeError(f"LLM unavailable — cascade {cascade} exhausted (no Groq in prod)")
     if not allow_groq or os.environ.get("GROQ_ENABLED", "1") == "0":
         raise RuntimeError("LLM unavailable (FreeTheAI/Hapuppy down, Groq disabled)")
@@ -773,7 +903,7 @@ def llm_call(
             allow_groq=False,
             caller=caller,
             item_id=item_id,
-            cascade="hapuppy_only",
+            cascade="promo",
         )
 
     raise RuntimeError("LLM unreachable after all retries")

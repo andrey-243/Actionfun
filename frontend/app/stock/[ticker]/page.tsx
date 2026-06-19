@@ -49,7 +49,7 @@ function getBoundaryIndices(labels: string[], period: string): number[] {
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
-interface StockData {
+interface TickerInfosYfinance {
   ticker: string;
   name: string;
   currency: string;
@@ -64,15 +64,13 @@ interface StockData {
   website?: string | null;
 }
 
-interface NewsData {
+interface TickerFrontWrapper {
   ticker: string;
   articles: Article[];
   summary: string;
   sentiment: string;
-  sentiment_reason: string;
   summary_24h: string;
   sentiment_24h: string;
-  sentiment_reason_24h: string;
   no_24h_news: boolean;
   cached_at: string;
   is_refreshing?: boolean;
@@ -341,8 +339,8 @@ export default function StockPage() {
   const router = useRouter();
   const supaRef = useRef(createClient());
 
-  const [stock, setStock] = useState<StockData | null>(null);
-  const [news, setNews] = useState<NewsData | null>(null);
+  const [stock, setStock] = useState<TickerInfosYfinance | null>(null);
+  const [news, setNews] = useState<TickerFrontWrapper | null>(null);
   const [stockLoading, setStockLoading] = useState(true);
   const [newsLoading, setNewsLoading] = useState(true);
   const [stockError, setStockError] = useState("");
@@ -875,7 +873,6 @@ export default function StockPage() {
               const is24h = chartPeriod === "1d";
               const activeSummary = is24h ? news.summary_24h : news.summary;
               const activeSentiment = is24h ? news.sentiment_24h : news.sentiment;
-              const activeReason = is24h ? news.sentiment_reason_24h : news.sentiment_reason;
               if (!activeSummary && !news.is_refreshing) return null;
               if (!activeSummary && news.is_refreshing) return (
                 <div style={{

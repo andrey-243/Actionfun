@@ -40,7 +40,9 @@ def _articles_from_archive(supa, ticker: str, hours: int = 48) -> list[dict]:
             "dumb_fr":  a.get("dumb_fr", ""),
         }
         for a in raw
-        if a.get("datetime", 0) > cutoff_ts and a.get("headline")
+        if a.get("datetime", 0) > cutoff_ts
+        and a.get("headline")
+        and (a.get("dumb_en") or "").strip().upper() != "SKIP"
     ]
     articles.sort(key=lambda x: x["datetime"], reverse=True)
     return articles[:100]
@@ -70,12 +72,12 @@ async def weekly(ticker: str):
         t = ticker.upper()
 
         cache = supa.table("ow_cache") \
-            .select("ai_summary_en, ai_summary_fr, cached_at, website") \
+            .select("ow7d_en, ow7d_fr, ow1d_cached_at_en, website") \
             .eq("ticker", t).maybe_single().execute()
         row = (cache.data or {}) if cache and cache.data else {}
 
-        ai_summary = row.get("ai_summary_en") or row.get("ai_summary_fr", "")
-        cached_at = row.get("cached_at")
+        ai_summary = row.get("ow7d_en") or row.get("ow7d_fr", "")
+        cached_at = row.get("ow1d_cached_at_en")
         website = row.get("website")
 
         # company_name depuis pinned_stocks pour enrichir _is_ticker_related

@@ -5,9 +5,88 @@ get_stock_data(ticker, period) :
   - Prix courant, previous_close, change_pct, market_cap, PE, 52W high/low
   - Série chart (date → close) selon période/intervalle
   - Labels 24H en HH:MM (bougies 5-min), autres périodes en YYYY-MM-DD
+
+get_company_name(ticker) / bulk_fetch_company_names(tickers) :
+  - Source unique ticker → nom de société (EU/ASIA + US)
+  - yf.Search → _KNOWN_NAMES fallback (tickers défunts/fusionnés/délisted)
 """
+import logging
 import yfinance as yf
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+
+logger = logging.getLogger(__name__)
+
+_KNOWN_NAMES: dict[str, str] = {
+    "AXA.PA":      "AXA SA",
+    "SG.PA":       "Société Générale",
+    "UG.PA":       "Peugeot SA",
+    "FP.PA":       "TotalEnergies",
+    "TCFP.PA":     "Thales SA",
+    "WDI.DE":      "Wirecard AG",
+    "1COV.DE":     "Covestro AG",
+    "KNEBV.DE":    "KONE Oyj",
+    "RB.L":        "Reckitt Benckiser",
+    "AHT.L":       "Ashtead Group",
+    "CRH.L":       "CRH plc",
+    "MXCT.L":      "MaxCyte Inc.",
+    "SKG.L":       "Smurfit Kappa",
+    "URW.AS":      "Unibail-Rodamco-Westfield",
+    "AEX.AS":      "AEX Index",
+    "DSM.AS":      "DSM-Firmenich",
+    "TKWY.AS":     "Just Eat Takeaway",
+    "ROG.SW":      "Roche Holding AG",
+    "CSGN.SW":     "Credit Suisse Group AG",
+    "BALN.SW":     "Baloise Holding AG",
+    "LUX.MI":      "Luxottica Group SpA",
+    "ATL.MI":      "Atlantia SpA",
+    "FCA.MI":      "Fiat Chrysler Automobiles",
+    "AB-INBEV.BR": "Anheuser-Busch InBev",
+    "GBL.BR":      "Groupe Bruxelles Lambert",
+    "CRH.IR":      "CRH plc",
+    "BHVN.IR":     "Biohaven Pharmaceutical",
+    "AIB.IR":      "AIB Group plc",
+}
+
+
+def get_company_name(ticker: str) -> str:
+    """Retourne le nom de la société pour un ticker EU/ASIA.
+
+    Ordre : yf.Search (fonctionne même quand t.info retourne 404) → _KNOWN_NAMES fallback.
+    Retourne "" si inconnu.
+    """
+    try:
+        quotes = yf.Search(ticker, max_results=1).quotes or []
+        if quotes:
+            name = quotes[0].get("longname") or quotes[0].get("shortname") or ""
+            if name and name.lower() != ticker.lower():
+                return name
+    except Exception:
+        pass
+    return _KNOWN_NAMES.get(ticker.upper(), "")
+
+
+def bulk_fetch_company_names(tickers: list[str]) -> dict[str, str]:
+    """Fetch les noms de société en parallèle pour les tickers EU/ASIA (avec '.').
+
+    Remplace _bulk_fetch_company_names depuis breakers_articles_service.
+    """
+    eu_asia = [t for t in tickers if "." in t]
+    if not eu_asia:
+        return {}
+
+    names: dict[str, str] = {}
+
+    def _fetch_one(ticker: str) -> None:
+        name = get_company_name(ticker)
+        if name:
+            names[ticker] = name
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        list(ex.map(_fetch_one, eu_asia))
+
+    logger.info(f"company names fetched: {len(names)}/{len(eu_asia)} tickers (dot-suffixed)")
+    return names
 
 
 PERIOD_INTERVAL = {
@@ -48,7 +127,7 @@ def get_stock_data(ticker: str, period: str = "6mo") -> dict:
     try:
         from urllib.parse import urlparse
         info = t.info
-        name = info.get("longName") or info.get("shortName", ticker.upper())
+        name = info.get("longName") or info.get("shortName") or _KNOWN_NAMES.get(ticker.upper(), ticker.upper())
         pe_ratio = info.get("trailingPE")
         raw_url = info.get("website", "") or ""
         if raw_url:

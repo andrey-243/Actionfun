@@ -392,22 +392,22 @@ def _articles_hash(articles: list[dict]) -> str:
 
 def _needs_24h_refresh(row: dict | None) -> bool:
     lang = os.environ.get("LLM_LANG", "en")
-    col = "ai_summary_24h_en" if lang == "en" else "ai_summary_24h"
+    col = "ow1d_en" if lang == "en" else "ow1d_fr"
     return not row or not row.get(col)
 
 
 def _needs_7d_refresh(row: dict | None) -> bool:
     lang = os.environ.get("LLM_LANG", "en")
-    col = "ai_summary_en" if lang == "en" else "ai_summary"
+    col = "ow7d_en" if lang == "en" else "ow7d_fr"
     return not row or not row.get(col)
 
 
 def _is_stale_6h(row: dict | None, now: datetime) -> bool:
     """Filet de sécurité : si le cache n'a pas été mis à jour depuis 6h, une visite page déclenche un refresh."""
-    if not row or not row.get("cached_at"):
+    if not row or not row.get("ow1d_cached_at_en"):
         return False
     try:
-        cached_at = datetime.fromisoformat(row["cached_at"].replace("Z", "+00:00"))
+        cached_at = datetime.fromisoformat(row["ow1d_cached_at_en"].replace("Z", "+00:00"))
         return (now - cached_at) >= timedelta(hours=6)
     except Exception:
         return True
@@ -425,6 +425,8 @@ def _write_dumb_to_archive(ticker: str, articles: list[dict], lang: str, supa) -
             continue
         url = a.get("url", "")
         pub_date = a.get("pub_date", "")
+        if not pub_date and a.get("datetime"):
+            pub_date = datetime.fromtimestamp(a["datetime"], tz=timezone.utc).isoformat()
         if not url or not pub_date:
             continue
         try:
@@ -512,9 +514,9 @@ def _call1_dumb_ow24h(ticker: str, fresh_articles: list[dict], row: dict | None,
     # LLM2: skip brutalise si les articles n'ont pas changé depuis le dernier run
     new_hash = _articles_hash(fresh_articles[:30])
     cached_hash = (row or {}).get("articles_hash", "")
-    has_summary = bool((row or {}).get("ai_summary_24h_fr") or (row or {}).get("ai_summary_24h_en"))
+    has_summary = bool((row or {}).get("ow1d_fr") or (row or {}).get("ow1d_en"))
     if cached_hash and cached_hash == new_hash and has_summary:
-        update = {"cached_at": now.isoformat()}
+        update = {"ow1d_cached_at_en": now.isoformat()}
         if website and not (row or {}).get("website"):
             update["website"] = website
         supa.table("ow_cache").update(update).eq("ticker", ticker).execute()
@@ -560,7 +562,7 @@ def _call1_dumb_ow24h(ticker: str, fresh_articles: list[dict], row: dict | None,
     else:
         bench_line = _bench_context_line(ctx, lang)
         no_news_note = "No news in the last 24 hours." if lang == "en" else "Aucune actualité dans les dernières 24 heures."
-        existing_7d = (row.get("ai_summary_en") or row.get("ai_summary_fr") or "") if row else ""
+        existing_7d = (row.get("ow7d_en") or row.get("ow7d_fr") or "") if row else ""
         result_24h = {
             "summary": f"{no_news_note}{(' ' + bench_line) if bench_line else ''}".strip(),
             "sentiment": ai_result.get("sentiment", "NEUTRAL"),
@@ -572,15 +574,15 @@ def _call1_dumb_ow24h(ticker: str, fresh_articles: list[dict], row: dict | None,
     if lang == "en":
         update = {
             "ticker": ticker,
-            "ai_summary_24h_en": result_24h.get("summary", ""),
-            "ai_sentiment_24h": result_24h.get("sentiment", "NEUTRAL"),
+            "ow1d_en": result_24h.get("summary", ""),
+            "ow1d_sentiment": result_24h.get("sentiment", "NEUTRAL"),
             "no_24h_news": no_24h,
-            "cached_at": now.isoformat(),
-            "generated_by_en": llm_source,
+            "ow1d_cached_at_en": now.isoformat(),
+            "llm_source_en": llm_source,
             "articles_hash": new_hash,
-            "ai_summary_en": ai_result.get("summary", ""),
-            "ai_sentiment": ai_result.get("sentiment", "NEUTRAL"),
-            "ow7d_cached_at": now.isoformat(),
+            "ow7d_en": ai_result.get("summary", ""),
+            "ow7d_sentiment": ai_result.get("sentiment", "NEUTRAL"),
+            "ow7d_cached_at_en": now.isoformat(),
         }
         if website:
             update["website"] = website
@@ -588,18 +590,16 @@ def _call1_dumb_ow24h(ticker: str, fresh_articles: list[dict], row: dict | None,
     else:
         update = {
             "ticker": ticker,
-            "ai_summary_24h_fr": result_24h.get("summary", ""),
-            "ai_sentiment_24h": result_24h.get("sentiment", "NEUTRAL"),
-            "ai_sentiment_reason_24h": result_24h.get("sentiment_reason", ""),
+            "ow1d_fr": result_24h.get("summary", ""),
+            "ow1d_sentiment": result_24h.get("sentiment", "NEUTRAL"),
             "no_24h_news": no_24h,
-            "cached_at": now.isoformat(),
+            "ow1d_cached_at_fr": now.isoformat(),
             "website": website,
-            "generated_by_fr": llm_source,
+            "llm_source_fr": llm_source,
             "articles_hash": new_hash,
-            "ai_summary_fr": ai_result.get("summary", ""),
-            "ai_sentiment": ai_result.get("sentiment", "NEUTRAL"),
-            "ai_sentiment_reason": ai_result.get("sentiment_reason", ""),
-            "ow7d_cached_at": now.isoformat(),
+            "ow7d_fr": ai_result.get("summary", ""),
+            "ow7d_sentiment": ai_result.get("sentiment", "NEUTRAL"),
+            "ow7d_cached_at_fr": now.isoformat(),
         }
         supa.table("ow_cache").upsert(update).execute()
     return {**(row or {}), **update}
@@ -634,20 +634,19 @@ def _call2_ow7d(ticker: str, fresh_articles: list[dict], row: dict | None,
     if lang == "en":
         update = {
             "ticker": ticker,
-            "ai_summary_en": ai_result.get("summary", ""),
-            "ai_sentiment": ai_result.get("sentiment", "NEUTRAL"),
-            "ow7d_cached_at": now.isoformat(),
-            "generated_by_en": llm_source,
+            "ow7d_en": ai_result.get("summary", ""),
+            "ow7d_sentiment": ai_result.get("sentiment", "NEUTRAL"),
+            "ow7d_cached_at_en": now.isoformat(),
+            "llm_source_en": llm_source,
         }
         supa.table("ow_cache").upsert({"ticker": ticker, **update}).execute()
     else:
         update = {
             "ticker": ticker,
-            "ai_summary_fr": ai_result.get("summary", ""),
-            "ai_sentiment": ai_result.get("sentiment", "NEUTRAL"),
-            "ai_sentiment_reason": ai_result.get("sentiment_reason", ""),
-            "ow7d_cached_at": now.isoformat(),
-            "generated_by_fr": llm_source,
+            "ow7d_fr": ai_result.get("summary", ""),
+            "ow7d_sentiment": ai_result.get("sentiment", "NEUTRAL"),
+            "ow7d_cached_at_fr": now.isoformat(),
+            "llm_source_fr": llm_source,
         }
         supa.table("ow_cache").upsert(update).execute()
     return {**(row or {}), **update}
@@ -668,7 +667,7 @@ def get_or_refresh_ow_both(ticker: str, lang: str = None) -> tuple[dict | None, 
     cache = supa.table("ow_cache").select("*").eq("ticker", ticker).limit(1).execute()
     row = cache.data[0] if cache.data else None
 
-    if row is None or not row.get("cached_at"):
+    if row is None or not row.get("ow1d_cached_at_en"):
         return None, True
 
     now = datetime.now(timezone.utc)
@@ -731,16 +730,13 @@ def _build_response(ticker: str, articles: list, row: dict) -> dict:
     return {
         "ticker": ticker,
         "articles": articles,
-        "summary": row.get("ai_summary_en", "") or row.get("ai_summary_fr", ""),
-        "sentiment": row.get("ai_sentiment", "NEUTRAL"),
-        "sentiment_reason": row.get("ai_sentiment_reason", ""),
-        "summary_24h": row.get("ai_summary_24h_en", "") or row.get("ai_summary_24h_fr", ""),
-        "sentiment_24h": row.get("ai_sentiment_24h", "NEUTRAL"),
-        "sentiment_reason_24h": row.get("ai_sentiment_reason_24h", ""),
+        "summary": row.get("ow7d_en", "") or row.get("ow7d_fr", ""),
+        "sentiment": row.get("ow7d_sentiment", "NEUTRAL"),
+        "summary_24h": row.get("ow1d_en", "") or row.get("ow1d_fr", ""),
+        "sentiment_24h": row.get("ow1d_sentiment", "NEUTRAL"),
         "no_24h_news": row.get("no_24h_news", False),
-        "cached_at": row.get("cached_at", ""),
+        "cached_at": row.get("ow1d_cached_at_en", ""),
         "website": row.get("website", ""),
-        "llm_source": row.get("generated_by_fr") or row.get("generated_by_en") or "cache",
     }
 
 
@@ -791,7 +787,7 @@ def hourly_ow_regen() -> list[str]:
     pinned = {r["ticker"] for r in (pins.data or [])}
 
     recent = supa.table("ow_cache") \
-        .select("ticker").eq("no_24h_news", True).gte("cached_at", six_h_ago).execute()
+        .select("ticker").eq("no_24h_news", True).gte("ow1d_cached_at_en", six_h_ago).execute()
     recent_tickers = {r["ticker"] for r in (recent.data or [])}
 
     pinned_no_news = supa.table("ow_cache") \
@@ -818,7 +814,7 @@ def hourly_ow_regen() -> list[str]:
             fresh_articles, _ = _fetch_news(ticker)
             articles_24h = _filter_24h(fresh_articles)
             if len(articles_24h) == 0:
-                supa.table("ow_cache").update({"cached_at": now.isoformat()}).eq("ticker", ticker).execute()
+                supa.table("ow_cache").update({"ow1d_cached_at_en": now.isoformat()}).eq("ticker", ticker).execute()
                 logger.info(f"[hourly_refresh] {ticker} — toujours 0 news 24h")
                 continue
             gen_ow_both(ticker, force_24h=True)

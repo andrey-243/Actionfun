@@ -1,5 +1,33 @@
 # StockVibe — Recap
 
+## Navigation rapide
+
+| Section | Contenu |
+|---|---|
+| [Règles & nommage](#règles--nommage) | Termes produit (OW/DUMB/BUB/Breaks), source articles |
+| [Stack](#stack) | Backend, frontend, auth, DB, crons |
+| [Design](#design-da) | Palette, typographie, composants |
+| [Lancer](#lancer) | Commandes dev local |
+| [Déploiement prod](#déploiement-prod) | Config VPS, env vars |
+| [Structure fichiers](#structure-fichiers) | Arborescence backend/frontend |
+| [Fonctions publiques](#fonctions-publiques--cascades--actions) | API interne, cascades services |
+| [LLM Cascade](#llm--cascade--modèles) | FreeTheAI/Hapuppy/Groq, prompts, fallbacks, quotas |
+| [Supabase Tables](#supabase--tables-actives) | Schéma DB, colonnes, RLS |
+| [Articles — Architecture](#articles--architecture-par-période) | Flow scraping, périodes, merge multi-source |
+| [Articles — Doublons](#articles--doublons--multi-source) | Dédup, conflits sources |
+| [Rotation des données](#rotation-des-données) | TTL, purge, archivage |
+| [News Architecture](#news--architecture) | my-news, daily/weekly digest |
+| [Events / Dots chart](#events-dots-chart) | BUB, dots, chart events |
+| [Chart — Périodes](#chart--périodes--intervalles-yfinance) | Intervalles yfinance par période |
+| [Resend Email](#resend--email) | Config, templates, sandbox |
+| [Tickers Coverage](#tickers--coverage) | Marchés couverts, suffixes |
+| [Batch fill DB](#batch-scraper--backendscriptsbatch_fill_dbpy) | Script fill initial |
+| [Batch breakers](#batch-breakers--backendscriptsrefresh_breakerspy) | Script refresh breakers |
+| [État courant — Features](#features) | Statut de chaque feature |
+| [Séquence batch](#séquence-batch--en-first-relance-2026-06-01) | Ordre et état du batch en cours |
+| [Optimisations réalisées](#optimisations-réalisées-) | Historique des perf fixes |
+| [Roadmap post-beta](#roadmap-post-beta) | Prochaines features |
+
 ---
 
 ## Architecture
@@ -20,7 +48,7 @@ Si une feature bypass `articles` c'est un bug architectural à corriger.
 | Breaks | Résumés W1/W2/W3/W4 (1M) ou mensuels (6M/1Y) — `breakers_articles_service.py` |
 | Daily Digest (1J) | Digest end-of-day — page my-news + email 19h15 · langue selon `user_preferences.lang` |
 | Weekly Digest (7J) | Digest hebdo — email sam 7h · OW 7J + 5 articles · langue selon `user_preferences.lang` |
-| articles | DB mergée Finn+Yahoo — source de vérité unique pour tous les articles |
+| articles | DB mergée multi-sources — source de vérité unique pour tous les articles |
 
 ---
 
@@ -34,12 +62,12 @@ Si une feature bypass `articles` c'est un bug architectural à corriger.
 | Fonts | Inter (UI) · Space Mono (tickers/numbers) |
 | Charts | Chart.js · react-chartjs-2 |
 | Données bours. | yfinance 1.4.1 + curl_cffi (bypass Yahoo rate limit) |
-| News | yfinance `get_news()` → Groq llama-3.3-70b → cache Supabase |
+| News | yfinance `get_news()` → Groq llama-3.3-70b → cache Supabase · **Marketaux** (EU+ASIA prod cron */6h + scrap) · **NewsAPI** (EU+ASIA prod cron */6h + scrap P1→P4) · **Google News RSS** (tous tickers prod */3h + scrap fallback) · **Alpha Vantage NEWS_SENTIMENT** (scrap last resort P1→P4, 25 req/j) |
 | Taux de change | Frankfurter API (`api.frankfurter.dev/v1`) — gratuit, taux BCE |
 | Events chart | Finnhub company-news (free, 1 an d'historique) + Groq cause IA |
 | Email digest | Resend (3 000 emails/mois gratuit) — clé configurée, sandbox actif · Daily 19h15 + Weekly sam 7h · langue via `user_preferences.lang` (DEFAULT 'en') · Azure batch amont avant snapshot |
 | Logos | Logo.dev free (500k req/mois, attribution requise) — domaine depuis yfinance `t.info["website"]`, stocké dans `ow_cache.website` · `NEXT_PUBLIC_LOGODEV_TOKEN` dans `frontend/.env.local` |
-| Cron | APScheduler intégré dans FastAPI — email 18h30 · cold_start FR 19h · re-enrich 22h30 (+ retry :35 toutes les heures, actif si pending) · weekly lun 3h30 · monthly 1er 4h · yearly 1er jan 5h · **yahoo */3h** (tous pinnés ≥3, merge articles + trigger OW si nouveaux articles) · **finnhub */6h** (current month, merge + trigger OW si nouveaux articles) · **hourly_news_refresh :15** (pinned + visités récemment avec no_24h_news → `force_24h=True`) · **purge DB** lun 3h (bub_cache >1 an). TG: tous les crons 1x/j envoient ▶ start + ✅ end avec durée. Yahoo/Finnhub: ✅ avec résumé par ticker (Yahoo: `AAPL +5 · AMZN +3` · Finnhub: `AAPL 45 · AMZN 23`). Hourly: TG uniquement si des tickers sortent du pool no_24h_news (`✅ News refresh — AAPL · AMZN sortis du pool`). Re-enrich retry : freeze jusqu'à 2h si FreeTheAI down à 22h30, puis check toutes les 1h, freeze 1h si toujours indisponible. |
+| Cron | APScheduler intégré dans FastAPI — email 18h30 · cold_start FR 19h · re-enrich 22h30 (+ retry :35 toutes les heures, actif si pending) · weekly lun 3h30 · monthly 1er 4h · yearly 1er jan 5h · **yahoo */3h** (tous pinnés ≥3, merge articles — si nouveaux articles : gen_dumb + OW 1D+7D immédiatement) · **finnhub */6h** (current month, merge — si nouveaux articles : gen_dumb + OW 1D+7D immédiatement) · **marketaux */6h** (EU+ASIA pinnés uniquement — routing région via `_detect_region(ticker)`) · **newsapi */6h** (EU+ASIA pinnés uniquement) · **google_rss */3h** (tous pinnés — complément Yahoo, feed ~2 semaines) · **hourly_news_refresh :15** (pinned + visités récemment avec no_24h_news → `force_24h=True`) · **purge DB** lun 3h (bub_cache >1 an). TG: tous les crons 1x/j envoient ▶ start + ✅ end avec durée. Yahoo/Finnhub: ✅ avec résumé par ticker (Yahoo: `AAPL +5 · AMZN +3` · Finnhub: `AAPL 45 · AMZN 23`). Hourly: TG uniquement si des tickers sortent du pool no_24h_news (`✅ News refresh — AAPL · AMZN sortis du pool`). Re-enrich retry : freeze jusqu'à 2h si FreeTheAI down à 22h30, puis check toutes les 1h, freeze 1h si toujours indisponible. |
 | Git | github.com/andrey-243/Actionfun — repo privé |
 | Déploiement | **Render** Web Service (backend, free 750h/mois) · **Vercel** (frontend, free) · **Supabase** (DB, déjà en place) · **UptimeRobot** (keep-alive ping /health toutes les 5 min) |
 
@@ -110,14 +138,15 @@ stock_app/
 │   │   ├── llm_service.py
 │   │   └── cold_start_service.py
 │   ├── scripts/
-│   │   ├── batch_fill_db.py
-│   │   ├── refresh_breakers.py
-│   │   ├── fix_checkpoint_from_db.py   ← audit checkpoint vs DB · 5 catégories
-│   │   ├── fix_missing.py              ← répare DUMB/W/M manquants sans full batch
-│   │   ├── break_view_resume.py
-│   │   ├── refetch_finnhub.py
-│   │   ├── sync_progress.py
-│   │   └── migrate_dumb_to_archive.py
+│   │   ├── batch_fill_db.py            ← stateless (DB source of truth) · phases: scrape/enrich/bubbles/translate-fr/translate-fr-dumb
+│   │   ├── refresh_breakers.py         ← scrape P1+P2 + DUMB + W + M breakers
+│   │   ├── zen_watcher.py              ← probe ZenLLM toutes les 5 min → lance batch bubbles si UP
+│   │   ├── translate_bulk.py           ← bulk EN→FR : BUB → Y → M → W · cascade promo (Gemini)
+│   │   ├── populate_logos.py
+│   │   ├── scrap_google_rss.py         ← top 1 scrap · 12 mois · max 100 art/call · tous tickers · skip is_fresh · cron */3h · TG fin de run + source_counts
+│   │   ├── scrap_newsapi.py            ← P1→P4 · 1 mois (plan Dev gratuit) · 100 req/j · cron */6h · TG fin de run + source_counts
+│   │   ├── scrap_marketaux.py          ← P1→P4 · 3 mois (plan Basic) · 100 req/j · cron */6h · TG fin de run + source_counts
+│   │   └── scrap_alphavantage.py       ← last resort · P1→P4 · 12 mois · 25 req/j · cron indirect via refresh_breakers · TG fin de run + source_counts
 │   ├── .env
 │   ├── .venv/
 │   └── requirements.txt
@@ -151,16 +180,16 @@ stock_app/
 
 | Fonction | Cascade prod | Cascade batch/scrap |
 |---|---|---|
-| `gen_ow_both()` | DUMB: `dumb_prod` Gemini→Hapuppy→Groq · OW 24H: `ow24h_prod` Gemini→Hapuppy · OW 7J: `ow7j_prod` FreeTheAI→Hapuppy | — |
+| `gen_ow_both()` | DUMB: `dumb_prod` Hapuppy→Gemini→Groq · OW 24H: `ow24h_prod` Gemini→Hapuppy · OW 7J: `ow7j_prod` Gemini→Hapuppy | — |
 | `get_or_refresh_ow_both()` | → appelle `gen_ow_both()` si stale | — |
-| `gen_dumb(cutoff_days=7)` | `dumb_prod` Gemini→Hapuppy→Groq | `dumb_scrap` Groq→Hapuppy. `cutoff_days` : fenêtre articles (7j prod/crons · 35j batch fix scripts) |
+| `gen_dumb(cutoff_days=7)` | `dumb_prod` Gemini→Hapuppy→Groq | `zen` ZenLLM→raise (original: `promo`). `cutoff_days` : fenêtre articles (7j prod/crons · 35j batch fix scripts) |
 | `read_breaks_by_period()` | Lit `breaks_weekly/monthly/yearly` + `articles` | idem |
 | `read_breaks_periods_available()` | Lit `breaks_monthly/yearly` | idem |
-| `gen_breaks_weekly()` | `weekly_prod` Hapuppy→Gemini | `weekly_scrap` Hapuppy seul |
-| `gen_breaks_monthly()` | `monthly_prod` FreeTheAI→Hapuppy | `monthly_scrap` FreeTheAI seul |
+| `gen_breaks_weekly()` | `weekly_prod` Hapuppy→Gemini | `zen` ZenLLM→raise (original: `promo`) |
+| `gen_breaks_monthly()` | `monthly_prod` FreeTheAI→Hapuppy | `zen` ZenLLM→raise (original: `promo`) |
 | `gen_breaks_yearly()` | `yearly_prod` FreeTheAI seul | — |
 | `get_or_gen_breaks_monthly_ondemand()` | `monthly_prod` FreeTheAI→Hapuppy | — |
-| `get_or_gen_bub()` | `bub_prod` Hapuppy→Gemini | `bub_prod` Hapuppy→Gemini |
+| `get_or_gen_bub()` | `bub_prod` Gemini→Hapuppy | `bub_prod` Gemini→Hapuppy | params : `cascade`, `prefetched_cache`, `force_regen` (bypass cache), `in_1w/1m/6m/1y` |
 | `send_daily_digest()` | Lit `ow_cache` · Azure si FR manquant · envoie Resend | — |
 | `send_weekly_digest()` | Lit `ow_cache` · Azure si FR manquant · envoie Resend | — |
 
@@ -172,19 +201,25 @@ Tous les appels LLM passent par `services/llm_service.py` qui gère la cascade a
 
 **Cascade par mode (`cascade` param de `llm_call()`) :**
 
-| Mode | Ordre | Qui l'utilise |
-|---|---|---|
-| `default` | FreeTheAI → Hapuppy → Groq | live OW, BUB si cascade non précisé |
-| `weekly_scrap` | Hapuppy uniquement | weekly batch scraper |
-| `monthly_scrap` | FreeTheAI uniquement — lève `FreeTheAIExhaustedError` si quota | monthly batch scraper |
-| `dumb_scrap` | Gemini → Groq → Hapuppy (fallback) | DUMB batch scraper |
-| `bub_prod` | Hapuppy → Gemini | BUB prod (event dots) |
-| `ow24h_prod` | Gemini → Hapuppy | OW 24H prod |
-| `ow7j_prod` | FreeTheAI → Hapuppy | OW 7J prod |
-| `weekly_prod` | Hapuppy → Gemini | Breaks weekly prod, cold_start, reenrich |
-| `monthly_prod` | FreeTheAI → Hapuppy | Breaks monthly prod, cold_start, reenrich |
-| `yearly_prod` | FreeTheAI uniquement — lève `RuntimeError` si quota | Breaks yearly prod |
-| `dumb_prod` | Gemini → Hapuppy → Groq | DUMB prod |
+| Mode | Providers (ordre) | Qui l'utilise | Notes |
+|---|---|---|---|
+| `default` | FreeTheAI → Hapuppy → Groq | live OW, BUB si non précisé | |
+| `zen` | ZenLLM → raise | refresh_breakers.py (toutes phases) · regen_bubs.py · batch_fill_db.py (bubbles) | **ZEN PROMO actif** — waterfall `free/gpt-5.5` → `free/claude-sonnet-4.6` · clé `ZENLLM_API_KEY` · bloc dédié · `BUBBLES_WORKERS=1` forcé (zen_watcher) · **fin promo** : scripts → `promo`/`bub_batch`, retirer `BUBBLES_WORKERS=1` de zen_watcher |
+| `promo` | Gemini → raise | scripts ponctuels / debug | `max_tokens` non envoyé (défaut Gemini 2000) |
+| `dumb_prod` | Hapuppy → Gemini → Groq | DUMB prod (crons) | |
+| `ow24h_prod` | Gemini → Hapuppy | OW 24H prod | |
+| `ow7j_prod` | Gemini → Hapuppy | OW 7J prod | |
+| `bub_prod` | Gemini → Hapuppy | BUB prod (event dots) | |
+| `weekly_prod` | Hapuppy → Gemini | Breaks W prod · cold_start · reenrich | |
+| `monthly_prod` | FreeTheAI → Hapuppy | Breaks M prod · cold_start · reenrich | |
+| `yearly_prod` | FreeTheAI → raise | Breaks Y prod | lève `RuntimeError` si quota |
+| `weekly_scrap` | Gemini → Hapuppy → raise | scrap scripts standalone (google_rss · newsapi · marketaux · alphavantage) | défaut de `scrap_gen_weekly` |
+| `monthly_scrap` | FreeTheAI → raise | scrap scripts standalone — mois fresh (≥25 arts, <3j) | lève `FreeTheAIExhaustedError` si quota |
+| `monthly_scrap_ext` | FreeTheAI → Hapuppy | scrap scripts standalone — mois non-fresh | défaut de `scrap_gen_monthly` si non-fresh |
+| `dumb_scrap` | Groq → Hapuppy → raise | scrap scripts standalone (gen_dumb post-scrap) | |
+| `bub_batch` | FreeTheAI → Gemini → raise | — (temporairement remplacé par `zen`) | comportement original batch_fill_db.py -- phase bubbles |
+
+**Règle FreeTheAI** : restreint aux cascades `monthly_prod`, `yearly_prod`, `monthly_scrap`, `monthly_scrap_ext` uniquement. Toutes les autres cascades (prod temps réel, batch W/DUMB/promo) n'appellent jamais FreeTheAI.
 
 **Cascade default :**
 ```
@@ -201,19 +236,28 @@ FreeTheAI: bbl/gpt-5.4-mini → secondary (seulement si primary = 502/503/timeou
   → 3 rounds échoués consécutifs (502/503/timeout) → circuit breaker 30min → probe auto
   → reset sur succès · 429/checkin/daily ne comptent pas comme "round échoué"
 
-Gemini: gemini-3.1-flash-lite → selon mode (avant Hapuppy pour ow24h_prod/dumb_prod/dumb_scrap · après pour bub_prod/weekly_prod)
+Gemini: gemini-3.1-flash-lite → selon mode (avant Hapuppy pour ow24h_prod/dumb_prod/weekly_scrap · après pour bub_prod/weekly_prod) — OUT OF CREDITS (19/06/2026)
                                  API native Google (pas OpenAI-compatible) : POST generativelanguage.googleapis.com/v1beta/models/{model}:generateContent
-                                 500 RPD · 250K TPM free tier · clé dans GEMINI_API_KEY
-                                 429 quota → _gemini_daily_exhausted (skip session) · 429 rate-limit → backoff 60s · 400/403 → _gemini_bad_key
-                                 Pas de semaphore ni min_interval — gestion réactive uniquement (suffisant : scraper séquentiel, prod volume faible)
+                                 3 clés en rotation : GEMINI_API_KEY · GEMINI_API_KEY_2 · GEMINI_API_KEY_3 (comptes Google indépendants)
+                                 État per-clé : bad_key · daily_exhausted · consecutive_429 · freeze_until · ratelimit_until · last_call
+                                 Sur daily épuisé ou 3x429 freeze → rotation immédiate vers la clé suivante (continue dans la boucle)
+                                 Throttle : Lock(_gemini_lock) + GEMINI_MIN_INTERVAL=4.1s par clé — sleep sorti du lock
+                                 429 RPM × 3 consécutifs → freeze_until = minuit UTC · probe auto 1h après expiry
+                                 429 quota daily → daily_exhausted (keywords stricts : "daily"/"per_day"/"per_day_free_tier")
+                                 400/403 → bad_key · sur succès → consecutive_429 = 0, freeze_until = None
 
-Hapuppy: gpt-4.1-mini       → 3 retries avant de passer à Groq
+Hapuppy: hapuppy/gpt-5.5 → hapuppy/gpt-5.4 (promo temp — gratuit sans crédits · à remettre sur gpt-4.1-mini après) → 3 retries avant de passer à Groq
                                Call en streaming httpx : read=15s par chunk (trous noirs détectés en 15s,
                                réponses lentes mais réelles préservées si chunks arrivent progressivement)
-                               403/429 quota : freeze jusqu'au prochain 18h00 Paris (reset Hapuppy) — 403=crédits épuisés, 429=body keywords ("quota","credit","budget"...)
+                               403 : lit le body d'abord — si keywords quota/credit/budget → freeze 18h Paris · sinon → backoff 12s (RPM, crédits illimités)
+                               429 quota : body keywords ("quota","credit","budget"...) → freeze jusqu'au prochain 18h00 Paris (reset Hapuppy)
                                429 rate-limit : sleep 5s local + retry dans le même thread (pas de freeze global) — max 3 tentatives
-                               timeout/502/connexion → backoff 1s/2s, retry
-                               Concurrence : Semaphore(HAPUPPY_CONCURRENCY=5) — max 5 appels httpx simultanés
+                               timeout/502/SSL EOF/connexion → retry x4, backoff 1s→2s→4s→8s + jitter (was x2)
+                               Concurrence : Semaphore(HAPUPPY_CONCURRENCY=25) — max 25 appels httpx simultanés (testé : 25/25 succès, avg 2.8s)
+                               Limite : 100 req/min · Rate-limiter adaptatif (_hapuppy_adaptive_interval) selon état Groq + Gemini
+                                 Groq down OU Gemini down → 0.8s (~75 RPM) · les deux down → 1.2s (~50 RPM) · aucun down → 0.0s
+                                 HAPUPPY_MIN_INTERVAL env var = override manuel prioritaire
+                                 Sérialisation via _hapuppy_rate_lock (threading.Lock) — partagé tous cascades
 
 Groq: voir tableau ci-dessous → fallback final (uniquement si Hapuppy quota épuisé ou down)
                                 Bloqué pour tous les modes prod sauf dumb_prod (qualité insuffisante)
@@ -230,7 +274,7 @@ AgentRouter (`agentrouter.org`) retiré — clé `unauthorized_client`.
 
 **Comportement erreurs Hapuppy :**
 - **timeout/connexion** : call en streaming, read=15s/chunk — trous noirs coupés en 15s, vraies réponses lentes préservées. Backoff 1s/2s, 3 retries, puis Groq
-- **403 crédits épuisés** : freeze jusqu'au prochain 18h00 Paris (reset Hapuppy), notif TG `hapuppy_quota`
+- **403** : lit le body — si keywords quota/credit/budget → freeze 18h Paris + notif TG `hapuppy_quota` · si pas de keyword → backoff 12s (erreur RPM, crédits illimités)
 - **429 quota épuisé** (body contient "quota"/"credit"/"budget"...) : freeze jusqu'au prochain 18h00 Paris
 - **429 rate-limit** (body sans keyword quota) : sleep 5s local + retry Hapuppy dans le même thread — pas de freeze global, Groq non déclenché
 - **Unfreeze manuel** : `POST /admin/hapuppy/unfreeze` — reset freeze dans le process FastAPI (⚠ n'affecte pas un batch standalone)
@@ -282,10 +326,10 @@ Groq `llama-3.1-8b-instant` : ✓
 | BRUTALIZE (30 articles → résumé 7J) | site + batch | `bbl/gpt-4.1` | `llama-4-scout-17b` ¹ |
 | SUMMARY_24H | site + batch | `bbl/gpt-4.1` | `llama-3.1-8b-instant` ¹ |
 | EVENT_CAUSE (dot chart) | site | `bbl/gpt-4.1` | `llama-3.1-8b-instant` |
-| DIGEST DAILY (1J) | email 19h15 | — (lit `ow_cache.ai_summary_24h_en/fr` selon `user_preferences.lang` · Azure pre-flight si FR manquant · snapshot mémoire · zéro LLM) | — |
-| DIGEST WEEKLY (7J) | email sam 7h | — (lit `ow_cache.ai_summary_en/fr` selon `user_preferences.lang` · 5 articles 7j · même pre-flight Azure) | — |
+| DIGEST DAILY (1J) | email 19h15 | — (lit `ow_cache.ow1d_en/ow1d_fr` selon `user_preferences.lang` · Azure pre-flight si FR manquant · snapshot mémoire · zéro LLM) | — |
+| DIGEST WEEKLY (7J) | email sam 7h | — (lit `ow_cache.ow7d_en/ow7d_fr` selon `user_preferences.lang` · 5 articles 7j · même pre-flight Azure) | — |
 | WEEKLY / MONTHLY condensation | site + batch | `bbl/gpt-4.1` | `llama-3.3-70b-versatile` ¹ |
-| TRADUCTION EN→FR | batch + site | `bbl/gpt-5.4-mini` (trad légère) | Azure → Yandex (TODO) → FreeTheAI `gpt-5.4-mini` → Hapuppy `gpt-4.1-mini` → Groq `llama-3.1-8b-instant` |
+| TRADUCTION EN→FR | batch + site | Azure primary | Azure → Groq `llama-3.1-8b-instant` → Hapuppy `gpt-4.1-mini` |
 
 ¹ Groq désactivé quand `BATCH_MODE=1` — le batch échoue proprement sur le ticker et skip.
 
@@ -296,17 +340,26 @@ Groq `llama-3.1-8b-instant` : ✓
 **`translation_service.py` — waterfall :**
 ```
 Azure Translator (batch natif 25 items/appel, ~200ms)
-  → Yandex (TODO — clés configurées, pas encore intégré)
-  → FreeTheAI bbl/gpt-5.4-mini (circuit breaker partagé avec llm_service)
-  → Hapuppy gpt-4.1-mini (circuit breaker partagé avec llm_service)
   → Groq llama-3.1-8b-instant
+  → Hapuppy gpt-4.1-mini (quota skip partagé avec llm_service)
 ```
-- Circuit breakers FreeTheAI + Hapuppy partagés avec `llm_service` (même état en mémoire)
+- Quota skip Hapuppy partagé avec `llm_service` (même état en mémoire — `_hapuppy_quota_skip_until`)
+- FreeTheAI retiré du waterfall traduction (réservé aux cascades monthly_prod/yearly_prod/monthly_scrap)
 - Trail + notif TG throttlée 30min — notif si Azure down, provider fallback utilisé, ou tous down
 - Azure 2M chars/mois free tier — OW non inclus dans batch (trop volatile, refresh 3h)
 - **Azure = primary pour digest** : 8 textes en 0.68s batch · qualité bonne sur financier standard · artefacts rares (`rassemblement` pour "rally", gérondif mal conjugué) non bloquants pour email
 - **Hapuppy** : URL `beta.hapuppy.com` (pas `api.hapuppy.com` — 503) · latence ~10s individuel · instable en charge (timeouts fréquents) · légèrement meilleur sur termes techniques spécialisés (ex: "runtime" conservé vs Azure qui traduit "en temps réel")
 - **Digest quota estimé** : ~500 chars × 20 tickers × 2 digests/semaine ≈ 80K chars/mois (4% du free tier Azure)
+
+**`translate_bulk.py` — script local bulk traduction :**
+Utilise `llm_call(cascade="promo")` (Gemini→raise) — pas encore migré `zen` (Gemini out of credits, à faire si nécessaire). `translation_service.py` inchangé comme backup prod. `TRANSLATE_PROMPT` importé depuis `translation_service.py` (source unique).
+- Filtre : `_en` non-null ET `_fr` null uniquement — idempotent, relançable sans risque
+- Ordre de priorité : BUB → Y breakers → M breakers → W breakers
+- Filtres : `--region US|EU|ASIA`, `--ticker TICKER`, `--since 2h|30m|3d`, `--only bub,y,m,w`
+- `--workers N` (défaut 10) : traductions en parallèle via ThreadPoolExecutor — chaque row assignée à un seul worker, pas de doublon possible
+- Erreurs par traduction catchées individuellement (None) : la row reste `_fr=null` → reprocessée au prochain run automatiquement
+- `--dry-run` : compte les lignes sans écrire
+- `max_tokens=2000` non envoyé à Gemini (Gemini ignore ce param dans cascade `promo`)
 
 **FreeTheAI — modèles actifs (testés 29/05/2026) :**
 | Modèle | JSON propre | Latence | Notes |
@@ -342,13 +395,27 @@ llm_service.py / translation_service.py
 ```
 GROQ_API_KEY=...
 FREETHEAI_API_KEY=sta_...          # /checkin Discord chaque jour UTC
-GEMINI_API_KEY=...                 # Google AI Studio — gemini-3.1-flash-lite, 500 RPD, 250K TPM
+GEMINI_API_KEY=...                 # Google AI Studio — gemini-3.1-flash-lite, 500 RPD, 250K TPM — OUT OF CREDITS 19/06/2026
+ZENLLM_API_KEY=sk-zenith-...       # ZenLLM (OpenAI-compatible) — cascade "zen" batch promo
 TELEGRAM_BOT_TOKEN=...             # @mcorp1290_bot
 TELEGRAM_CHAT_ID=...               # notifs cascade LLM
+
+**⚠ Règle TG (s'applique à TOUS les scripts)** : `parse_mode: HTML`. Tout `<` ou `>` dans le texte doit être échappé en `&lt;`/`&gt;` AVANT la conversion `*bold*`→`<b>`. Sinon Telegram retourne 400 silencieusement (pas d'exception, message jamais envoyé). Pattern correct :
+```python
+safe = msg.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+html = re.sub(r'\*([^*]+)\*', r'<b>\1</b>', safe)
+```
+R2_ENDPOINT_URL=...                # Cloudflare R2 S3-compatible endpoint
+R2_ACCESS_KEY_ID=...               # R2 API token ID
+R2_SECRET_ACCESS_KEY=...           # R2 API token secret
+R2_BUCKET=stockvibe-articles       # bucket R2 (à créer dans dashboard Cloudflare)
 AZURE_TRANSLATOR_KEY=...           # F0 free tier 2M chars/mois (traduction EN→FR)
 AZURE_TRANSLATOR_REGION=...        # ex: eastus
 YANDEX_API_KEY_ID=...              # Yandex Translate — ID de la clé IAM
 YANDEX_SECRET_KEY=...              # Yandex Translate — clé secrète (configuré, pas encore intégré dans translation_service.py)
+MARKETAUX_API_TOKEN=...            # marketaux.com — 100 req/j free · EU+ASIA prod cron + scrap
+NEWSAPI_API_KEY=...                # newsapi.org — 100 req/j free · EU+ASIA prod cron + scrap P1→P4
+ALPHAVANTAGE_API_KEY=...           # alphavantage.co — 25 req/j free · scrap last resort P1→P4 · ~3 ans historique
 ```
 
 ---
@@ -356,21 +423,33 @@ YANDEX_SECRET_KEY=...              # Yandex Translate — clé secrète (configu
 ### Supabase — Tables actives
 
 ```
-ow_cache           — cache OW live (ticker PK, ai_summary_fr, ai_summary_24h_fr, ai_summary_en, ai_summary_24h_en,
-                             ai_sentiment, ai_sentiment_24h, cached_at, ow7d_cached_at, website, generated_by_en,
-                             generated_by_fr, no_24h_news, articles_hash, exchange) — pas de TTL, refresh sur nouveaux articles uniquement. EN served first.
+ow_cache           — cache OW live (ticker PK, ow7d_en, ow7d_fr, ow1d_en, ow1d_fr,
+                             ow7d_sentiment, ow1d_sentiment,
+                             ow1d_cached_at_en, ow1d_cached_at_fr, ow7d_cached_at_en, ow7d_cached_at_fr,
+                             llm_source_en, llm_source_fr,
+                             website, no_24h_news, articles_hash, exchange) — pas de TTL, refresh sur nouveaux articles uniquement. EN served first.
                              Zéro articles stockés ici. `exchange` = code yfinance (NMS, NYQ, KSC…) — peuplé à la 1ère
                              visite via trigger dans `get_news_stale()`. One-shot initial : `scripts/populate_exchange.py`.
-                             Lignes sans `cached_at` (exchange-only) traitées comme cache absent → appel bloquant.
+                             Lignes sans `ow1d_cached_at_en` (exchange-only) traitées comme cache absent → appel bloquant.
 user_preferences           — préférences (user_id PK, currency, notify_email, notify_weekly, digest_tickers text[], lang text DEFAULT 'en')
 pinned_stocks              — watchlist (user_id, ticker, company_name, pinned_at) — unique(user_id, ticker)
 ~~daily_digest~~           — **supprimée** (remplacée par lecture directe `ow_cache`)
-bub_cache               — causes AI événements chart (ticker, date PK, articles, cause_fr, cause_en) — permanent
+bub_cache               — causes AI événements chart (ticker, date PK, bub_en, bub_fr,
+                             bub_cached_at_en, bub_cached_at_fr, llm_source_en, llm_source_fr,
+                             in_1w, in_1m, in_6m, in_1y) — permanent · articles JSONB droppé (DT9 ✅)
 articles — source de vérité articles (ticker, year_month PK, articles JSONB avec dumb_en/dumb_fr
                              par article, source: "finnhub"|"yahoo"|"mixed") — mois actif refresh 12h, passés permanent.
-breaks_weekly     — résumé AI + top 10 articles par semaine (ticker, year_month, week_num PK, ai_summary_en, ai_summary_fr, top_articles) — jamais ai_summary vanilla
-breaks_monthly    — résumé AI par mois (ticker, year_month PK, ai_summary_en, ai_summary_fr) — jamais ai_summary vanilla
-breaks_yearly     — résumé AI par année (ticker, year PK, ai_summary_en, ai_summary_fr) — jamais ai_summary vanilla
+breaks_weekly     — résumé AI + top 10 articles par semaine (ticker, year_month, week_num PK, bw_en, bw_fr, top_articles,
+                             llm_source_en, llm_source_fr, condensed_at, status TEXT) — NULL = généré ok · "skew" = semaine cluster Finnhub skippée ·
+                             "less_3_articles" = articles insuffisants (< seuil) · "no_articles" = scrapé mais 0 articles ·
+                             "no_processed" = jamais scrapé (aucune row dans articles) · "error" = exception LLM.
+                             Exists checks filtrent sur status IS NULL (les rows non-null permettent le retry après nouveau scrape).
+                             _purge_excess_weeklies ne purge que les rows status IS NULL.
+breaks_monthly    — résumé AI par mois (ticker, year_month PK, bm_en, bm_fr,
+                             llm_source_en, llm_source_fr, condensed_at, status TEXT) — NULL = généré ok · "less_3_articles" = articles insuffisants (< 3) ·
+                             "no_articles" = scrapé mais 0 articles · "no_processed" = jamais scrapé · "error" = exception LLM.
+                             Exists checks filtrent sur status IS NULL. _build_state_from_db compte uniquement les rows status IS NULL.
+breaks_yearly     — résumé AI par année (ticker, year PK, by_en, by_fr, llm_source_en, llm_source_fr) — jamais ai_summary vanilla
 cold_start_status         — cold start tickers rares (ticker PK, phase TEXT, status TEXT, pending_fr BOOL,
                              started_at, completed_at, error TEXT, updated_at)
 ```
@@ -444,31 +523,54 @@ Yearly  : textes M1→M12
 **Problème connu — Finnhub date clustering :**
 Finnhub indexe les articles avec sa date de crawl, pas la date de publication. Pour ~35% des mois, 80%+ des articles tombent en W4. Détection automatique côté backend : si skewed → section merged "WX→WY · pas de récap hebdomadaire disponible".
 
-**Script condensation manuelle :** `backend/scripts/break_view_resume.py`
-```bash
-python scripts/break_view_resume.py AAPL --months 6  # weeklies + monthlies
-python scripts/break_view_resume.py AAPL --weekly    # weeklies seulement
-```
-⚠ Inutilisable pour générer des weekly summaries fiables tant que Finnhub clustère les dates en W4.
-
 **Script batch refresh breakers :** `backend/scripts/refresh_breakers.py`
 ```bash
-python scripts/refresh_breakers.py --region US --lang en           # run normal (resume auto)
-python scripts/refresh_breakers.py --region US --lang en --no-resume  # repart de zéro
-python scripts/refresh_breakers.py --region US --lang en --re-enrich-legacy  # re-traite les tickers legacy
+python scripts/refresh_breakers.py --region US --lang en                               # run complet
+python scripts/refresh_breakers.py --region US --lang en --force-regen                # régénère W+M même s'ils existent déjà
+python scripts/refresh_breakers.py --region US --lang en --skip-scrape                # DUMB+W+M seulement, sans scrap
+python scripts/refresh_breakers.py --region US --lang en --skip-p1                    # saute RSS+Yahoo+Finnhub, garde P2+génération
+python scripts/refresh_breakers.py --region US --lang en --skip-rss-yahoo             # saute RSS+Yahoo, exécute Finnhub+P2+génération (reprise mid-Finn)
+python scripts/refresh_breakers.py --region US --lang en --retry-missed               # retraite les (ticker, ym) du scrap_missed_checkpoint.json
+python scripts/refresh_breakers.py --region US --lang en --retry-skipped              # re-scrape tickers avec W less_10_articles ou M absent (mois courant) → chaîne W→M
+python scripts/refresh_breakers.py --region US --lang en --ticker AAPL                # ticker unique (debug)
 ```
-Checkpoint JSON : `scripts/refresh_breakers_{region}_{lang}.json` — champs `done` + `legacy` + `monthly_done`.
-`legacy` = tickers traités avant l'enrichissement dumb+summary (`_article_text()`) — prompts générés avec headlines seuls.
-Au premier run post-enrichissement, les tickers `done` existants sont auto-marqués `legacy`.
-`--re-enrich-legacy` pour les re-passer avec la nouvelle logique dumb+summary.
+Flags supprimés (refacto 2026-06) : `--phase ab`, `--phase m`, `--no-resume`, `--regen-bubs`, `--translate`.
 
-**Deux flux parallèles (Flow AB + Flow M) :**
-- **Flow AB** : scrape + DUMB + weeklies. Cascade : DUMB=`groq_first`, weekly=`hapuppy_only`
-- **Flow M** : monthlies uniquement. Cascade : `freetheai_only` — lève `FreeTheAIExhaustedError` si quota atteint
+**Status column — écriture par script :**
+| Script | W writes | M writes |
+|---|---|---|
+| `refresh_breakers.py` | skew · less_10_articles · no_articles · error | no_articles · error |
+| `breakers_articles_service.py` (cron) | no_processed · no_articles · less_10_articles · error | no_processed · no_articles · error |
+| `cold_start_service.py` | error | error |
+| `batch_fill_db.py` | non concerné (traduction uniquement) | non concerné |
+
+`less_10_articles` remplace `less_3_articles` (seuil W passé à `MIN_W_SCRAP = 10`).
+
+**Flow (tout séquentiel) :**
+- **Phase 1** : RSS 12m → Yahoo mois courant → Finnhub 12m US — sources gratuites
+- **Gate fraicheur** : `_build_targets` (1 req/year_month) → skip P2 si ≥25 arts mois ET ≥10 arts semaine courante
+- **Phase 2** : NewsAPI 1m → Marketaux 3m → AV 12m US-only — payant, budget-limité
+  - `scrap_budget` : tag `(ticker, ym)` uniquement si les 3 sources payantes ont toutes été skippées faute de budget
+  - **p2_sources** : colonne `p2_sources text[]` sur `articles` — tracker quels APIs ont déjà hit chaque (ticker, ym). Couvre **P1 Finnhub** + **P2** (newsapi · marketaux · av). Skip si déjà taggé. Tag posé **uniquement sur succès ou résultat vide** — un 429 ne pose PAS le tag (ticker retenté au prochain run). Abort automatique après 3 × 429 consécutifs (2 pour AV). Pour les crons prod : tag P2 uniquement en fin de mois (J+3). Reset naturel : nouvelle row par mois.
+  - **Finnhub throttle** : `time.sleep(1.0)` entre chaque call — ~60 req/min (limite free tier). Sur second passage (`--skip-rss-yahoo`), les paires déjà taggées `"finnhub"` dans `p2_sources` sont skippées.
+  - **AV : US uniquement** — `_detect_region(t) == "US"` filtré avant le loop. AV ne couvre pas les tickers EU/ASIA (suffixes `.DE`, `.L`, `.AS` non reconnus → `feed = []` → budget grillé pour rien). **1 call/ticker** (fenêtre 12m, limit=1000) — résultats splittés par `year_month` en mémoire puis upsertés mois par mois. Budget 25 req/j → 25 tickers/j au lieu de N_mois × N_tickers.
+- **Post-scrap** : DUMB → W (5 semaines glissantes) → M par ticker — **25 tickers en parallèle** via `ThreadPoolExecutor(25)` · semaphore Hapuppy(25) régule les LLM · compteurs protégés par lock
+- **Flow M** : monthlies uniquement. Cascade : `promo` — lève `RuntimeError` si Hapuppy down. 1 worker.
 - Deux `ThreadPoolExecutor` séparés (AB: max_workers=2, M: max_workers=1), unifiés via `as_completed`
 - `_freetheai_monthly_stop = threading.Event()` — quand Flow M capte `FreeTheAIExhaustedError` : stop propre + notif TG
 - Flow AB continue indépendamment même si FreeTheAI est épuisé (Hapuppy/Groq fallback)
-- Lendemain : même commande reprend automatiquement les monthlies manquants sans re-scraper
+- `--phase ab` : lance uniquement Flow AB — utile pour remplir les W sans consommer le quota FreeTheAI
+- `--phase m` : lance uniquement Flow M — utile en soirée quand FreeTheAI est dispo
+- `--skip-scrape` : saute P1 + P2 (tout le scrape) mais **exécute quand même la génération W/M** — utile si les articles sont déjà en DB
+- `--skip-p1` : saute RSS + Yahoo + Finnhub (Phase 1 gratuite) mais garde Phase 2 payante + génération W/M — utile pour aller directement aux APIs payantes
+- `--retry-missed` : lit `scrap_missed_checkpoint.json`, reprocess uniquement les paires ratées via APIs payantes (RSS skippé). Met à jour le checkpoint avec ce qui reste, ou le supprime si tout est couvert. Relançable plusieurs jours de suite.
+
+**Retry scrap — `scrap_missed_checkpoint.json`** :
+- Écrit à la fin de P2 pour les `(ticker, ym)` qui ont eu **zéro articles via RSS** ET dont **toutes les sources payantes ont été skippées faute de budget** (`scrap_budget`)
+- Contient `{ "date": "YYYY-MM-DD", "missed": [[ticker, ym], ...] }`
+- `--retry-missed` reprocess ces paires via NewsAPI (1m) → Marketaux (3m) → AV (12m US), puis appelle `gen_dumb + gen_weekly + gen_monthly` par ticker/ym si articles ajoutés
+- Le checkpoint est mis à jour après chaque run : paires couvertes retirées, supprimé si vide
+- Indépendant du run normal — lancer `--retry-missed` seul ne scrap pas les autres tickers
 
 ---
 
@@ -485,11 +587,6 @@ Finnhub indexe le même article depuis plusieurs outlets. Contenu identique à 1
 - `ArticleDrawer` : un bouton "Read" par source disponible
 - **Scope** : 1M/6M/1Y. 1D/1W utilise `articles` (Finn+Yahoo) — multi-source possible mais pas de badges supplémentaires dans ce mode.
 
-**Script refetch :** `backend/scripts/refetch_finnhub.py`
-```bash
-python scripts/refetch_finnhub.py --months 3   # re-fetch 3 derniers mois avec dedup+merge
-python scripts/refetch_finnhub.py --dry-run    # liste les rows sans fetch
-```
 
 ---
 
@@ -498,15 +595,42 @@ python scripts/refetch_finnhub.py --dry-run    # liste les rows sans fetch
 ```
 articles (raw bodies)
   → source de vérité unique — article_archive supprimé ✅ (code + DB)
-  → JAMAIS purgé automatiquement · 4 478 rows · 687 tickers · 122 121 articles (juin 2026)
-  → cappé à 50 articles par (ticker, year_month)
-  → TODO lifecycle : strip champ "summary" sur articles > 35 jours (sidebar plus affichée) via cron nettoyage
-  → TODO lifecycle : delete rows entières après ~13 mois (aucune vue n'affiche des articles > 1Y) via même cron
-  → TODO lifecycle : supprimer le cap 50 une fois la purge 13 mois en place
+  → JAMAIS purgé automatiquement · 5 616 rows · 216 341 articles · 289 MB TOAST (juin 2026)
+  → sources : finnhub 97k | yahoo 64k | mixed 42k | google_rss 11k
+  → PK = (ticker, year_month) — une seule source par cellule, pas de doublon cross-source possible
+  → quasi zéro doublons URL intra-array (1 pair / 50k articles échantillonnés)
+
+  **Lifecycle articles — architecture décidée :**
+
+  0 → 6 mois (Supabase, full content) :
+    → champs complets : headline · url · source · datetime · extra_sources · summary · dumb_en · dumb_fr
+    → display 1D/1W/1M/6M avec drawer · BUB gen · Breaks gen : tout disponible
+
+  6 → 13 mois (Supabase lightweight + externe R2/Turso) :
+    → Supabase garde : headline · url · source · datetime · extra_sources
+    → Externe (clé `{ticker}/{year_month}.json.gz`) : summary · dumb_en · dumb_fr
+    → display 6M/1Y directLink=true : lightweight Supabase suffit, externe jamais touché
+    → BUB sur dot déjà cached (bub_en non-null) : externe jamais touché
+    → BUB sur nouveau dot jamais cliqué : fetch externe → LLM avec contenu complet
+    → Breaks : déjà générés pour ces mois, externe jamais touché
+    → Gain estimé : 150-200 MB libérés sur Supabase
+
+  > 13 mois : purge total
+    → DELETE row Supabase + DELETE fichier externe
+    → bub_cache a déjà purgé les dots > 1 an → aucun BUB possible
+    → aucune vue n'affiche des articles > 12 mois
+
+bub_cache
+  → 9 574 rows · 12 MB (après DROP articles + VACUUM FULL, -103 MB libérés le 2026-06-19)
+  → colonne `articles` JSONB droppée — BUBs fetched fresh depuis `articles` à la demande (DT9 ✅)
+  → purge auto lun 3h : rows > 1 an supprimées
 
 breaks_weekly
+  → 1 703 rows · 16 620 top_articles re-copiés depuis `articles` · 12 MB
+  → top_articles stockés pour générer les Breaks, inutiles une fois bw_fr/bw_en rempli
   → max 5 weeklies stockés par ticker (purge auto à chaque nouveau weekly)
   → supprimé le 1er du mois suivant (après monthly calendaire généré)
+  → TODO cleanup : vider breaks_weekly.top_articles pour les rows où bw_fr/bw_en IS NOT NULL (gain ~10 MB)
 
 breaks_monthly (calendaire : S1+S2+S3+S4 dans l'ordre)
   → gardé 12 mois — source pour vues 6M / 1Y
@@ -526,15 +650,93 @@ breaks_yearly
 **Chaîne de condensation :**
 ```
 Lundi 3h    : weekly summary → purge si > 5 weeklies
-1er du mois : monthly calendaire (S1+S2+S3+S4) → purge weeklies du mois passé
-1er janvier : yearly (12 monthly calendaires) → purge ces 12 monthlies
+1er du mois : monthly calendaire (S1+S2+S3+S4) → purge W du mois passé (conditionnel)
+1er janvier : yearly (12 monthly calendaires) → purge ces 12 monthlies (conditionnel)
 ```
+
+**Conditions de purge (fixes à implémenter) :**
+- W → purgés seulement si : (1) contenu M non-null en DB ET (2) W4 du mois courant existe (`status IS NULL`)
+  → garantit 4 semaines visibles en vue 1M avant suppression du mois passé
+- M → purgés seulement si : contenu Y non-null en DB après upsert yearly
+  → évite perte de données si yearly upsert silencieux avec contenu vide
 
 **Source par ticker :**
 - Finnhub retourne des articles → `source: "finnhub"` → bootstrap immédiat 12 mois
 - Finnhub retourne 0 articles → `source: "yahoo"` → accumulation daily via cron
+- `source` valeurs valides : `"finnhub"` · `"yahoo"` · `"marketaux"` · `"newsapi"` · `"google_rss"` · `"alphavantage"` · `"mixed"` (dès qu'il y a merge multi-source)
 
-**Cron Yahoo */3h** : fetch `get_news(count=100)` → `_dedup_by_headline` merge → `source: "mixed"` si Finnhub déjà présent → si nouveaux articles : `brutalise_new_articles(ticker)` (DUMB immédiat) → `get_news(ticker, force_24h=True)` (OW depuis dumb)
+**Routing région (`_detect_region(ticker)`) :**
+- US : pas de `.` dans le ticker (AAPL, AMZN…)
+- EU : suffixes `.PA .AS .L .MI .DE .MC .SW .CO .OL .ST` etc.
+- ASIA : suffixes `.T .HK .KS .SS .AX .NS .BO .TW` etc.
+- Fallback : US si inconnu · source : `ow_cache.exchange` peut affiner (NMS/NYQ = US, PAR = EU, KSC = ASIA…)
+
+**File de scrap multi-sources (ordre d'exécution) :**
+
+Seuils qualité : M breaker = 25 articles minimum · W breaker = 10 articles minimum.
+
+1. **Google RSS** (`after:/before:` par mois) → gratuit · sans quota · ~2 ans d'historique · ~46 articles/mois
+   Scope : **tous tickers** (US + EU + ASIA) pour les mois SKWD et vides
+
+2. **Si M < 25 articles après RSS** → NewsAPI + Marketaux (100 req/j chacun)
+   Scope : **EU+ASIA** (tous mois manquants) + **US SKWD ou vides uniquement**
+   NewsAPI : mois courant prio, 1 mois max · Marketaux : SKWD prio → M vides, 3 mois max
+
+3. **Si M encore < 25 articles** → Alpha Vantage (25 req/j · ~2 ans d'historique)
+   Scope : **EU+ASIA** (tous mois manquants) + **US SKWD ou vides uniquement**
+   Priorité interne : P1 SKWD EU+ASIA · P2 M vides EU+ASIA · P3 SKWD US · P4 M vides US
+
+Même logique pour les W breakers avec seuil à 10 articles.
+
+**Rôles par source — scrap vs prod :**
+| Source | Scrap | Prod (au lancement) |
+|---|---|---|
+| Yahoo | déjà en place | */3h tous pinnés ≥3 — inchangé |
+| Finnhub | déjà en place | */6h tous pinnés — inchangé |
+| Marketaux | SKWD prio → M vides EU+ASIA | */6h EU+ASIA pinnés |
+| NewsAPI | P1 SKWD EU+ASIA → P2 M vides EU+ASIA → P3 SKWD US → P4 M vides US | */6h EU+ASIA pinnés |
+| Google RSS | **top 1 scrap** : after/before par mois · tous tickers (SKWD + vides US+EU+ASIA) · ~46 art/mois · gratuit/illimité | */3h tous tickers (complément Yahoo) |
+| NewsAPI | si M < 25 art après RSS · EU+ASIA (tous) + US SKWD ou vides · 100 req/j | */6h EU+ASIA pinnés |
+| Marketaux | si M < 25 art après RSS · EU+ASIA (tous) + US SKWD ou vides · SKWD prio · 100 req/j | */6h EU+ASIA pinnés |
+| Alpha Vantage | last resort si M encore < 25 art · EU+ASIA (tous) + US SKWD ou vides · 25 req/j | scrap only (25/j trop limité) |
+
+**Cron Yahoo */3h** : fetch `get_news(count=100)` → pour les tickers EU/ASIA (`.` dans le ticker) : + `yf.Search(company_name)` via `t.info.get("shortName")` (dedup par URL) → `_dedup_by_headline` merge → `source: "mixed"` si Finnhub déjà présent → si nouveaux articles : `brutalise_new_articles(ticker)` (DUMB immédiat) → `get_news(ticker, force_24h=True)` (OW depuis dumb)
+
+**Cron Google RSS */3h** (`google_rss_articles_scrap()` dans `main.py`) : tous pinnés · `_fetch_rss_month` par mois · `_build_rss_query(ticker, company_name)` · merge → dedup headline → upsert · post-scrap : gen_dumb + scrap_gen_weekly + scrap_gen_monthly
+
+**Cron Marketaux */6h** (`marketaux_articles_scrap()`) : tous pinnés · P1→P4 · `_detect_region` · `_fetch_marketaux_month` · `_normalize_marketaux()` · budget 100 req/j · post-scrap complet
+
+**Cron NewsAPI */6h** (`newsapi_articles_scrap()`) : tous pinnés · P1→P4 · `_fetch_newsapi_month` · `_normalize_newsapi()` · budget 100 req/j · 1 mois max (plan Dev gratuit) · post-scrap complet
+
+**`is_fresh(ticker, year_month)` — logique partagée** : `len(articles) >= 25 AND (now - cached_at).days < 3` · dérivé de `articles.cached_at` + count JSONB · zéro DDL · utilisé par : scrap scripts (skip) + M gen (choix cascade)
+
+**Ticker → company name — source unique : `yfinance_service.py`**
+
+- `get_company_name(ticker) -> str` : 1. `yf.Search(ticker).quotes[0]` (longname/shortname) · 2. `t.info` longName/shortName · 3. `_KNOWN_NAMES` fallback statique (28 tickers EU confirmés par recoupement multi-sources)
+- `bulk_fetch_company_names(tickers) -> dict[str, str]` : ThreadPoolExecutor(8) sur `get_company_name` · filtre `"." in ticker` (EU/ASIA uniquement)
+- `_KNOWN_NAMES` couvre les tickers défunts/fusionnés/délisted que Yahoo ne résout plus (Wirecard, Credit Suisse, FCA, Peugeot, Luxottica, etc.) — 3 tickers volontairement exclus faute de source fiable : BCMB.DE, GFJ.DE, AIRP.IR
+- `breakers_articles_service.py` n'expose plus `_bulk_fetch_company_names` — tous les appelants (refresh_breakers, scrap_google_rss, scrap_newsapi, scrap_alphavantage, scrap_marketaux) importent depuis `yfinance_service`
+- Les tickers sans nom trouvé sont écrits dans `scripts/missing_names_{REGION}.txt` (overwrite à chaque run) — fichier d'audit pour identifier les tickers que Yahoo ne connaît pas
+
+**`_build_rss_query(ticker, company_name)`** dans `breakers_articles_service.py` :
+- US : `_company_keywords(company_name)[:2]` + "stock"
+- EU/ASIA : `company_name.strip().split()[:3]` brut (pas de filtre keyword) + "stock" — préserve "Holding", "Motors" etc. · fallback base ticker sans suffixe ("7203" depuis "7203.T")
+
+**Fonctions fetch dans `breakers_articles_service.py`** (source unique, importées par scrap scripts + refresh_breakers) :
+`_fetch_rss_month` · `_fetch_newsapi_month` · `_fetch_marketaux_month` · `_fetch_av_month` · `_normalize_av` · `scrap_ext_sources` · `_is_month_fresh` · `_upsert_articles_merge` · `_normalize_google_rss` · `_normalize_newsapi` · `_normalize_marketaux`
+
+`_upsert_articles_merge` retourne `(added: int, effective_source: str)` — `effective_source` vaut `""` si rien ajouté, `source_tag` si nouveau ticker/mois, `"mixed"` si merge multi-source. Tous les callers unpackent le tuple (`added, _ = ...` ou `added, src = ...`).
+
+`scrap_gen_weekly(ticker, year_month, supa, caller, cascade="weekly_scrap")` · `scrap_gen_monthly(ticker, year_month, supa, caller, cascade=None)` — le param `cascade` permet aux appelants de forcer une cascade différente (ex: `promo` depuis refresh_breakers). Défaut : `weekly_scrap` (Gemini→Hapuppy) pour W · auto-détecté `monthly_scrap`/`monthly_scrap_ext` pour M.
+
+**Cascades LLM par script (DUMB · W · M) :**
+| Script | DUMB | Weekly | Monthly |
+|---|---|---|---|
+| `refresh_breakers.py` (toutes phases) | `promo` | `promo` | `promo` |
+| `scrap_google_rss.py` | `dumb_scrap` Groq→Hapuppy | `weekly_scrap` Gemini→Hapuppy | `monthly_scrap`/`ext` FreeTheAI→Hapuppy |
+| `scrap_newsapi.py` | `dumb_scrap` | `weekly_scrap` Gemini | `monthly_scrap`/`ext` FreeTheAI |
+| `scrap_marketaux.py` | `dumb_scrap` | `weekly_scrap` Gemini | `monthly_scrap`/`ext` FreeTheAI |
+| `scrap_alphavantage.py` | `dumb_scrap` | `weekly_scrap` Gemini | `monthly_scrap`/`ext` FreeTheAI |
 
 **Cron Finnhub */6h** : `_get_or_fetch_month()` → merge Finnhub + existant Yahoo → `ACTIVE_MONTH_TTL_HOURS = 12` → si nouveaux articles : `brutalise_new_articles(ticker)` → `get_news(ticker, force_24h=True)`
 
@@ -608,8 +810,8 @@ Labels X : période `1d` → `HH:MM` (bougies 5-min). Autres périodes → `YYYY
 - Sandbox : `RESEND_FROM_EMAIL=onboarding@resend.dev` → emails envoyés uniquement vers l'adresse du compte Resend
 - Production : vérifier un domaine dans Resend dashboard → changer `RESEND_FROM_EMAIL=digest@tondomaine.com`
 - **2 jobs APScheduler** :
-  - `daily_digest_email` 19h15 — lit `ai_summary_24h_en/fr` selon `user_preferences.lang` · Azure pre-flight pour manquants FR · snapshot mémoire · envoi via `supa.auth.admin.get_user_by_id()` (pas management API)
-  - `weekly_digest_email` sam 7h — lit `ai_summary_en/fr` · 5 articles 7j · même flow
+  - `daily_digest_email` 19h15 — lit `ow1d_en/ow1d_fr` selon `user_preferences.lang` · Azure pre-flight pour manquants FR · snapshot mémoire · envoi via `supa.auth.admin.get_user_by_id()` (pas management API)
+  - `weekly_digest_email` sam 7h — lit `ow7d_en/ow7d_fr` · 5 articles 7j · même flow
 - **Langue** : `user_preferences.lang` ('en' | 'fr', DEFAULT 'en') — toggle dans Profile page · fallback EN si FR vide
 
 ---
@@ -619,8 +821,8 @@ Labels X : période `1d` → `HH:MM` (bougies 5-min). Autres périodes → `YYYY
 | Région | Count | Source articles | Historique |
 |---|---|---|---|
 | US (S&P500 + NASDAQ) | 260 | Finnhub 12 mois + Yahoo | 12 mois complets |
-| EU (Paris/Frankfurt/LSE/Amsterdam/Zurich...) | 227 | Yahoo principalement | Accumulation daily |
-| Asie (Japon/HK/Corée/Inde/Taiwan/Australie...) | 230 | Yahoo principalement | Accumulation daily |
+| EU (Paris/Frankfurt/LSE/Amsterdam/Zurich...) | 227 | Yahoo + Marketaux + NewsAPI (prod) · Marketaux scrap P1→P4 + NewsAPI scrap P1→P4 · Google RSS + AV last resort | Accumulation daily + backfill 3 mois |
+| Asie (Japon/HK/Corée/Inde/Taiwan/Australie...) | 230 | Yahoo + Marketaux + NewsAPI (prod) · Marketaux scrap P1→P4 + NewsAPI scrap P1→P4 · Google RSS + AV last resort | Accumulation daily + backfill 3 mois |
 | **Total** | **717** | | |
 
 Fichier de référence : `backend/data/tickers.py`
@@ -629,14 +831,44 @@ Fichier de référence : `backend/data/tickers.py`
 
 ### Batch scraper — `backend/scripts/batch_fill_db.py`
 
+Stateless : aucun fichier JSON local. Source de vérité = Supabase (check DB par phase au démarrage).
+
 ```bash
 python scripts/batch_fill_db.py --phase scrape --region US
 python scripts/batch_fill_db.py --phase enrich --region US
-python scripts/batch_fill_db.py --phase bubbles --region US
+python scripts/batch_fill_db.py --phase bubbles --region US --lang en              # normal : skip tickers complets en DB
+python scripts/batch_fill_db.py --phase bubbles --region US --lang en --empty-only # tickers ayant ≥1 bub_en NULL
+python scripts/batch_fill_db.py --phase bubbles --region US --lang en --force      # regen tous les dots de bub_cache (remplace regen_bubs)
+python scripts/batch_fill_db.py --phase bubbles --region all --lang en --force --ticker AAPL
 python scripts/batch_fill_db.py --phase all --region US
 python scripts/batch_fill_db.py --phase translate-fr --region US
 python scripts/batch_fill_db.py --phase translate-fr-dumb --region US
 ```
+
+**Checks DB par phase (skip logic) :**
+| Phase | Condition skip ticker |
+|---|---|
+| `scrape` | row `articles` existe pour ce ticker + mois courant |
+| `enrich` | `ow_cache.ow7d_en IS NOT NULL` |
+| `bubbles` normal | `SELECT DISTINCT ticker FROM bub_cache WHERE bub_en IS NOT NULL` |
+| `bubbles --empty-only` | tickers avec `bub_en IS NULL` dans bub_cache |
+| `bubbles --force` | aucun skip — traite tous les dots existants en bub_cache |
+| `translate-fr` | `bub_cache.bub_fr IS NOT NULL` |
+| `translate-fr-dumb` | `articles.dumb_fr IS NOT NULL` |
+
+---
+
+### Traduction bulk — `backend/scripts/translate_bulk.py`
+
+```bash
+python scripts/translate_bulk.py --region EU           # BUB → Y → M → W, EU uniquement
+python scripts/translate_bulk.py --region EU --only y,m  # Y + M seulement
+python scripts/translate_bulk.py --ticker AXA.PA       # ticker unique
+python scripts/translate_bulk.py --since 2h            # lignes mises à jour dans les 2h
+python scripts/translate_bulk.py --dry-run             # compte sans écrire
+```
+
+Utilise cascade `promo` (Gemini → raise) via `llm_call` — 3 clés Gemini en rotation.
 
 ---
 
@@ -645,111 +877,110 @@ python scripts/batch_fill_db.py --phase translate-fr-dumb --region US
 Scrape articles + génère weekly/monthly breakers pour tous les tickers d'une région.
 
 ```bash
-python scripts/refresh_breakers.py --region US   --lang en
-python scripts/refresh_breakers.py --region EU   --lang en
-python scripts/refresh_breakers.py --region ASIA --lang en
-python scripts/refresh_breakers.py --region US   --lang fr   # après migration colonnes _fr
-python scripts/refresh_breakers.py --region US   --lang en --ticker AAPL   # ticker unique
-python scripts/refresh_breakers.py --region US   --lang en --no-resume     # ignore checkpoint
+python scripts/refresh_breakers.py --region US --lang en                           # run complet — scrape P1+P2 → DUMB → W → M
+python scripts/refresh_breakers.py --region US --lang en --retry-skipped           # re-scrape ciblé : tickers W less_10_articles ou M absent (mois courant)
+python scripts/refresh_breakers.py --region US --lang en --retry-missed            # retraite les (ticker, ym) du scrap_missed_checkpoint.json
+python scripts/refresh_breakers.py --region US --lang en --skip-scrape             # DUMB+W+M uniquement, articles déjà frais
+python scripts/refresh_breakers.py --region US --lang en --skip-p1                 # saute RSS+Yahoo+Finnhub, garde P2+génération
+python scripts/refresh_breakers.py --region US --lang en --force-regen             # régénère W+M même s'ils existent déjà
+python scripts/refresh_breakers.py --region US --lang en --ticker AAPL             # ticker unique (debug)
 ```
 
-**Flow par ticker :**
-1. Fetch Finnhub + Yahoo en // pour le mois courant → dedup → upsert `articles`
-2. **DUMB** → `gen_dumb(ticker, lang)` — génère `dumb_en` pour les articles sans DUMB avant condensation (non-bloquant)
-3. Détection skew Finnhub : si une semaine > `SKEW_RATIO × médiane` des autres → `finn_skewed=True`
-4. Weeklies manquants sur les 5 dernières semaines glissantes :
-   - Semaine cluster (skew) → skip
-   - < 2 articles dans la semaine → skip
-5. Monthlies manquants sur les 6 derniers mois :
-   - `finn_skewed` → gen depuis raw articles directement
-   - ≥ 3 weeklies existants → gen depuis weeklies
-   - sinon → gen depuis raw articles
-6. Checkpoint JSON après chaque ticker
+**Flow complet :**
+
+*Phase 1 — sources gratuites (séquentiel) :*
+- Google RSS (toutes régions, 12 mois · 0.5s entre calls)
+- Yahoo (toutes régions, mois courant uniquement — API sans filtre date)
+- Finnhub (US uniquement, 12 mois)
+
+*Gate qty P1 → P2 (`_build_qty_gate`) :*
+- **W-gate** : mois courant < `MIN_W_SCRAP` (10) arts sur la semaine courante, ou mois passé < `MIN_M_SCRAP` (25) arts → cascade NewsAPI + Marketaux
+- **M-gate** : après NewsAPI+Marketaux, paires encore < `MIN_M_SCRAP` (25) arts/mois → cascade AV
+
+*Phase 2 — sources payantes :*
+- NewsAPI (budget 100 req/j · 1 mois · cibles W-gate) → Marketaux (budget 100 req/j · 3 mois · cibles W-gate) → AV (budget 25 req/j · **1 call/ticker** · fenêtre 12m · limit=1000 · split par year_month en mémoire · cibles M-gate)
+- Tag `scrap_budget` uniquement si les 3 sources payantes ont été skippées faute de budget pour ce ticker/mois
+
+*Post-scrap par ticker/mois (après cascade complète) :*
+- **DUMB** → `gen_dumb(promo)` · `cutoff_days=7` (défaut) · cap 30 articles · 1 call LLM batch · log `DUMB {ticker}: N arts [Wx]` si N > 0
+- **Skew Finnhub** (US uniquement) : si articles Finnhub clustérisés sur une semaine → W de cette semaine généré sans les articles Finnhub (Yahoo + RSS + sources payantes seulement)
+- **Gen W** sur les 5 semaines glissantes :
+  - < 10 arts → `status=less_10_articles`
+  - ≥ 10 arts → LLM → `status=null`
+  - Input LLM : **tous les articles de la semaine sans cap** via `_article_text` (headline seul pour RSS, headline + summary pour Yahoo/payants)
+- **Gen M** :
+  - Skip si un W du mois a `status=scrap_budget`
+  - ≥ 3 W `status=null` → `_gen_monthly_from_weeklies` — respecte le `cascade` de l'appelant (était hardcodé `monthly_scrap` → FreeTheAI, corrigé)
+  - < 3 W `status=null` → `_gen_monthly_from_raw` (tous les articles du mois sans cap)
+  - Cascade M : `promo` dans refresh_breakers — aucun appel FreeTheAI, chemin weeklies inclus
+
+**Input LLM W/M** : `_article_text(a)` — `dumb_en/fr` si disponible, sinon `summary`, sinon `headline` seul. Aucun cap sur le nombre d'articles envoyés. RSS = headline seul (pas de summary), Yahoo/payants = headline + summary. La qty compense le manque de profondeur RSS.
+
+**Parallélisme post-scrap** : `ThreadPoolExecutor(10)` workers · stagger démarrage `index × 0.5s` · `_exec` retry ×5 sur disconnect Supabase (`RemoteProtocolError`, `ReadError`, `ConnectError`) avec backoff exponentiel 3s → 9s → 27s → 81s → 243s → raise · `_retry_call(fn, *args)` : même logique que `_exec` mais pour les fonctions de service (`gen_dumb`, `scrap_gen_monthly`) qui appellent supa directement · Client Supabase HTTP/1.1 forcé dans `_supa()` (postgrest-py hardcode `http2=True` → GOAWAY frames → "Server disconnected" même à 2 workers — fix : remplacer `client.postgrest.session` par `httpx.Client(http2=False)` après création) · Logs : `→ {ticker} [Wx]` au démarrage de chaque worker (Wx = thread index) · Ctrl+C : les threads en cours finissent proprement, les W/M déjà loggés `✓` sont en DB, le reste est retryé au prochain `--skip-scrape`.
+
+**Bulk qty check** : `_build_qty_gate` charge les articles (JSONB) en une seule requête batch pour toutes les paires candidates, compte en mémoire — jamais de double boucle avec requêtes individuelles. `_build_targets` (freshness via `cached_at`) reste utilisé pour construire la liste initiale des paires à scraper (P1).
 
 **Filtrage pertinence (prompts)** : les prompts weekly et monthly demandent explicitement au LLM d'ignorer les articles génériques (top marchés, classements) non spécifiques au ticker. Pas de filtre DUMB/SKIP (90% des articles historiques n'ont pas de `dumb_en`) — le filtre est dans l'instruction prompt.
 
 **Checkpoints** — `backend/scripts/refresh_breakers_{region}_{lang}.json` (un par combo région+langue)
-- Un ticker est marqué `done` **uniquement si aucun échec LLM** (`_process_weeklies` + `_process_monthlies` retournent 0 failures)
-- Si failures > 0 → ticker NON ajouté au checkpoint → retenté automatiquement au prochain run
-- Log : `⚠ TICKER non marqué done (N échec(s) LLM) — retenté au prochain batch`
-- **Legacy auto-regen** : si `done` non-vide + `legacy` vide au démarrage → tous les `done` auto-marqués `legacy`. Les tickers `legacy` sont inclus dans `todo` même s'ils sont dans `done` et regénérés avec `force_regen=True` (bypass existence check DB). Un run normal suffit — pas de flag supplémentaire. Après re-gen réussi, ticker retiré de `legacy`.
-- **`--force-regen`** : flag CLI pour forcer la réécriture des weeklies/monthlies existants pour tous les tickers du run (pas seulement legacy).
+- `done` et `monthly_done` reconstruits depuis la DB au démarrage — source de vérité, pas de divergence possible
+- JSON conservé pour inspection (done + monthly_done), aucun champ n'est chargé depuis le JSON au démarrage
+- Un ticker est marqué `done` **uniquement si aucun échec LLM** — si failures > 0, retenté au prochain run
+- **`--no-resume`** : ignore la DB et le JSON, repart de zéro
+- **`--force-regen`** : régénère W+M pour tous les tickers du run, même s'ils existent déjà en DB
 
-**Notifs TG** — départ · checkpoint tous les 30 tickers (%, ETA, +articles, W/M générés, skewed, erreurs) · fin
+**Notifs TG** — départ · checkpoint tous les 30 tickers (%, ETA, +articles, sources LLM W/M, DUMB ok/fail, skewed, erreurs) · fin
+Format : `📅 W: 14 [14 hapuppy]` · `🤖 DUMB 18 ok · 2 fail` · `📆 M: 186 [186 hapuppy]`
 
-**Note lang** — `--lang en` peut tourner immédiatement. `--lang fr` requiert la migration colonnes `ai_summary_fr` (ADD sur `article_week/month/year_summaries`).
+**Logging console/fichier** (`refresh_breakers.log`) :
+- httpx et httpcore silencés (`WARNING+` seulement) — zéro bruit réseau dans les logs normaux
+- **Startup** : `_build_state_from_db` loggue l'état W (`done / sans row / by status`) + état M par mois (`done / à gen / sans articles`)
+- **RSS progress** : log tous les 100 tickers avec ETA (`RSS [100/2601] · +X arts · ~Ymin restant`)
+- **Per-source summary** : résumé à la fin de chaque source (`RSS done: N tickers maj · +X articles`). Pour les scripts scrap standalone : breakdown `source_counts` par effective source affiché en fin de log ET en notif TG (`google_rss: 45 | mixed: 48`)
+- **Skips explicites** : `⏭ W ticker YM Wn — aucun article en DB` · `⏭ W ticker YM Wn — N arts < 10 (skip)`
+- **Transitions de statut** : `↑ W ticker YM Wn: retry après less_10_articles` — loggué quand un ticker qui avait un statut non-null va être re-généré
+- **Statuts W** : `null` = généré OK · `less_10_articles` = < 10 arts semaine · `skew` = généré sans articles Finnhub · `scrap_budget` = sources payantes non atteintes
+- **DUMB skip** : `DUMB ticker: skip (tous déjà brutalised)` quand `gen_dumb` retourne 0
+- **LLM calls** (dans `breakers_articles_service._llm_call` et `refresh_breakers._llm_call`) : une seule ligne post-call `LLM [ticker] cascade → provider (model)` — ex: `LLM [SAN.PA] promo → hapuppy (gpt-5.5)`. `max_tokens` non loggué (et non envoyé à l'API pour `promo`)
 
-**Progress files** — `backend/scripts/batch_progress_{phase}_{region}[_{lang}].json`
-- Un fichier par combo phase+region+lang → pas de conflit si 2 process parallèles
-- `scrape` : pas de lang · `enrich`/`bubbles` : suffixe `_en` ou `_fr` · `translate-fr*` : pas de lang
+**Note lang** — `--lang en` peut tourner immédiatement. `--lang fr` requiert que `bw_fr`/`bm_fr`/`by_fr` soient remplis (via `batch_fill_db.py --phase translate-fr`).
 
-**Sync progress depuis Supabase** : `backend/scripts/sync_progress.py`
-```bash
-python scripts/sync_progress.py           # recrée tous les fichiers progress depuis la DB
-python scripts/sync_progress.py --dry-run
-```
-Threshold bubbles_done = 8 causes non-null.
 
-**Pool `bubbles_no_data`** : tickers avec 0 articles dans `articles` (détecté phase bubbles) → skipper dans les runs suivants, ne pas compter dans `bubbles_done`. Clé `bubbles_no_data` dans le progress file.
+**Fenêtre articles bubbles** : `bubble_service.py` T-6→T+6 fixe. S'applique batch + live (`/api/events`).
 
-**Fenêtre articles bubbles** : `bubble_service.py` cherche d'abord T-3→T+3. Si 0 articles → fallback T-6→T+6 (year_months supplémentaires seulement). S'applique batch + live (`/api/events`).
+**Prompt BUB** : tous les articles sans summary (headline seul, no limit) + tous les articles avec summary (no limit). W breaker hebdomadaire injecté si présent. Cascade `bub_prod` = Gemini → Hapuppy, `max_tokens=280`. Cascade `bub_batch` (batch local) = FreeTheAI → Gemini → raise, no `max_tokens`.
 
-**Re-process tickers skippés** : retirer le ticker de `bubbles_done` dans le progress file → sera re-traité au prochain run avec le fallback ±6j.
+**`get_or_gen_bub()` params** : `prefetched_cache` (dict row, skip SELECT individuel), `in_1w`/`in_1m`/`in_6m`/`in_1y` (bool, inclus dans l'upsert ; sur cache-hit, update uniquement si valeur différente), `force_regen` (bool, bypass cache → re-génère même si bub_en déjà présent).
 
-**Concurrence phase bubbles** : `ThreadPoolExecutor(BUBBLES_WORKERS=3)` — 3 tickers en parallèle. Semaphore Hapuppy (3) dans `llm_service.py` limite les appels HTTP concurrents. Progress mis à jour dans le thread principal via `as_completed` (thread-safe sans Lock). Ctrl+C propre : `os._exit(0)` après sauvegarde progress.
+**`bub_cache` colonnes fenêtres** : `in_1w`, `in_1m`, `in_6m`, `in_1y` (BOOLEAN) — indiquent dans quelle(s) fenêtre(s) display le dot est actuellement affiché. Alignées sur le frontend (4 périodes avec dots) :
+| yfinance period | interval | window | max_dots | col DB |
+|---|---|---|---|---|
+| `5d` | `1h` | 3 | 5 | `in_1w` |
+| `1mo` | `1d` | 2 | 8 | `in_1m` |
+| `6mo` | `1d` | 4 | 10 | `in_6m` |
+| `1y` | `1d` | 5 | 10 | `in_1y` |
+Pas de dots sur `1d` et `5y`. Un dot peut être dans plusieurs fenêtres simultanément.
 
-**Save throttle** : `save_progress()` n'écrit sur disque que tous les `BATCH_SAVE_EVERY=5` appels. `force=True` aux checkpoints TG → perte max 5 tickers en cas de crash.
+**Phase bubbles batch** : détection dots par fenêtre → `dot_windows: {date: {windows}}` → passe `in_1w`/`in_1m`/`in_6m`/`in_1y` à `get_or_gen_bub`. Logs : `TICKER — N dots · X/N cached`, puis par BUB : `✓ gemini [1m,6m]`. TG checkpoint : stats LLM + cache + `1w: X | 1m: Y | 6m: Z | 1y: W`. Flag `--cleanup` : supprime les rows `bub_cache` orphelines (date hors détection actuelle) après le run.
 
-**Notifs TG batch** : `parse_mode: HTML` (Markdown v1 causait des 400 sur les underscores/accents). Conversion `*bold*` → `<b>bold</b>` et `_italic_` → `<i>italic</i>` dans `_telegram()`.
+**LLM failures** : une failure upsert quand même la row avec `bub_en=NULL` + `articles` rempli. `--empty-only` au run suivant capte ces tickers et retente le LLM. Pas besoin de flag séparé `--failed-only`.
 
-**Checkpoint repair** — `backend/scripts/fix_checkpoint_from_db.py`
+**Couverture bub_en (juin 2026, batch initial)** :
+| Région | Rows | Avec bub_en | % |
+|---|---|---|---|
+| US | 2 485 | 2 223 | 89.5% |
+| EU | 1 426 | 1 158 | 81.2% |
+| ASIA | 3 853 | 1 744 | 45.3% (batch en cours) |
+NULL restants = LLM failures du jour, rattrapables via `--empty-only`. Pas de dates orphelines hors fenêtre.
 
-Analyse la DB et catégorise les tickers `done` selon ce qui manque. Adaptable par région et date.
+**Cleanup bub_cache** : peu fréquent (fenêtres longues = dots stables). Via `--cleanup` sur le batch uniquement, jamais automatique.
 
-```bash
-python scripts/fix_checkpoint_from_db.py --region US --lang en --dry-run
-python scripts/fix_checkpoint_from_db.py --region EU --lang en --dry-run
-python scripts/fix_checkpoint_from_db.py --region US --lang en --month 2026-06 --week-start 2026-06-09
-```
+**Re-process tickers skippés** : utiliser `--force --ticker TICKER` pour re-traiter un ticker spécifique, ou `--empty-only` pour attraper tous les tickers avec `bub_en NULL`.
 
-Catégories détectées et actions checkpoint :
-- **RESCRAP** : aucun article ce mois → retiré de `done` + `legacy` + `monthly_done`
-- **W MISS** : articles ok mais breaks_weekly manquants → retiré de `done`
-- **DUMB MISS** : articles ok, weeklies ok, dumb_en manquants cette semaine → ajouté à `legacy` (reste dans `done`)
-- **W MISS + DUMB** : les deux → retiré de `done` + ajouté à `legacy`
-- **MONTHLY MISS** : pas de row dans `breaks_monthly` pour le mois courant → retiré de `monthly_done`
+**Concurrence phase bubbles** : `ThreadPoolExecutor(BUBBLES_WORKERS=3)` — 3 tickers en parallèle. `BUBBLES_WORKERS=1` forcé par `zen_watcher.py` (ZenLLM fragile sous concurrence). Ctrl+C propre : `os._exit(0)`.
 
-**Fenêtres** :
-- Mois courant : `--month` (défaut : mois en cours)
-- Semaine DUMB : `--week-start` (défaut : lundi courant) — articles filtrés depuis ce lundi uniquement
-- Articles "faux ce mois" : filtrés par timestamp réel (`month_start <= datetime < month_end`), pas par `year_month` du row — évite les articles d'un batch débordant sur le mois stockés sous le mauvais `year_month`
+**Notifs TG batch** : `parse_mode: HTML` (Markdown v1 causait des 400 sur les underscores/accents). Conversion `*bold*` → `<b>bold</b>` et `_italic_` → `<i>italic</i>` dans `_telegram()`. Tout `<` ou `>` dans le texte doit être échappé `&lt;`/`&gt;` — sinon Telegram retourne 400 silencieusement (ex: `arts < 3` causait 400 sur les runs EU avec skipped > 0).
 
-**Script ciblé** — `backend/scripts/fix_missing.py`
-
-Exécute uniquement les étapes manquantes par catégorie, sans passer par le full Flow AB.
-
-```bash
-python scripts/fix_missing.py --region US --lang en --dry-run
-python scripts/fix_missing.py --region EU --lang en
-python scripts/fix_missing.py --region US --lang en --month 2026-06 --week-start 2026-06-09
-```
-
-Catégories et actions :
-- **RESCRAP** → retire de `done`, message : lancer `refresh_breakers.py` manuellement
-- **W MISS** → scrap + `gen_dumb(cutoff_days=35)` + `gen_weekly` (semaines manquantes seulement)
-- **DUMB MISS** → scrap + `gen_dumb(cutoff_days=35)` ; retire de `legacy` si succès
-- **W+DUMB** → scrap + `gen_dumb(cutoff_days=35)` + `gen_weekly`
-- **MONTHLY MISS** → `gen_monthly` (weeklies si ≥3, sinon raw) ; ajoute à `monthly_done` si succès
-
-**`gen_dumb(cutoff_days=35)`** : fenêtre élargie pour couvrir les articles du mois entier en affichage (35j = max display window). Par défaut `cutoff_days=7` — comportement inchangé pour tous les appelants prod/crons.
-
----
-
-**Script one-shot websites** : `backend/scripts/populate_websites.py`
-```bash
-python scripts/populate_websites.py            # tous les tickers en ow_cache
-python scripts/populate_websites.py --ticker AMZN
-```
 
 ---
 
@@ -781,11 +1012,11 @@ python scripts/populate_websites.py --ticker AMZN
 | Chart — vertical grid lines | ✅ | Tirets par période |
 | Lazy loading page stock | ✅ | Default 24H — articles 1M+ et causes events : on-demand |
 | Cascade LLM FreeTheAI→Groq | ✅ | gpt-4.1 → gpt-5.4-mini → Hapuppy gpt-4.1-mini → Groq |
-| Daily digest (1J) | ✅ | email 19h15 · lit `ai_summary_24h_en/fr` selon `user_preferences.lang` + articles 24h · `_ensure_fr_translations` amont |
-| Weekly digest (7J) | ✅ | email sam 7h · lit `ai_summary_en/fr` selon `user_preferences.lang` + 5 articles 7j · `_ensure_fr_translations` amont |
+| Daily digest (1J) | ✅ | email 19h15 · lit `ow1d_en/ow1d_fr` selon `user_preferences.lang` + articles 24h · `_ensure_fr_translations` amont |
+| Weekly digest (7J) | ✅ | email sam 7h · lit `ow7d_en/ow7d_fr` selon `user_preferences.lang` + 5 articles 7j · `_ensure_fr_translations` amont |
 | Digest — email | ✅ | Resend sandbox actif |
 | EOD digest — onglet "Mes news" | ✅ | **DigestCard** : cartes avec news = normal. Cartes sans news (`no_24h_news=True`) = border neon rotatif (conic-gradient counter-clockwise, 3s). **Header chips** (inline, poussés à droite) : `[N news]` muted · `[last news Xh ago]` bleu · `[↻ Xh]` freshness-coloré (vert <6h · ambre 6-24h · rouge >24h). Badge sentiment ou `[NO NEWS]` coloré selon ancienneté. Un seul texte (OW 7J si no-news, OW 24H sinon). **Dédup** au render (`.filter` par ticker) — protège contre React StrictMode double-invocation. **ArticleRow** : date relative — `<1h` = `Xm`, `<24h` = `Xh`, `≥24h` = `Xj`. **Loading** : progressive — cartes apparaissent au fil des fetches. |
-| Weekly router | ✅ | `/api/weekly/{ticker}` — `routers/digest.py` lit depuis **`ow_cache`** (`ai_summary_en` = même OW 7J que la page stock + `cached_at`). Plus d'`breaks_weekly`. Timestamps D et W cohérents (même `cached_at`). Badge `7J` au lieu de `S1·2026-06`. `_week_articles_from_archive` inclut `dumb_en`/`dumb_fr` + filtre `_is_ticker_related`. |
+| Weekly router | ✅ | `/api/weekly/{ticker}` — `routers/digest.py` lit depuis **`ow_cache`** (`ow7d_en` = même OW 7J que la page stock + `cached_at`). Plus d'`breaks_weekly`. Timestamps D et W cohérents (même `cached_at`). Badge `7J` au lieu de `S1·2026-06`. `_week_articles_from_archive` inclut `dumb_en`/`dumb_fr` + filtre `_is_ticker_related`. |
 | Préférences notif | ✅ | Toggle Daily (PREMIUM jaune) + Weekly (PREMIUM vert) + chips par ticker · `notify_weekly` en DB · toggle langue EN/FR (`user_preferences.lang`) |
 | Loading animation — DogLoader | ✅ | Sleeping dog SVG, 2 comètes sens inverse, rotation 3D lente |
 | DB articles — rotation & purge | ✅ | 5W max, monthly calendaire 1er du mois, yearly purge monthlies |
@@ -793,11 +1024,12 @@ python scripts/populate_websites.py --ticker AMZN
 | Articles 1M/6M/1Y/5Y — sections par période | ✅ | 1M=semaines W1-W4 · 6M/1Y=mois collapsés avec ExpandButton pill · 5Y=year dropdown (violet) + mois indentés. Pagination +10 par clic. Tous les articles retournés (pas de troncature backend). |
 | Articles multi-source | ✅ | Dedup par headline. Badges colorés + multi-CTA dans drawer |
 | LLM source tracking | ✅ | `llm_source` persisté dans ow_cache, summaries, bub_cache |
-| Re-enrich Groq→FreeTheAI | ✅ | Cron 22h30 — scan `llm_source='groq'` + `ai_summary_en IS NULL`. Si FreeTheAI down → pending, retry à partir de 2h toutes les 1h. |
+| Re-enrich Groq→FreeTheAI | ✅ | Cron 22h30 — scan `llm_source='groq'` + `ow7d_en IS NULL`. Si FreeTheAI down → pending, retry à partir de 2h toutes les 1h. |
 | Cold start ticker rare | ✅ | Scrape progressif background (1M→6M→1Y). `ColdStartBanner` poll 10s. |
 | 24h vide — fallback 0 token | ✅ | Pas d'appel LLM si 0 articles 24h. Badge `AUCUNE NEWS 24H` + note italique (le texte fallback moche n'est plus affiché). `no_24h_news` en DB. |
 | Architecture DB — refacto | ✅ | `ow_cache` zéro articles. DUMB dans `articles`. Migration one-shot : 4 148 `dumb_en` copiés. |
 | **Batch DB filler (717 tickers)** | 🔄 | Voir séquence ci-dessous |
+| Consolidation ticker→name | ✅ | `get_company_name` + `bulk_fetch_company_names` dans `yfinance_service.py` · `_KNOWN_NAMES` 28 tickers EU · `breakers_articles_service` redirige via alias · 7 fichiers mis à jour |
 | Reddit sentiment | ⬜ | À venir |
 | Refresh proactif OW (crons) | ✅ | Yahoo/Finnhub trigger `gen_ow_both(force_24h=True)` si nouveaux articles |
 | Stale-while-revalidate OW | ✅ | Cache retourné immédiatement + background `gen_ow_both(force_24h=True)` + badge `↻ mise à jour...` (vert + spin). Filet 6h : visite page trigger refresh si `cached_at > 6h` même sans nouveaux articles. |
@@ -811,11 +1043,11 @@ python scripts/populate_websites.py --ticker AMZN
 | 1 | Bubbles 6M+1Y | US | ✅ |
 | 2 | Bubbles 6M+1Y | EU | ✅ |
 | 3 | Bubbles 6M+1Y | ASIA | ✅ (208 tickers · 2136 bubbles · 2026-06-03) |
-| 4 | Breakers weekly+monthly EN | US | ✅ (2026-06-09) · checkpoint réparé 2026-06-11 (fix_checkpoint_from_db) |
-| 5 | Breakers weekly+monthly EN | EU | 🔄 en cours — checkpoint réparé 2026-06-11 · fix_missing à lancer |
+| 4 | Breakers weekly+monthly EN | US | 🔄 AB en cours (237/257 done) · M: 254/257 pour 2026-06 · mois anciens: 76→248/257 · --phase ab à relancer pour W2 2026-06 (243 tickers sans W2) |
+| 5 | Breakers weekly+monthly EN | EU | 🔄 en cours · M: 176/227 pour 2026-06 · 46 tickers sans W2 · --phase ab à relancer |
 | 6 | Breakers weekly+monthly EN | ASIA | ⏳ |
 | 7 | Breakers weekly+monthly FR | US+EU+ASIA | ⏳ après migration colonnes `_fr` |
-| — | OW enrich (ai_summary_en) | EU · ASIA | ⏭ skip — se remplit via cron 3h + reenrich 22h30 |
+| — | OW enrich (ow7d_en) | EU · ASIA | ⏭ skip — se remplit via cron 3h + reenrich 22h30 |
 
 **Conso réelle — nuit 29-30 mai 2026 (261 tickers US enrichis) :**
 | Provider | Modèle | Requests | Tokens input | Tokens output | Coût |
@@ -860,6 +1092,7 @@ python scripts/populate_websites.py --ticker AMZN
 | **Perf3** | **Loading progressif my-news** — `Promise.all` → fetch individuel + `setDigests/setWeeklies` incrémental. Spinner s'arrête dès la 1ère réponse reçue, cards suivantes apparaissent au fil de l'eau. | `my-news/page.tsx` |
 | **Data1** | **Hourly refresh fetch Yahoo avant lecture DB** — `run_hourly_news_refresh` appelle `_accumulate_yahoo` en début de boucle. Corrige le cas tickers < 3 pins (ex: 7203.T) dont la DB ne se mettait jamais à jour car `run_yahoo_accumulation` exige ≥ 3 users. | `services/overview_service.py` |
 | **Data2** | **`_is_ticker_related` — base ticker sans suffixe exchange** — ajoute `"7203"` (base de `"7203.T"`) aux keywords. Corrige le faux-négatif sur tous les tickers non-US dont les headlines utilisent le format `TSE:7203` / `KSC:005930`. Affecte JP, KR, HK, etc. | `services/breakers_articles_service.py` |
+| **Data4** | **Yahoo company name search (EU/ASIA)** — `_yahoo_scrap_accumulate` (cron prod) + `_fetch_yahoo_month` (batch) : pour les tickers avec `.` dans le symbole, fetch `yf.Search(company_name, news_count=30)` en plus de `get_news(100)`. Dedup par URL. Apporte +8 à +10 articles supplémentaires sur les tickers ASIA (ex: 2382.HK Sunny Optical : 1→9). US inchangé (pas de `.`). `name_search` param dans `_fetch_yahoo_month`/`_scrape_and_upsert`/`_process_ticker_ab` — propagé depuis `main()` : `name_search = args.region != "US"`. | `scripts/refresh_breakers.py`, `services/breakers_articles_service.py` |
 | **Data3** | **`_is_ticker_related` + company_name partout** — `_fetch_news` et `_week_articles_from_archive` appelaient le filtre sans `company_name` → articles liés à la société filtrés si le ticker ne figurait pas tel quel dans le texte. Fix : `_lookup_company_name(ticker, supa)` lookup depuis `pinned_stocks` dans `_fetch_news` ; idem dans `routers/digest.py` weekly endpoint. Couvre tous les appelants sans `company_name` explicite (OW, DUMB, my-news weekly). | `services/overview_service.py`, `routers/digest.py` |
 | **Breaks4** | **`refresh_breakers.py` — DUMB avant condensation** — `_process_ticker` appelle `gen_dumb(ticker, lang)` en step 1b (après scrape, avant weeklies). Sans ce step, tous les Breakers étaient générés depuis `summary→headline` fallback car `brutalise_new_articles` n'était jamais appelé pour les tickers batch (`min_users=3` dans les crons Yahoo/Finnhub excluait les ~700 tickers batch). US/EU/ASIA Breakers déjà générés = qualité dégradée. | `scripts/refresh_breakers.py` |
 | **UX10** | **DigestCard/WeeklyCard — chips header** — 3 chips inline dans la ligne ticker (poussés à droite via `flex: 1`) : count muted · `last news Xh ago` bleu · `↻ Xh` freshness-coloré (vert <6h · ambre 6-24h · rouge >24h). Supprime le footer meta-ligne. `CARD_STYLE` constant retiré. Dédup render (StrictMode). `_articles_from_archive` cap `[:15]` → `[:100]` pour corriger W < D articles count. | `my-news/page.tsx`, `routers/digest.py` |
@@ -873,6 +1106,100 @@ python scripts/populate_websites.py --ticker AMZN
 | **UX5** | **ExpandButton pill sections.** Remplace le chevron discret par une pill `N articles ›` (border accent, fond plein au hover). Sections collapsées par défaut, pagination +10 par clic, bouton `↓ N de plus`. 5Y : year dropdown avec `expandedYears` state, année la plus récente ouverte par défaut, mois indentés avec bordure violette. `top_articles` non tronqué côté backend. | `page.tsx`, `breakers_articles_service.py` |
 | **UX6** | **`_is_ticker_related` appliqué dans `overview_service.py`** — articles `articles` filtrés avant envoi au frontend (daily news) → articles hors-sujet exclus. Même filtre dans `digest.py` pour le weekly. `dumb_en`/`dumb_fr` passés dans `_articles_from_archive` → bouton dumb visible dans `ArticleRow` weekly. | `overview_service.py`, `routers/digest.py` |
 | **UX7** | **`ArticleRow` my-news — compact + dumb expand.** Layout : titre + source badge + heure sur une seule ligne (source à droite). Bouton circle 22×22px vert, fond pâle → plein au hover, `›` tourne 90° au clic → dumb inline fond vert léger. Visible uniquement si `dumb_en \|\| dumb_fr`. `WeeklyCard` redesigné pour matcher `DigestCard` : même padding/typo, count `X articles 7j`, freshness dot. | `my-news/page.tsx` |
+
+---
+
+---
+
+### Dette technique — Backend & UX
+
+| # | Scope | Statut | Action réalisée |
+|---|---|---|---|
+| **BUX1** | `digest.py` · my-news 1W + 1D | DONE | Filtre `dumb_en != "SKIP"` ajouté dans `_articles_from_archive` — couvre 1D et 1W via héritage |
+| **BUX2** | my-news frontend | DONE | `.filter(w => top_articles.length > 0)` ajouté avant le render des `WeeklyCard` |
+| **BUX3** | `stock/[ticker]/page.tsx` | DONE | `StockData` → `TickerInfosYfinance` |
+| **BUX4** | `stock/[ticker]/page.tsx` | DONE | `NewsData` → `TickerFrontWrapper` |
+| **BUX5** | `my-news/page.tsx` | DONE | `DigestArticle` → `MyNews1DArticle` · `Digest` → `MyNews1DTicker` · `WeeklyArticle` → `MyNews1WArticle` · `Weekly` → `MyNews1WTicker` |
+| **BUX6** | `my-news/page.tsx` | DONE | `digests` → `myNews1DTickers` · `weeklies` → `myNews1WTickers` · setters idem |
+| **BUX7** | `EventDrawer.tsx` | DONE | `EventArticle` → `BubArticle` · `EventData` → `BubData` |
+| **BUX8** | `ow_cache` | DONE | `generated_by_en` → `llm_source_en` · `generated_by_fr` → `llm_source_fr` · convention unifiée avec breaks + bub_cache |
+
+---
+
+### Dette technique DB — à traiter progressivement
+
+| # | Table | Problème | Action |
+|---|---|---|---|
+| **DT1** | `breaks_weekly`, `breaks_monthly`, `breaks_yearly`, `bub_cache` | DONE | `llm_source` → `llm_source_en` + `llm_source_fr` · helper `_llm_source_col()` ajouté dans `breakers_articles_service.py` |
+| **DT2** | `breaks_weekly`, `breaks_monthly`, `breaks_yearly` | SKIP | `ai_summary` legacy — DROP quand couverture `bw_en` 100% (dépend DT11) |
+| **DT3** | `ow_cache` | DONE | DROP `llm_source` DB + retiré de `_build_response` |
+| **DT4** | `ow_cache` | DONE | DROP `ai_sentiment_reason` DB + retiré upserts FR + `_build_response` + type TS |
+| **DT5** | `ow_cache` | DONE | DROP `ai_sentiment_reason_24h` idem |
+| **DT6** | `ow_cache` | DONE | `cached_at` → `ow1d_cached_at_en` · `ow7d_cached_at` → `ow7d_cached_at_en` · `_fr` ajoutés · MAJ `_is_stale_6h`, upserts, `_build_response`, cron |
+| **DT7** | `ow_cache` | DONE | DROP `latest_news_id` DB |
+| **DT8** | `bub_cache` | DONE | `cached_at` → `bub_cached_at_en` + `bub_cached_at_fr` ajouté |
+| **DT9** | `bub_cache` | DONE | DROP `articles` jsonb + VACUUM FULL · 115 MB → 12 MB · 103 MB libérés |
+| **DT10** | `articles` | TODO | `source` + `p2_sources` → `sources[]` · backfill + DROP `source` · MAJ code · non urgent |
+| **DT11** | `breaks_weekly` (1041 rows) | SKIP | Rows legacy `bw_en IS NULL` — regen via `refresh_breakers.py --force` (cascade existante) quand opportun |
+
+### Storage DB — état au 2026-06-19
+
+| Table | Avant | Après | Gain |
+|---|---|---|---|
+| `bub_cache` | 115 MB | 12 MB | -103 MB |
+| `articles` | 292 MB | 292 MB | 289 MB de TOAST (vraie donnée JSONB, pas du bloat) |
+| Total DB | ~499 MB | ~396 MB | -103 MB |
+
+**Prochaine optimisation : purger `articles` > 12 mois**
+- `bub_cache` est purgé > 1 an → articles > 12 mois ne sont plus utilisés pour les BUBs
+- BUBs : 12 131 total, 8 598 avec `bub_en` (71%) — couverture à compléter avant purge
+- Cutoff recommandé : **12 mois** (pas 18 — trop conservateur)
+
+**Contraintes bloquantes avant toute purge `articles` :**
+1. **BUBs** : s'assurer que tous les dots actifs ont un `bub_en` — sinon perte de source. Compléter la génération BUB (3 533 manquants) avant de purger.
+2. **W avant digest** : weekly digest (sam 7h) lit `ow_cache.ow7d_en/fr`, pas `breaks_weekly` — pas de conflit. Safe.
+3. **Cutoff articles** : **13 mois** (pas 12) — BUBs actifs jusqu'à 12 mois ont besoin d'articles T±6j comme source, buffer 1 mois nécessaire.
+4. **Fenêtres display** : 1D = 26h (pas 24h) pour absorber les décalages horaires. 6M/1Y = `directLink=true` (titre + lien direct, pas de drawer, pas de summary). 5Y = zéro article brut.
+
+**Fixes purge W→M et M→Y — logique décidée (à coder) :**
+
+`run_monthly_calendaire` — 2 guards avant `_purge_weeklies_for_month` :
+- **Guard 1 — contenu M non-null** : vérifier que `bm_en` (ou `bm_fr`) est non-null en DB avant de purger. Couvre le cas upsert silencieux avec contenu vide.
+- **Guard 2 — W4 mois courant existe** : helper `_current_month_has_w4(ticker, supa)` — vérifie qu'un W4 avec `status IS NULL` existe pour le mois courant. Garantit que la vue 1M affiche 4 semaines complètes avant de supprimer le mois passé. Naturellement satisfait début du mois suivant (W4 condensé le lundi après le 22).
+- S'applique aux 2 cas : monthly déjà en DB (re-run) ET génération fraîche.
+
+`gen_breaks_yearly` — 1 guard avant `DELETE breaks_monthly` :
+- **Guard — contenu Y non-null** : vérifier que `by_en` (ou `by_fr`) est non-null en DB après l'upsert. Si vide : log warning, monthlies conservés.
+
+**Display par période (référence pour les purges) :**
+| Vue | Composant articles | Drawer ? | Summary nécessaire |
+|---|---|---|---|
+| 1D / 1W | `NewsCard` | ArticleDrawer | oui — `dumb_en/fr` |
+| 1M | `CompactArticleRow` | ArticleDrawer au clic | oui — summary + dumb |
+| 6M / 1Y | `CompactArticleRow` `directLink=true` | non — lien direct URL | non |
+| 5Y | aucun article brut | — | — |
+
+---
+
+### À revoir — flows en attente
+
+| Service | Statut | Notes |
+|---|---|---|
+| `cold_start_service.py` + `routers/cold_start.py` | A revoir | Flow cold start tickers rares (hors top 250) via Finnhub — scrape progressif 1m→6m→1y + condensation Breaks. Route GET/POST `/ticker/{ticker}/init-status` + `/initialize`. A revoir : pertinence Finnhub comme source cold start vs nouveaux scrapers (Google RSS, Marketaux...) |
+
+---
+
+### Refacto 2026-06 — BUBs + batch_fill_db stateless ✅
+
+**Terminé :** `regen_bubs.py` mergé dans `batch_fill_db.py --phase bubbles --force`. Tous les progress JSON locaux supprimés. `bubble_service.py` enrichi (weekly_breaker injecté + `force_regen` param).
+
+**Scripts supprimés :** `regen_bubs.py` · `sync_progress.py` · `fix_checkpoint_from_db.py` · `fix_missing.py` · `break_view_resume.py` · `refetch_finnhub.py` · `test_google_rss.py` · `enrich_tonight.py` · `reprocess_groq_tickers.py` · `retro_fill_bub_windows.py` · `migrate_dumb_to_archive.py` · `populate_websites.py` · `populate_exchange.py`
+
+**Commandes BUBs désormais :**
+```bash
+python scripts/batch_fill_db.py --phase bubbles --region all --lang en --empty-only  # dots vides
+python scripts/batch_fill_db.py --phase bubbles --region all --lang en --force       # regen tous (remplace regen_bubs)
+```
 
 ---
 

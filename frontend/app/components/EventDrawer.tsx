@@ -4,7 +4,7 @@ import { useState, useEffect } from "react";
 import { createClient } from "../lib/supabase";
 import DogLoader from "./DogLoader";
 
-interface EventArticle {
+interface BubArticle {
   headline: string;
   source: string;
   url: string;
@@ -12,9 +12,9 @@ interface EventArticle {
   summary: string;
 }
 
-interface EventData {
+interface BubData {
   date: string;
-  articles: EventArticle[];
+  articles: BubArticle[];
   cause: string | null;
 }
 
@@ -27,7 +27,7 @@ interface Props {
 }
 
 export default function EventDrawer({ ticker, date, changePct, onClose, apiUrl }: Props) {
-  const [data, setData] = useState<EventData | null>(null);
+  const [data, setData] = useState<BubData | null>(null);
   const [loading, setLoading] = useState(true);
   const [isPinned, setIsPinned] = useState(false);
   const [pinLoading, setPinLoading] = useState(false);

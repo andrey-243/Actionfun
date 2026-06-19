@@ -13,7 +13,7 @@ import httpx
 import services.llm_service as _lsvc
 from services.llm_service import (
     _log_usage,
-    HAPUPPY_URL, HAPUPPY_MODEL, HAPUPPY_QUOTA_FREEZE_SECONDS,
+    HAPUPPY_URL, HAPUPPY_MODELS, HAPUPPY_QUOTA_FREEZE_SECONDS,
     GROQ_URL,
     _notif_sent_at, NOTIF_THROTTLE,
 )
@@ -43,7 +43,7 @@ def _send_translate_notif(reason: str, trail: list[str]) -> None:
     headers = {
         "azure_down":   "🟠 *Azure Translator — down*",
         "groq_down":    "🟠 *Groq `llama-3.1-8b-instant` — down (traduction)*",
-        "hapuppy_down": f"🟠 *Hapuppy `{HAPUPPY_MODEL}` — down (traduction)*",
+        "hapuppy_down": f"🟠 *Hapuppy `{HAPUPPY_MODELS[0]}` — down (traduction)*",
         "all_down":     "🔴 *Traduction — tous les providers en échec*\nEN conservé en DB, retry au prochain batch.",
     }
     header = headers.get(reason, f"🟠 *Traduction — {reason}*")
@@ -106,7 +106,7 @@ def translate_to_fr(text: str) -> str:
         now_mono = time.monotonic()
         if _lsvc._hapuppy_quota_skip_until is not None:
             if now_mono < _lsvc._hapuppy_quota_skip_until:
-                trail.append(f"Hapuppy `{HAPUPPY_MODEL}` : ⏭ frozen (quota épuisé)")
+                trail.append(f"Hapuppy `{HAPUPPY_MODELS[0]}` : ⏭ frozen (quota épuisé)")
                 hapuppy_key = ""
             else:
                 _lsvc._hapuppy_quota_skip_until = None
@@ -117,31 +117,31 @@ def translate_to_fr(text: str) -> str:
                 HAPUPPY_URL,
                 headers={"Authorization": f"Bearer {hapuppy_key}", "Content-Type": "application/json"},
                 json={
-                    "model": HAPUPPY_MODEL,
+                    "model": HAPUPPY_MODELS[0],
                     "messages": [{"role": "user", "content": TRANSLATE_PROMPT.format(text=text)}],
                     "max_tokens": 1000,
                     "temperature": 0.1,
                 },
-                timeout=30,
+                timeout=120,
             )
             if r.status_code == 200:
                 content = r.json()["choices"][0]["message"]["content"].strip()
                 if content:
                     u = r.json().get("usage", {})
-                    _log_usage(HAPUPPY_MODEL, u.get("prompt_tokens", 0), u.get("completion_tokens", 0))
+                    _log_usage(HAPUPPY_MODELS[0], u.get("prompt_tokens", 0), u.get("completion_tokens", 0))
                     return content
             elif r.status_code == 429:
                 _lsvc._hapuppy_quota_skip_until = time.monotonic() + HAPUPPY_QUOTA_FREEZE_SECONDS
-                trail.append(f"Hapuppy `{HAPUPPY_MODEL}` : ✗ 429 quota épuisé")
+                trail.append(f"Hapuppy `{HAPUPPY_MODELS[0]}` : ✗ 429 quota épuisé")
                 _send_translate_notif("hapuppy_down", trail)
             else:
-                trail.append(f"Hapuppy `{HAPUPPY_MODEL}` : ✗ {r.status_code}")
+                trail.append(f"Hapuppy `{HAPUPPY_MODELS[0]}` : ✗ {r.status_code}")
                 _send_translate_notif("hapuppy_down", trail)
         except Exception as e:
-            trail.append(f"Hapuppy `{HAPUPPY_MODEL}` : ✗ {e}")
+            trail.append(f"Hapuppy `{HAPUPPY_MODELS[0]}` : ✗ {e}")
             _send_translate_notif("hapuppy_down", trail)
     else:
-        trail.append(f"Hapuppy `{HAPUPPY_MODEL}` : ⏭ skipped (clé manquante)")
+        trail.append(f"Hapuppy `{HAPUPPY_MODELS[0]}` : ⏭ skipped (clé manquante)")
 
     _send_translate_notif("all_down", trail)
     raise RuntimeError("Translation failed — tous les providers sont down\n" + "\n".join(trail))

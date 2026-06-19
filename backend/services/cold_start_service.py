@@ -252,8 +252,8 @@ def _condense(ticker: str, phase: str):
             by_week[wnum].append(a)
 
         for wnum, week_articles in by_week.items():
-            exists = supa.table("breaks_weekly").select("week_num").eq("ticker", ticker).eq("year_month", ym).eq("week_num", wnum).maybe_single().execute()
-            if exists and exists.data:
+            exists = supa.table("breaks_weekly").select("week_num, status").eq("ticker", ticker).eq("year_month", ym).eq("week_num", wnum).maybe_single().execute()
+            if exists and exists.data and exists.data.get("status") is None:
                 continue
             articles_text = "\n".join(f"- {a['headline']}" for a in week_articles[:30])
             label = _week_label(ym, wnum)
@@ -262,34 +262,43 @@ def _condense(ticker: str, phase: str):
                 top_articles = sorted(week_articles, key=lambda a: len(a.get("summary", "")), reverse=True)[:10]
                 supa.table("breaks_weekly").upsert({
                     "ticker": ticker, "year_month": ym, "week_num": wnum,
-                    "ai_summary": summary, "ai_summary_en": summary,
+                    "ai_summary": summary, "bw_en": summary,
                     "top_articles": top_articles, "article_count": len(week_articles),
                     "condensed_at": datetime.now(timezone.utc).isoformat(),
                 }).execute()
             except Exception as e:
                 logger.warning(f"[cold_start] weekly {ticker} {ym} W{wnum}: {e}")
+                supa.table("breaks_weekly").upsert({
+                    "ticker": ticker, "year_month": ym, "week_num": wnum,
+                    "status": "error", "article_count": len(week_articles),
+                }).execute()
 
     # Monthlies à partir de 6M
     if phase in ("6m", "1y"):
         for ym in months_to_condense:
-            exists = supa.table("breaks_monthly").select("year_month").eq("ticker", ticker).eq("year_month", ym).maybe_single().execute()
-            if exists and exists.data:
+            exists = supa.table("breaks_monthly").select("year_month, status").eq("ticker", ticker).eq("year_month", ym).maybe_single().execute()
+            if exists and exists.data and exists.data.get("status") is None:
                 continue
-            week_rows = supa.table("breaks_weekly").select("week_num, ai_summary_en, article_count").eq("ticker", ticker).eq("year_month", ym).order("week_num").execute()
-            if not week_rows.data or len(week_rows.data) < 2:
+            week_rows = supa.table("breaks_weekly").select("week_num, bw_en, ai_summary, article_count, status").eq("ticker", ticker).eq("year_month", ym).order("week_num").execute()
+            ok_weeks = [r for r in (week_rows.data or []) if r.get("status") is None]
+            if len(ok_weeks) < 2:
                 continue
-            weeks_text = "\n".join(f"W{r['week_num']}: {r.get('ai_summary_en') or r.get('ai_summary', '')}" for r in week_rows.data)
-            article_count = sum(r.get("article_count", 0) for r in week_rows.data)
+            weeks_text = "\n".join(f"W{r['week_num']}: {r.get('bw_en') or r.get('ai_summary', '')}" for r in ok_weeks)
+            article_count = sum(r.get("article_count", 0) for r in ok_weeks)
             try:
                 summary = _llm_call(MONTH_CONDENSE_PROMPT_EN.format(ticker=ticker, label=_month_label(ym), weeks_text=weeks_text), max_tokens=500, cascade="monthly_prod")
                 supa.table("breaks_monthly").upsert({
                     "ticker": ticker, "year_month": ym,
-                    "ai_summary": summary, "ai_summary_en": summary,
+                    "ai_summary": summary, "bm_en": summary,
                     "article_count": article_count,
                     "condensed_at": datetime.now(timezone.utc).isoformat(),
                 }).execute()
             except Exception as e:
                 logger.warning(f"[cold_start] monthly {ticker} {ym}: {e}")
+                supa.table("breaks_monthly").upsert({
+                    "ticker": ticker, "year_month": ym,
+                    "status": "error", "article_count": article_count,
+                }).execute()
 
     # Purge après W→M (garder 5 semaines récentes pour la vue 1M)
     _purge_excess_weeklies(ticker, supa, max_weeks=5)
@@ -330,19 +339,19 @@ def translate_pending_fr():
 def _translate_ticker_fr(ticker: str, supa, translate_fn):
     """Traduit *_en → *_fr dans ow_cache et article summaries."""
     # ow_cache
-    row = supa.table("ow_cache").select("ai_summary_en, ai_summary_24h_en, ai_summary_fr, ai_summary_24h_fr").eq("ticker", ticker).maybe_single().execute()
+    row = supa.table("ow_cache").select("ow7d_en, ow1d_en, ow7d_fr, ow1d_fr").eq("ticker", ticker).maybe_single().execute()
     if row and row.data:
         updates = {}
-        if row.data.get("ai_summary_en") and not row.data.get("ai_summary_fr"):
-            updates["ai_summary_fr"] = translate_fn(row.data["ai_summary_en"])
-        if row.data.get("ai_summary_24h_en") and not row.data.get("ai_summary_24h_fr"):
-            updates["ai_summary_24h_fr"] = translate_fn(row.data["ai_summary_24h_en"])
+        if row.data.get("ow7d_en") and not row.data.get("ow7d_fr"):
+            updates["ow7d_fr"] = translate_fn(row.data["ow7d_en"])
+        if row.data.get("ow1d_en") and not row.data.get("ow1d_fr"):
+            updates["ow1d_fr"] = translate_fn(row.data["ow1d_en"])
         if updates:
             supa.table("ow_cache").update(updates).eq("ticker", ticker).execute()
 
-    # breaks_weekly — traduire ai_summary_en → ai_summary_fr
-    weeks = supa.table("breaks_weekly").select("year_month, week_num, ai_summary_en, ai_summary_fr").eq("ticker", ticker).execute()
+    # breaks_weekly — traduire bw_en → bw_fr
+    weeks = supa.table("breaks_weekly").select("year_month, week_num, bw_en, bw_fr").eq("ticker", ticker).execute()
     for w in (weeks.data or []):
-        if w.get("ai_summary_en") and not w.get("ai_summary_fr"):
-            fr = translate_fn(w["ai_summary_en"])
-            supa.table("breaks_weekly").update({"ai_summary_fr": fr}).eq("ticker", ticker).eq("year_month", w["year_month"]).eq("week_num", w["week_num"]).execute()
+        if w.get("bw_en") and not w.get("bw_fr"):
+            fr = translate_fn(w["bw_en"])
+            supa.table("breaks_weekly").update({"bw_fr": fr}).eq("ticker", ticker).eq("year_month", w["year_month"]).eq("week_num", w["week_num"]).execute()

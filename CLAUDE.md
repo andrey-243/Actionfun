@@ -2,13 +2,35 @@
 
 ## Carte des MDs — où lire, où écrire
 
-| Fichier | Lire quand... | Écrire quand... |
-|---|---|---|
-| `RECAP.md ## Architecture` | stack, DB schema, LLM cascade, articles flow, chart config, conventions nommage | décision architecturale prise (nouvelle table, nouveau service, changement de flow) |
-| `RECAP.md ## État courant` | statut features, séquence batch en cours, roadmap | feature change de statut · batch avance · roadmap mise à jour |
-| `ERRORS.md` | bug similaire à ce qu'on a déjà rencontré | approche nécessite > 2 tentatives |
 **Règle** : ne jamais écrire dans un autre `.md` que `RECAP.md` et `ERRORS.md`.
 Ne jamais créer ni écrire dans `~/.claude/projects/` — sans exception. Toute information persistante va uniquement dans `RECAP.md` ou `ERRORS.md`.
+
+### RECAP.md — pointeurs par thème
+
+| Thème | Section à lire | Écrire quand... |
+|---|---|---|
+| Termes produit (OW/DUMB/BUB/Breaks) | `## Architecture > Règles & nommage` | nouveau terme produit |
+| Stack, ports, libs | `## Architecture > Stack` | nouvelle dépendance majeure |
+| Schéma DB, tables, colonnes | `## Architecture > Supabase — Tables actives` | nouvelle table ou colonne |
+| LLM cascade, quotas, fallbacks, prompts | `## Architecture > LLM — Cascade & modèles` | changement cascade ou nouveau modèle |
+| Flow articles, scraping, merge sources | `## Architecture > Articles — Architecture par période` | nouveau source ou changement de flow |
+| Dédup, conflits multi-source | `## Architecture > Articles — Doublons & Multi-source` | nouvelle règle de dédup |
+| Digest (daily/weekly), my-news | `## Architecture > News — Architecture` | changement de logique digest |
+| Events / dots chart, BUB | `## Architecture > Events (dots chart)` | nouveau type d'event |
+| Chart périodes, intervalles yfinance | `## Architecture > Chart — Périodes & intervalles yfinance` | nouvelle période ou intervalle |
+| Emails Resend | `## Architecture > Resend — Email` | changement template ou config |
+| Tickers couverts, marchés | `## Architecture > Tickers — Coverage` | nouveau marché ou ticker list |
+| Batch fill DB | `## Architecture > Batch scraper` | changement logique batch |
+| Batch breakers | `## Architecture > Batch breakers` | changement logique breakers |
+| Statut features, roadmap | `## État courant > Features` | feature change de statut |
+| Séquence batch en cours | `## État courant > Séquence batch` | batch avance ou bloqué |
+| Optimisations passées | `## État courant > Optimisations réalisées` | nouvelle optim réalisée |
+
+### ERRORS.md
+
+| Lire quand... | Écrire quand... |
+|---|---|
+| bug similaire à ce qu'on a déjà rencontré | approche nécessite > 2 tentatives |
 
 ---
 
