@@ -139,9 +139,10 @@ stock_app/
 │   │   ├── cold_start_service.py
 │   │   └── articles_store.py           ← Turso HTTP API (write/fetch/delete/merge heavy fields) · inactif sans TURSO_URL
 │   ├── scripts/
-│   │   ├── batch_fill_db.py            ← stateless (DB source of truth) · phases: scrape/enrich/bubbles/translate-fr/translate-fr-dumb
+│   │   ├── batch_fill_db.py            ← stateless (DB source of truth) · phases: scrape/enrich/bubbles/translate-fr/translate-fr-dumb · génère article.id à la création
 │   │   ├── refresh_breakers.py         ← scrape P1+P2 + DUMB + W + M breakers
-│   │   ├── migrate_articles_cold.py    ← migration one-shot Supabase→Turso (champs lourds >6M) · --init-db --dry-run --ticker --months
+│   │   ├── backfill_article_ids.py     ← one-shot backfill id=sha1(url)[:16] sur tous les articles Supabase existants
+│   │   ├── migrate_articles_cold.py    ← migration Supabase→Turso 3 phases · --phase 1/2/3 · --init-db · --dry-run · --ticker
 │   │   ├── zen_watcher.py              ← probe ZenLLM 5 min → batch bubbles UP · kill si 3 échecs consécutifs · reprobe · --cascade (défaut: zen)
 │   │   ├── translate_bulk.py           ← bulk EN→FR : BUB → Y → M → W · cascade promo (Gemini)
 │   │   ├── populate_logos.py
@@ -650,29 +651,43 @@ articles (raw bodies)
   → PK = (ticker, year_month) — une seule source par cellule, pas de doublon cross-source possible
   → quasi zéro doublons URL intra-array (1 pair / 50k articles échantillonnés)
 
-  **Lifecycle articles — architecture décidée :**
+  **Lifecycle articles — migration progressive Supabase → Turso :**
 
-  0 → 6 mois (Supabase, full content) :
-    → champs complets : headline · url · source · datetime · extra_sources · summary · dumb_en · dumb_fr
-    → display 1D/1W/1M/6M avec drawer · BUB gen · Breaks gen : tout disponible
+  Clé de join : `id = sha1(url)[:16]` — stocké dans le JSONB Supabase ET dans Turso.
+  Turso schema : `article_content(id PK, ticker, year_month, url, summary, dumb_en, dumb_fr, headline, source, is_related)`
+  Index Turso : `idx_art_ym ON (ticker, year_month)`
 
-  6 → 13 mois (Supabase lightweight + externe Turso) :
-    → Supabase garde : headline · url · source · datetime · extra_sources
-    → Turso `article_content(ticker, year_month, url, summary, dumb_en, dumb_fr)` : summary · dumb_en · dumb_fr
-    → display 6M/1Y directLink=true : lightweight Supabase suffit, externe jamais touché
-    → BUB sur dot déjà cached (bub_en non-null) : externe jamais touché
-    → BUB sur nouveau dot jamais cliqué : fetch externe → LLM avec contenu complet
-    → Breaks : déjà générés pour ces mois, externe jamais touché
-    → Gain estimé : 150-200 MB libérés sur Supabase
-    → Code sur branche `feat/r2-articles-migration` · inactif jusqu'à `TURSO_URL` dans `.env` prod
-    → Migration : `python scripts/migrate_articles_cold.py --init-db --dry-run` puis sans `--dry-run`
-    → Lire/écrire Turso : `services/articles_store.py` (write_heavy · fetch_heavy · delete_heavy · merge_heavy_into_articles)
-    → bubble_service gater sur `os.environ.get("TURSO_URL")` avant d'appeler fetch_heavy
+  0 → 1 mois (Supabase full) :
+    → champs complets : id · headline · url · source · datetime · summary · dumb_en · dumb_fr · is_related
+    → display 1D/1W/1M avec drawer · BUB gen · Breaks gen : tout disponible
 
-  > 13 mois : purge total
-    → DELETE row Supabase + DELETE Turso (`delete_heavy(ticker, ym)`)
+  Phase 1 (>1M) : strip summary + dumb_en + dumb_fr de Supabase → Turso
+    → Supabase garde : id · headline · url · source · datetime · is_related
+    → BUB sur dot ancien : gate Turso déclenché si summary absent → fetch_heavy → merge sur id
+    → Gain estimé : ~15 MB / 6 mois
+
+  Phase 2 (>7M) : strip url de Supabase → Turso
+    → Supabase garde : id · headline · source · datetime · is_related
+    → BUB : gate déclenché si url absent → fetch Turso complet (url + summary)
+    → Gain estimé : ~30 MB supplémentaires
+
+  Phase 3 (>13M) : strip headline + source de Supabase → Turso
+    → Supabase garde uniquement : id · datetime · is_related (~27 chars/article)
+    → Aucune vue n'affiche des articles > 12 mois → Turso consulté uniquement si regen forcée
+    → Gain total cumulé : ~65 MB
+
+  > 13 mois (futur) : purge Turso optionnelle
+    → `delete_heavy(ticker, ym)` — à décider selon capacité Turso
     → bub_cache a déjà purgé les dots > 1 an → aucun BUB possible
-    → aucune vue n'affiche des articles > 12 mois
+
+  Scripts :
+    → `python scripts/backfill_article_ids.py` : one-shot, ajoute id à tous les articles existants
+    → `python scripts/migrate_articles_cold.py --phase 1 [--init-db] [--dry-run]`
+    → `python scripts/migrate_articles_cold.py --phase 2`
+    → `python scripts/migrate_articles_cold.py --phase 3`
+    → Lire/écrire Turso : `services/articles_store.py` (write_heavy · fetch_heavy · merge_heavy_into_articles · delete_heavy)
+    → bubble_service : gate `os.environ.get("TURSO_URL")` + déclenchement si summary OU url absent
+    → Inactif jusqu'à `TURSO_URL` dans `.env` prod
 
 bub_cache
   → 9 574 rows · 12 MB (après DROP articles + VACUUM FULL, -103 MB libérés le 2026-06-19)
