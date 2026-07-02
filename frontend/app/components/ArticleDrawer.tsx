@@ -32,15 +32,15 @@ const SOURCE_COLORS: Record<string, { bg: string; text: string }> = {
   "ft":           { bg: "#FCD0B1", text: "#000" },
 };
 
-const PALETTE = ["#5B4FCF","#2E7D8C","#8C5B2E","#4A7C3F","#7C3F6A","#3F5E7C"];
-
 export function sourceStyle(name: string): { bg: string; text: string } {
   const key = name.toLowerCase().replace(/\s+/g, "");
   for (const [k, v] of Object.entries(SOURCE_COLORS)) {
     if (key.includes(k.replace(/\s+/g, "").replace(/[./]/g, ""))) return v;
   }
-  const idx = name.split("").reduce((acc, c) => acc + c.charCodeAt(0), 0) % PALETTE.length;
-  return { bg: PALETTE[idx], text: "#fff" };
+  // Deterministic HSL hash — 360 hues, no collisions in practice
+  const hash = name.split("").reduce((acc, c) => (acc * 31 + c.charCodeAt(0)) & 0xffffffff, 0);
+  const hue = Math.abs(hash) % 360;
+  return { bg: `hsl(${hue}, 55%, 38%)`, text: "#fff" };
 }
 
 function SourceBadge({ name }: { name: string }) {
@@ -148,7 +148,7 @@ export default function ArticleDrawer({ article, onClose }: Props) {
             >
               <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
                 <SourceBadge name={article.source} />
-                {(article.extra_sources || []).map((s, i) => (
+                {(article.extra_sources || []).filter(s => s.name !== article.source).map((s, i) => (
                   <SourceBadge key={i} name={s.name} />
                 ))}
               </div>
@@ -235,7 +235,7 @@ export default function ArticleDrawer({ article, onClose }: Props) {
               {article.url && (
                 <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
                   <ReadLink url={article.url} source={article.source} primary />
-                  {(article.extra_sources || []).map((s, i) => (
+                  {(article.extra_sources || []).filter(s => s.name !== article.source).map((s, i) => (
                     <ReadLink key={i} url={s.url} source={s.name} />
                   ))}
                 </div>

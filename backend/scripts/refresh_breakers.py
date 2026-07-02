@@ -116,6 +116,17 @@ def _supa():
     return _thread_local.client
 
 
+def _in_ticker_chunks(supa, table: str, select: str, tickers: list[str], filter_fn, chunk_size: int = 100) -> list[dict]:
+    """Query chunked by ticker to avoid PostgREST URL limit (>2000 chars with 250 tickers)."""
+    result: list[dict] = []
+    for i in range(0, len(tickers), chunk_size):
+        chunk = tickers[i:i + chunk_size]
+        q = supa.table(table).select(select).in_("ticker", chunk)
+        r = _exec(filter_fn(q))
+        result.extend(r.data or [])
+    return result
+
+
 def _exec(query, retries: int = 5):
     """Retry Supabase .execute() sur transient disconnects — backoff 3s × 3^attempt."""
     delay = 3.0
@@ -334,6 +345,10 @@ def _summary_col(table: str = "breaks_weekly") -> str:
     return en_col if lang == "en" else fr_col
 
 
+def _llm_source_col() -> str:
+    return "llm_source_en" if os.environ.get("LLM_LANG", "en") == "en" else "llm_source_fr"
+
+
 def _week_prompt(ticker: str, label: str, articles_text: str) -> str:
     if os.environ.get("LLM_LANG") == "en":
         return (
@@ -367,12 +382,12 @@ def _month_prompt(ticker: str, label: str, content: str) -> str:
 
 
 def _gen_weekly(ticker: str, year_month: str, week_num: int,
-                articles: list[dict], supa) -> str | bool:
+                articles: list[dict], supa, done_status: str = "done_more_10") -> str | bool:
     """str=source LLM si succès · False=échec."""
     label = _week_label(year_month, week_num)
     articles_text = "\n".join(_article_text(a) for a in articles)
     try:
-        summary, src = _llm_call(_week_prompt(ticker, label, articles_text), cascade="zen", item_id=ticker)
+        summary, src = _llm_call(_week_prompt(ticker, label, articles_text), cascade="promo", item_id=ticker)
         sc = _summary_col()
         top = sorted(articles, key=lambda x: x.get("datetime", 0), reverse=True)[:10]
         _exec(supa.table("breaks_weekly").upsert({
@@ -382,9 +397,9 @@ def _gen_weekly(ticker: str, year_month: str, week_num: int,
             sc:              summary,
             "top_articles":  top,
             "article_count": len(articles),
-            "llm_source":    src,
+            _llm_source_col(): src,
             "condensed_at":  datetime.now(timezone.utc).isoformat(),
-            "status":        None,
+            "status":        done_status,
         }))
         logger.info(f"  ✓ W {ticker} {year_month} W{week_num} ({len(articles)} arts) [{src}]")
         return src
@@ -408,7 +423,7 @@ def _gen_monthly_from_raw(ticker: str, year_month: str, supa) -> str | None | bo
         .limit(1))
     if not row.data:
         _exec(supa.table("breaks_monthly").upsert({
-            "ticker": ticker, "year_month": year_month, "status": "no_processed",
+            "ticker": ticker, "year_month": year_month, "status": "no_articles_row",
         }))
         return None
     raw = row.data[0].get("articles") or []
@@ -421,14 +436,14 @@ def _gen_monthly_from_raw(ticker: str, year_month: str, supa) -> str | None | bo
     label = _month_label(year_month)
     articles_text = "\n".join(_article_text(a) for a in raw)
     try:
-        summary, src = _llm_call(_month_prompt(ticker, label, articles_text), cascade="zen", item_id=ticker)
+        summary, src = _llm_call(_month_prompt(ticker, label, articles_text), cascade="bub_batch", item_id=ticker)
         sc = _summary_col("breaks_monthly")
         _exec(supa.table("breaks_monthly").upsert({
             "ticker":        ticker,
             "year_month":    year_month,
             sc:              summary,
             "article_count": len(raw),
-            "llm_source":    src,
+            _llm_source_col(): src,
             "condensed_at":  datetime.now(timezone.utc).isoformat(),
         }))
         logger.info(f"  ✓ M {ticker} {year_month} raw ({len(raw)} arts) [{src}]")
@@ -473,16 +488,13 @@ def _build_qty_gate(
     all_tickers = list({t for t, _ in candidates})
     all_yms     = list({ym for _, ym in candidates})
 
-    rows = supa.table("articles") \
-        .select("ticker, year_month, articles") \
-        .in_("ticker", all_tickers) \
-        .in_("year_month", all_yms) \
-        .execute()
+    rows_data = _in_ticker_chunks(supa, "articles", "ticker, year_month, articles", all_tickers,
+                                   lambda q: q.in_("year_month", all_yms))
 
     month_cnt: dict[tuple, int] = {}
     week_cnt:  dict[tuple, int] = {}
 
-    for row in (rows.data or []):
+    for row in rows_data:
         key = (row["ticker"], row["year_month"])
         if key not in candidate_set:
             continue
@@ -513,27 +525,43 @@ def _build_qty_gate(
     return w_deficit, m_deficit
 
 
-def _fetch_p2_done(pairs: list[tuple[str, str]], supa) -> dict[tuple[str, str], set[str]]:
-    """Retourne {(ticker, ym): set_of_apis} depuis articles.p2_sources."""
+def _fetch_tried(pairs: list[tuple[str, str]], supa) -> dict[tuple[str, str], set[str]]:
+    """Retourne {(ticker, ym): set_of_apis} depuis articles.tried_sources."""
     if not pairs:
         return {}
     tickers = list({t for t, _ in pairs})
     yms = list({ym for _, ym in pairs})
-    rows = supa.table("articles").select("ticker, year_month, p2_sources") \
-        .in_("ticker", tickers).in_("year_month", yms).execute()
+    rows_data = _in_ticker_chunks(supa, "articles", "ticker, year_month, tried_sources", tickers,
+                                   lambda q: q.in_("year_month", yms))
     result: dict[tuple[str, str], set[str]] = {}
-    for row in (rows.data or []):
+    for row in rows_data:
         key = (row["ticker"], row["year_month"])
-        result[key] = set(row.get("p2_sources") or [])
+        result[key] = set(row.get("tried_sources") or [])
     return result
 
 
-def _mark_p2_done(ticker: str, ym: str, api: str, p2_done: dict, supa) -> None:
+_P2_ORDER = ["finnhub", "newsapi", "marketaux", "av"]
+
+def _mark_tried(ticker: str, ym: str, api: str, p2_done: dict, supa) -> None:
     """Marque (ticker, ym) comme traité par api dans DB et dans le dict local."""
     current = p2_done.setdefault((ticker, ym), set())
     current.add(api)
-    supa.table("articles").update({"p2_sources": list(current)}) \
+    ordered = [s for s in _P2_ORDER if s in current] + [s for s in current if s not in _P2_ORDER]
+    resp = supa.table("articles").update({"tried_sources": ordered}) \
         .eq("ticker", ticker).eq("year_month", ym).execute()
+    if not resp.data:
+        supa.table("articles").insert({
+            "ticker": ticker, "year_month": ym,
+            "articles": [], "sources": [], "tried_sources": ordered,
+        }).execute()
+    # P2 a potentiellement ajouté des articles : invalider les sentinels bub_cache de ce mois
+    # pour que les dots soient retentés avec les nouveaux articles.
+    supa.table("bub_cache").delete() \
+        .eq("ticker", ticker) \
+        .gte("date", f"{ym}-01") \
+        .lte("date", f"{ym}-31") \
+        .in_("bub_en", ["", "NO_ARTICLES"]) \
+        .execute()
 
 
 def _scrap_phase(tickers: list[str], supa, company_names: dict[str, str], lang: str,
@@ -562,12 +590,9 @@ def _scrap_phase(tickers: list[str], supa, company_names: dict[str, str], lang: 
         today_ym_str = now_utc.strftime("%Y-%m")
 
         fresh: set[tuple[str, str]] = set()
-        rows = supa.table("articles") \
-            .select("ticker, year_month, cached_at") \
-            .in_("year_month", yms) \
-            .in_("ticker", list(tickers_set)) \
-            .execute()
-        for row in (rows.data or []):
+        rows_data = _in_ticker_chunks(supa, "articles", "ticker, year_month, cached_at", list(tickers_set),
+                                       lambda q: q.in_("year_month", yms))
+        for row in rows_data:
             t = row.get("ticker", "")
             ym = row.get("year_month", "")
             cached = row.get("cached_at", "")
@@ -683,8 +708,8 @@ def _scrap_phase(tickers: list[str], supa, company_names: dict[str, str], lang: 
     # ── Phase 1 : Finnhub (12m, US uniquement) ────────────────────────────────
     if not skip_p1:
         us_targets_all = [(t, ym) for t, ym in targets_12 if _detect_region(t) == "US"]
-        finn_p2_done = _fetch_p2_done(us_targets_all, supa)
-        us_targets = [(t, ym) for t, ym in us_targets_all if "finnhub" not in finn_p2_done.get((t, ym), set())]
+        finn_tried = _fetch_tried(us_targets_all, supa)
+        us_targets = [(t, ym) for t, ym in us_targets_all if "finnhub" not in finn_tried.get((t, ym), set())]
         skipped_finn = len(us_targets_all) - len(us_targets)
         logger.info(f"scrap_phase Finnhub: {len(us_targets)} cibles US ({skipped_finn} déjà taggés skippés)")
         finn_updated, finn_arts = 0, 0
@@ -704,7 +729,7 @@ def _scrap_phase(tickers: list[str], supa, company_names: dict[str, str], lang: 
                         break
                     continue
                 finn_consec_429 = 0
-                _mark_p2_done(ticker, ym, "finnhub", finn_p2_done, supa)
+                _mark_tried(ticker, ym, "finnhub", finn_tried, supa)
                 if not raw:
                     pass
                 else:
@@ -731,8 +756,13 @@ def _scrap_phase(tickers: list[str], supa, company_names: dict[str, str], lang: 
 
     # ── Gate qty P1 → P2 ─────────────────────────────────────────────────────────
     current_wnum = _week_num(now_utc.day)
-    targets_p2_w, _ = _build_qty_gate(targets_12, today_ym, current_wnum, supa)
-    logger.info(f"scrap_phase P2 W-gate: {len(targets_p2_w)} cibles < {MIN_W_SCRAP} arts/semaine")
+    if force_pairs:
+        # force_pairs = paires déjà identifiées comme bloquées (retry_skipped) → gate redondante
+        targets_p2_w = list(force_pairs)
+        logger.info(f"scrap_phase P2 W-gate: bypassed ({len(targets_p2_w)} force_pairs)")
+    else:
+        targets_p2_w, _ = _build_qty_gate(targets_12, today_ym, current_wnum, supa)
+        logger.info(f"scrap_phase P2 W-gate: {len(targets_p2_w)} cibles < {MIN_W_SCRAP} arts/semaine")
     _telegram(
         f"📡 *Phase 1 terminée — {region} {lang.upper()}*\n"
         f"📰 RSS +{rss_arts} · Yahoo +{yahoo_arts}"
@@ -746,7 +776,7 @@ def _scrap_phase(tickers: list[str], supa, company_names: dict[str, str], lang: 
         logger.info("scrap_phase --skip-scrape : Phase 2 (NewsAPI + Marketaux + AV) ignorée")
         p2_done = {}
     else:
-        p2_done = _fetch_p2_done(targets_p2_w, supa)
+        p2_done = _fetch_tried(targets_p2_w, supa)
 
     # ── Phase 2 : NewsAPI + Marketaux + AV ───────────────────────────────────────
     newsapi_key = os.environ.get("NEWSAPI_API_KEY", "") if not skip_p2 else ""
@@ -777,7 +807,7 @@ def _scrap_phase(tickers: list[str], supa, company_names: dict[str, str], lang: 
                     break
                 continue
             na_consec_429 = 0
-            _mark_p2_done(ticker, ym, "newsapi", p2_done, supa)
+            _mark_tried(ticker, ym, "newsapi", p2_done, supa)
             if not raw:
                 continue
             normalized = [_normalize_newsapi(a) for a in raw if a.get("title") and a.get("url")]
@@ -817,7 +847,7 @@ def _scrap_phase(tickers: list[str], supa, company_names: dict[str, str], lang: 
                     break
                 continue
             mx_consec_429 = 0
-            _mark_p2_done(ticker, ym, "marketaux", p2_done, supa)
+            _mark_tried(ticker, ym, "marketaux", p2_done, supa)
             if not raw:
                 continue
             normalized = [_normalize_marketaux(a) for a in raw if a.get("title") and a.get("url")]
@@ -915,10 +945,10 @@ def _scrap_phase(tickers: list[str], supa, company_names: dict[str, str], lang: 
                     continue
                 normalized = [_normalize_av(a) for a in arts if a.get("title") and a.get("url")]
                 if not normalized:
-                    _mark_p2_done(ticker, ym, "av", p2_done, supa)
+                    _mark_tried(ticker, ym, "av", p2_done, supa)
                     continue
                 added, _ = _upsert_articles_merge(ticker, ym, normalized, "alphavantage", supa)
-                _mark_p2_done(ticker, ym, "av", p2_done, supa)
+                _mark_tried(ticker, ym, "av", p2_done, supa)
                 ticker_added += added
                 total_added += added
             if ticker_added > 0:
@@ -966,29 +996,20 @@ def _scrap_phase(tickers: list[str], supa, company_names: dict[str, str], lang: 
 
     # Compte W/M pending avant de démarrer
     _sliding_yms = list({ym for ym, _ in sliding})
-    _w_done_rows = _exec(supa.table("breaks_weekly")
-        .select("ticker,year_month,week_num")
-        .in_("ticker", tickers)
-        .in_("year_month", _sliding_yms)
-        .is_("status", "null")).data or []
+    _w_done_rows = _in_ticker_chunks(supa, "breaks_weekly", "ticker,year_month,week_num", tickers,
+                                      lambda q: q.in_("year_month", _sliding_yms).in_("status", ["done_more_10", "done_less_10"]))
     _w_done = {(r["ticker"], r["year_month"], r["week_num"]) for r in _w_done_rows}
     _w_total = len(tickers) * len(sliding)
     _w_pending = _w_total - len(_w_done)
 
-    _w_less10_rows = _exec(supa.table("breaks_weekly")
-        .select("ticker,year_month,week_num")
-        .in_("ticker", tickers)
-        .in_("year_month", _sliding_yms)
-        .eq("status", "less_10_articles")).data or []
+    _w_less10_rows = _in_ticker_chunks(supa, "breaks_weekly", "ticker,year_month,week_num", tickers,
+                                        lambda q: q.in_("year_month", _sliding_yms).eq("status", "less_10_articles"))
     _w_blocked = len(_w_less10_rows)
     _w_generable = _w_pending - _w_blocked
 
     _m_col = _summary_col("breaks_monthly")
-    _m_done_rows = _exec(supa.table("breaks_monthly")
-        .select("ticker,year_month")
-        .in_("ticker", tickers)
-        .in_("year_month", months_6)
-        .not_.is_(_m_col, "null")).data or []
+    _m_done_rows = _in_ticker_chunks(supa, "breaks_monthly", "ticker,year_month", tickers,
+                                      lambda q: q.in_("year_month", months_6).not_.is_(_m_col, "null"))
     _m_done = {(r["ticker"], r["year_month"]) for r in _m_done_rows}
     _m_total = len(tickers) * len(months_6)
     _m_pending = _m_total - len(_m_done)
@@ -1030,7 +1051,7 @@ def _scrap_phase(tickers: list[str], supa, company_names: dict[str, str], lang: 
 
         # 1. DUMB
         try:
-            n_dumb = _retry_call(gen_dumb, ticker, lang, cascade="zen")
+            n_dumb = _retry_call(gen_dumb, ticker, lang, cascade="promo")
             if n_dumb:
                 logger.info(f"  DUMB {ticker}: {n_dumb} arts [W{wid}]")
         except Exception as e:
@@ -1047,7 +1068,7 @@ def _scrap_phase(tickers: list[str], supa, company_names: dict[str, str], lang: 
             if not force_regen:
                 exists = _exec(supa.table("breaks_weekly").select("status")
                     .eq("ticker", ticker).eq("year_month", ym).eq("week_num", wnum).limit(1))
-                if exists.data and exists.data[0].get("status") is None:
+                if exists.data and exists.data[0].get("status") in ("done_more_10", "done_less_10"):
                     continue
 
             row = _exec(supa.table("articles").select("articles")
@@ -1092,7 +1113,7 @@ def _scrap_phase(tickers: list[str], supa, company_names: dict[str, str], lang: 
                 logger.info(f"  ⏭ M {ticker} {ym} — scrap_budget")
                 continue
             try:
-                src = _retry_call(scrap_gen_monthly, ticker, ym, supa, caller="refresh_scrap", cascade="zen")
+                src = _retry_call(scrap_gen_monthly, ticker, ym, supa, caller="refresh_scrap", cascade="bub_batch")
                 if src:
                     m_gen += 1
                     if isinstance(src, str):
@@ -1172,11 +1193,11 @@ def _scrap_retry_missed(supa, company_names: dict[str, str], lang: str) -> int:
             return
         try:
             from services.overview_service import gen_dumb
-            gen_dumb(ticker, lang, cascade="zen")
+            gen_dumb(ticker, lang, cascade="promo")
         except Exception as e:
             logger.warning(f"  gen_dumb {ticker}: {e}")
-        scrap_gen_weekly(ticker, ym, supa, caller="retry_scrap", cascade="zen")
-        scrap_gen_monthly(ticker, ym, supa, caller="retry_scrap", cascade="zen")
+        scrap_gen_weekly(ticker, ym, supa, caller="retry_scrap", cascade="promo")
+        scrap_gen_monthly(ticker, ym, supa, caller="retry_scrap", cascade="bub_batch")
 
     cutoff_1m = _last_n_months(1)[-1]
     cutoff_3m = _last_n_months(3)[-1]
@@ -1281,6 +1302,7 @@ def _retry_skipped_phase(
     company_names: dict[str, str],
     lang: str,
     region: str,
+    skip_p1: bool = False,
 ) -> dict:
     """Re-scrape uniquement les tickers avec W 'less_10_articles' ou M absent (mois courant)."""
     sliding = _sliding_weeks(n=5)
@@ -1289,19 +1311,43 @@ def _retry_skipped_phase(
     m_col = _summary_col("breaks_monthly")
 
     # W skipped dans la fenêtre glissante
-    w_rows = _exec(supa.table("breaks_weekly")
-        .select("ticker")
-        .in_("ticker", region_tickers)
-        .in_("year_month", sliding_yms)
-        .eq("status", "less_10_articles")).data or []
+    w_rows_all = _in_ticker_chunks(supa, "breaks_weekly", "ticker,year_month,status", region_tickers,
+                                   lambda q: q.in_("year_month", sliding_yms).in_("status", ["less_10_articles", "scrap_budget"]))
+
+    n_budget   = sum(1 for r in w_rows_all if r.get("status") == "scrap_budget")
+    n_less10   = sum(1 for r in w_rows_all if r.get("status") == "less_10_articles")
+    logger.info(
+        f"retry_skipped W trouvés : {len(w_rows_all)} rows "
+        f"({n_budget} scrap_budget → à traiter · {n_less10} less_10_articles)"
+    )
+
+    w_rows = w_rows_all
+
+    # Exclure les (ticker, ym) anciens déjà passés par tous les scrapers P2 actifs :
+    # rien de plus à scraper, le less_10 est définitif pour ces paires.
+    active_paid: set[str] = set()
+    if os.environ.get("NEWSAPI_API_KEY"):                          active_paid.add("newsapi")
+    if os.environ.get("MARKETAUX_API_TOKEN"):                      active_paid.add("marketaux")
+    if os.environ.get("ALPHAVANTAGE_API_KEY") and region == "US": active_paid.add("av")
+
+    if active_paid and w_rows:
+        candidate_pairs = list({(r["ticker"], r["year_month"]) for r in w_rows})
+        p2_done_map = _fetch_tried(candidate_pairs, supa)
+        exhausted_pairs = {
+            p for p in candidate_pairs
+            if active_paid.issubset(p2_done_map.get(p, set()))
+        }
+        if exhausted_pairs:
+            logger.info(f"  retry_skipped W: {len(exhausted_pairs)} (ticker, ym) P2-exhausted ignorés")
+        w_rows = [r for r in w_rows if (r["ticker"], r["year_month"]) not in exhausted_pairs]
+
     tickers_w = {r["ticker"] for r in w_rows}
+    # force_pairs W : uniquement les paires non-exhaustées (pas toute la fenêtre glissante)
+    w_force_pairs: set[tuple[str, str]] = {(r["ticker"], r["year_month"]) for r in w_rows}
 
     # M absent pour le mois courant
-    m_done = _exec(supa.table("breaks_monthly")
-        .select("ticker")
-        .in_("ticker", region_tickers)
-        .eq("year_month", current_ym)
-        .not_.is_(m_col, "null")).data or []
+    m_done = _in_ticker_chunks(supa, "breaks_monthly", "ticker", region_tickers,
+                                lambda q: q.eq("year_month", current_ym).not_.is_(m_col, "null"))
     tickers_m_done = {r["ticker"] for r in m_done}
     tickers_m = set(region_tickers) - tickers_m_done
 
@@ -1323,6 +1369,7 @@ def _retry_skipped_phase(
     _telegram(
         f"🔁 *retry_skipped démarré — {region} {lang.upper()}*\n"
         f"{len(targets)} tickers (W={len(tickers_w)} · M={len(tickers_m)})\n"
+        f"W rows: {len(w_rows_all)} ({n_budget} budget · {n_less10} less10)\n"
         + (f"W: {' '.join(sorted(tickers_w))}\n" if tickers_w else "")
         + (f"M: {' '.join(sorted(tickers_m))}" if tickers_m else "")
     )
@@ -1331,44 +1378,310 @@ def _retry_skipped_phase(
         logger.info("retry_skipped: rien à faire")
         return {"total_added": 0, "total_w_gen": 0, "total_m_gen": 0, "scrap_budget_count": 0, "all_w_sources": []}
 
-    # Paires exactes à forcer (bypass freshness) : mois glissants pour W, mois courant pour M
-    force_pairs: set[tuple[str, str]] = set()
-    for t in tickers_w:
-        for ym, _ in sliding:
-            force_pairs.add((t, ym))
+    # Paires exactes à forcer (bypass freshness) : paires W non-exhaustées + mois courant pour M
+    force_pairs: set[tuple[str, str]] = w_force_pairs
     for t in tickers_m:
         force_pairs.add((t, current_ym))
 
-    return _scrap_phase(targets, supa, company_names, lang, region=region, force_pairs=force_pairs)
+    return _scrap_phase(targets, supa, company_names, lang, region=region, force_pairs=force_pairs, skip_p1=skip_p1)
+
+
+def _gen_lesser_phase(region_tickers: list[str], supa, lang: str, region: str = "") -> dict:
+    """Génère done_less_10 pour les W less_10_articles dont tous les P2 actifs ont tourné — sans scrape."""
+    from services.breakers_articles_service import _is_p2_exhausted, MIN_W_SCRAP
+
+    sliding = _sliding_weeks(n=5)
+    sliding_yms = list({ym for ym, _ in sliding})
+
+    rows = _in_ticker_chunks(supa, "breaks_weekly", "ticker,year_month,week_num,article_count", region_tickers,
+                             lambda q: q.in_("year_month", sliding_yms).eq("status", "less_10_articles"))
+    if not rows:
+        logger.info("gen_lesser: aucun W less_10_articles dans la fenêtre glissante")
+        return {"total_w_gen": 0}
+
+    candidates = [(r["ticker"], r["year_month"], r["week_num"]) for r in rows]
+    pairs = list({(t, ym) for t, ym, _ in candidates})
+    p2_done_map = _fetch_tried(pairs, supa)
+    active_paid = {"newsapi", "marketaux"}
+    if os.environ.get("ALPHAVANTAGE_API_KEY") and region == "US":
+        active_paid.add("av")
+
+    total_gen, total_skip = 0, 0
+    for ticker, ym, wnum in candidates:
+        tried = p2_done_map.get((ticker, ym), set())
+        if not active_paid.issubset(tried):
+            total_skip += 1
+            continue
+
+        row = _exec(supa.table("articles").select("articles").eq("ticker", ticker).eq("year_month", ym).limit(1))
+        if not row.data:
+            total_skip += 1
+            continue
+        all_arts = row.data[0].get("articles") or []
+        week_arts = [
+            a for a in all_arts
+            if _week_num(datetime.fromtimestamp(a.get("datetime", 0), tz=timezone.utc).day) == wnum
+            and datetime.fromtimestamp(a.get("datetime", 0), tz=timezone.utc).strftime("%Y-%m") == ym
+        ]
+        if not week_arts:
+            total_skip += 1
+            continue
+
+        logger.info(f"  gen_lesser W {ticker} {ym} W{wnum} ({len(week_arts)} arts)")
+        src = _gen_weekly(ticker, ym, wnum, week_arts, supa, done_status="done_less_10")
+        if src:
+            total_gen += 1
+        else:
+            total_skip += 1
+
+    logger.info(f"gen_lesser done: {total_gen} générés · {total_skip} skippés")
+    return {"total_w_gen": total_gen}
+
+
+# ─── W rescue ─────────────────────────────────────────────────────────────────
+
+def _w_rescue_phase(region_tickers: list[str], supa, company_names: dict[str, str],
+                    lang: str, region: str = "") -> dict:
+    """Cascade P2 complète (newsapi→marketaux→AV) sur les W bloqués (<10 arts, 6m) — P1 ignoré.
+
+    Sélection : breaks_weekly.article_count < MIN_W_SCRAP ET status pas done_*.
+    Idempotent via tried_sources : chaque source skippée si déjà taggée.
+    AV : pattern ticker-level (1 req/ticker, 12m), toutes régions (pas US-only).
+    """
+    months_6 = _last_n_months(6)
+    done_statuses = ["done_more_10", "done_less_10"]
+
+    blocked_rows = _in_ticker_chunks(
+        supa, "breaks_weekly", "ticker,year_month",
+        region_tickers,
+        lambda q: q.in_("year_month", months_6)
+                   .lt("article_count", MIN_W_SCRAP)
+                   .not_.in_("status", done_statuses),
+    )
+    pairs = list({(r["ticker"], r["year_month"]) for r in blocked_rows})
+
+    if not pairs:
+        logger.info("w_rescue: aucun W bloqué (<10 arts) dans la fenêtre 6m")
+        return {"total_added": 0, "total_w_gen": 0}
+
+    n_tickers = len({t for t, _ in pairs})
+    logger.info(f"w_rescue: {len(pairs)} (ticker, year_month) cibles · {n_tickers} tickers distincts")
+    _telegram(
+        f"🔧 *w_rescue démarré — {region} {lang.upper()}*\n"
+        f"{n_tickers} tickers · {len(pairs)} (ticker, ym)"
+    )
+
+    pairs_set = set(pairs)
+    p2_done = _fetch_tried(pairs, supa)
+    cutoff_1m = _last_n_months(1)[-1]
+    cutoff_3m = _last_n_months(3)[-1]
+
+    total_added = 0
+    total_w_gen = 0
+
+    def _post_scrap_w(ticker: str, ym: str, added: int) -> None:
+        nonlocal total_w_gen
+        if added <= 0:
+            return
+        n = scrap_gen_weekly(ticker, ym, supa, caller="w_rescue", cascade="promo") or 0
+        total_w_gen += n
+
+    # ── NewsAPI (1m) ──────────────────────────────────────────────────────────
+    newsapi_key = os.environ.get("NEWSAPI_API_KEY", "")
+    na_arts = 0
+    if newsapi_key:
+        targets_na = [(t, ym) for t, ym in pairs
+                      if ym >= cutoff_1m and "newsapi" not in p2_done.get((t, ym), set())]
+        skipped_na = len([p for p in pairs if p[1] >= cutoff_1m]) - len(targets_na)
+        budget = 0
+        na_updated = 0
+        na_consec_429 = 0
+        logger.info(f"w_rescue NewsAPI: {len(targets_na)} cibles (budget=100, {skipped_na} déjà taggés skippés)")
+        for ticker, ym in targets_na:
+            if budget >= 100:
+                logger.info("  Budget NewsAPI épuisé")
+                break
+            if budget > 0:
+                time.sleep(1.0)
+            logger.info(f"  NewsAPI {ticker} {ym}")
+            query = _build_rss_query(ticker, company_names.get(ticker, ""))
+            raw = _fetch_newsapi_month(query, ym, newsapi_key)
+            budget += 1
+            if raw is None:
+                na_consec_429 += 1
+                if na_consec_429 >= 3:
+                    logger.warning(f"  NewsAPI: 3 x 429 consécutives — abandon ({budget} req)")
+                    break
+                continue
+            na_consec_429 = 0
+            _mark_tried(ticker, ym, "newsapi", p2_done, supa)
+            if not raw:
+                continue
+            normalized = [_normalize_newsapi(a) for a in raw if a.get("title") and a.get("url")]
+            added, _ = _upsert_articles_merge(ticker, ym, normalized, "newsapi", supa)
+            if added > 0:
+                na_updated += 1
+                na_arts += added
+                total_added += added
+            _post_scrap_w(ticker, ym, added)
+        logger.info(f"  NewsAPI: {na_updated} tickers · +{na_arts} articles ({budget} req)")
+
+    # ── Marketaux (3m) ────────────────────────────────────────────────────────
+    mx_token = os.environ.get("MARKETAUX_API_TOKEN", "")
+    mx_arts = 0
+    if mx_token:
+        targets_mx = [(t, ym) for t, ym in pairs
+                      if ym >= cutoff_3m and "marketaux" not in p2_done.get((t, ym), set())]
+        skipped_mx = len([p for p in pairs if p[1] >= cutoff_3m]) - len(targets_mx)
+        budget = 0
+        mx_updated = 0
+        mx_consec_429 = 0
+        logger.info(f"w_rescue Marketaux: {len(targets_mx)} cibles (budget=100, {skipped_mx} déjà taggés skippés)")
+        for ticker, ym in targets_mx:
+            if budget >= 100:
+                logger.info("  Budget Marketaux épuisé")
+                break
+            if budget > 0:
+                time.sleep(1.0)
+            logger.info(f"  Marketaux {ticker} {ym}")
+            query = _build_rss_query(ticker, company_names.get(ticker, ""))
+            raw = _fetch_marketaux_month(query, ym, mx_token)
+            budget += 1
+            if raw is None:
+                mx_consec_429 += 1
+                if mx_consec_429 >= 3:
+                    logger.warning(f"  Marketaux: 3 x 429 consécutives — abandon ({budget} req)")
+                    break
+                continue
+            mx_consec_429 = 0
+            _mark_tried(ticker, ym, "marketaux", p2_done, supa)
+            if not raw:
+                continue
+            normalized = [_normalize_marketaux(a) for a in raw if a.get("title") and a.get("url")]
+            added, _ = _upsert_articles_merge(ticker, ym, normalized, "marketaux", supa)
+            if added > 0:
+                mx_updated += 1
+                mx_arts += added
+                total_added += added
+            _post_scrap_w(ticker, ym, added)
+        logger.info(f"  Marketaux: {mx_updated} tickers · +{mx_arts} articles ({budget} req)")
+
+    # ── AV (12m, ticker-level, toutes régions) ────────────────────────────────
+    av_key = os.environ.get("ALPHAVANTAGE_API_KEY", "")
+    av_arts = 0
+    if av_key:
+        av_tickers = sorted({t for t, ym in pairs
+                             if _detect_region(t) == "US"
+                             and "av" not in p2_done.get((t, ym), set())})
+        budget = 0
+        av_updated = 0
+        av_consec_429 = 0
+        logger.info(f"w_rescue AV: {len(av_tickers)} tickers (budget=25)")
+
+        oldest_ym = _last_n_months(12)[-1]
+        oldest_year, oldest_month = int(oldest_ym[:4]), int(oldest_ym[5:7])
+        now_utc_av = datetime.now(timezone.utc)
+        time_from = f"{oldest_year}{oldest_month:02d}01T0000"
+        time_to   = f"{now_utc_av.year}{now_utc_av.month:02d}{now_utc_av.day:02d}T2359"
+        av_yms    = set(_last_n_months(12))
+
+        for ticker in av_tickers:
+            if budget >= 25:
+                logger.info("  Budget AV épuisé")
+                break
+            if budget > 0:
+                time.sleep(12.0)
+            logger.info(f"  AV {ticker} (12m)")
+            try:
+                r = httpx.get(
+                    "https://www.alphavantage.co/query",
+                    params={"function": "NEWS_SENTIMENT", "tickers": ticker,
+                            "time_from": time_from, "time_to": time_to,
+                            "limit": 1000, "apikey": av_key},
+                    timeout=30,
+                )
+                if r.status_code == 429:
+                    logger.warning(f"  AV {ticker}: 429 rate limit")
+                    av_consec_429 += 1
+                    if av_consec_429 >= 2:
+                        logger.warning(f"  AV: 2 x rate limit consécutives — abandon ({budget} req)")
+                        break
+                    budget += 1
+                    continue
+                r.raise_for_status()
+                data = r.json()
+                if "Information" in data:
+                    logger.warning(f"  AV rate limit: {data['Information'][:80]}")
+                    av_consec_429 += 1
+                    budget += 1
+                    if av_consec_429 >= 2:
+                        break
+                    continue
+                feed = data.get("feed") or []
+            except Exception as e:
+                logger.warning(f"  AV {ticker}: {e}")
+                budget += 1
+                continue
+            av_consec_429 = 0
+            budget += 1
+
+            by_ym: dict[str, list[dict]] = defaultdict(list)
+            for a in feed:
+                raw_time = a.get("time_published", "")
+                if raw_time and len(raw_time) >= 6:
+                    ym_art = f"{raw_time[:4]}-{raw_time[4:6]}"
+                    if ym_art in av_yms:
+                        by_ym[ym_art].append(a)
+
+            ticker_added = 0
+            for ym, arts in by_ym.items():
+                if (ticker, ym) not in pairs_set:
+                    continue  # hors scope W-rescue
+                if "av" in p2_done.get((ticker, ym), set()):
+                    continue
+                normalized = [_normalize_av(a) for a in arts if a.get("title") and a.get("url")]
+                if not normalized:
+                    _mark_tried(ticker, ym, "av", p2_done, supa)
+                    continue
+                added, _ = _upsert_articles_merge(ticker, ym, normalized, "alphavantage", supa)
+                _mark_tried(ticker, ym, "av", p2_done, supa)
+                ticker_added += added
+                total_added += added
+                _post_scrap_w(ticker, ym, added)
+
+            if ticker_added > 0:
+                av_updated += 1
+                av_arts += ticker_added
+                logger.info(f"  AV {ticker}: +{ticker_added} articles ({len(by_ym)} mois)")
+        logger.info(f"  AV: {av_updated} tickers · +{av_arts} articles ({budget} req)")
+
+    _telegram(
+        f"✅ *w_rescue terminé — {region} {lang.upper()}*\n"
+        f"📰 NewsAPI +{na_arts} · Marketaux +{mx_arts} · AV +{av_arts}\n"
+        f"📅 W générés: {total_w_gen}"
+    )
+    logger.info(f"w_rescue done: +{total_added} arts · {total_w_gen} W générés")
+    return {"total_added": total_added, "total_w_gen": total_w_gen}
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--region", required=True, choices=["US", "EU", "ASIA"])
-    parser.add_argument("--lang", required=True, choices=["en", "fr"])
-    parser.add_argument("--ticker", default=None, help="Ticker unique (debug)")
-    parser.add_argument("--force-regen", action="store_true",
-                        help="Régénère W/M même s'ils existent déjà en DB")
-    parser.add_argument("--skip-scrape", action="store_true",
-                        help="Saute tout le scrape articles")
-    parser.add_argument("--skip-p1", action="store_true",
-                        help="Saute RSS + Yahoo + Finnhub (Phase 1 gratuite) mais garde Phase 2 payante")
-    parser.add_argument("--skip-rss-yahoo", action="store_true",
-                        help="Saute RSS + Yahoo mais exécute Finnhub (reprendre après interruption Finn)")
-    parser.add_argument("--retry-missed", action="store_true",
-                        help="Reprocess uniquement les (ticker, ym) du scrap_missed_checkpoint.json")
-    parser.add_argument("--retry-skipped", action="store_true",
-                        help="Re-scrape tickers avec W less_10_articles ou M absent (mois courant) puis chaîne W→M")
-    args = parser.parse_args()
-
+def _run_single_region(args) -> None:
+    """Exécute le run complet pour une région. args.region doit être US/EU/ASIA."""
     os.environ["LLM_LANG"] = args.lang
 
     from data.tickers import get_by_region
     tickers = [args.ticker.upper()] if args.ticker else get_by_region(args.region)
 
     supa = _supa()
+
+    # Reset scrap_budget en run normal : recalculé en mémoire, le statut DB doit être nettoyé.
+    # En --retry-skipped : on garde le statut pour que _retry_skipped_phase puisse les cibler.
+    if not args.retry_skipped:
+        for tbl in ("breaks_weekly", "breaks_monthly"):
+            supa.table(tbl).update({"status": None}).eq("status", "scrap_budget").execute()
+        logger.info("scrap_budget reset en DB (breaks_weekly + breaks_monthly)")
+
     company_names: dict[str, str] = _bulk_fetch_company_names(tickers)
     missing_names = [t for t in tickers if "." in t and t not in company_names]
     if missing_names:
@@ -1381,14 +1694,12 @@ def main():
 
     # Compte W/M pending pour affichage départ
     _s_yms = list({ym for ym, _ in sliding})
-    _w_done_r = _exec(supa.table("breaks_weekly")
-        .select("ticker,year_month,week_num")
-        .in_("ticker", tickers).in_("year_month", _s_yms).is_("status", "null")).data or []
+    _w_done_r = _in_ticker_chunks(supa, "breaks_weekly", "ticker,year_month,week_num", tickers,
+                                   lambda q: q.in_("year_month", _s_yms).in_("status", ["done_more_10", "done_less_10"]))
     _w_pending_start = len(tickers) * len(sliding) - len(_w_done_r)
     _m_col_s = _summary_col("breaks_monthly")
-    _m_done_r = _exec(supa.table("breaks_monthly")
-        .select("ticker,year_month")
-        .in_("ticker", tickers).in_("year_month", months).not_.is_(_m_col_s, "null")).data or []
+    _m_done_r = _in_ticker_chunks(supa, "breaks_monthly", "ticker,year_month", tickers,
+                                   lambda q: q.in_("year_month", months).not_.is_(_m_col_s, "null"))
     _m_pending_start = len(tickers) * len(months) - len(_m_done_r)
 
     logger.info(
@@ -1411,7 +1722,11 @@ def main():
         total_added = _scrap_retry_missed(supa, company_names, args.lang)
         phase_result = {"total_added": total_added}
     elif args.retry_skipped:
-        phase_result = _retry_skipped_phase(tickers, supa, company_names, args.lang, region=args.region)
+        phase_result = _retry_skipped_phase(tickers, supa, company_names, args.lang, region=args.region, skip_p1=args.skip_p1)
+    elif args.gen_lesser:
+        phase_result = _gen_lesser_phase(tickers, supa, args.lang, region=args.region)
+    elif args.w_rescue:
+        phase_result = _w_rescue_phase(tickers, supa, company_names, args.lang, region=args.region)
     else:
         phase_result = _scrap_phase(
             tickers, supa, company_names, args.lang,
@@ -1438,6 +1753,37 @@ def main():
         f"📆 M: {m_gen} [{_fmt_sources(m_sources)}]{sb_line}"
     )
     logger.info(f"Done — {mins}m{secs:02d}s · +{arts} arts · {w_gen}W [{_fmt_sources(w_sources)}] · {m_gen}M [{_fmt_sources(m_sources)}]")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--region", required=True, choices=["US", "EU", "ASIA", "ALL"])
+    parser.add_argument("--lang", required=True, choices=["en", "fr"])
+    parser.add_argument("--ticker", default=None, help="Ticker unique (debug)")
+    parser.add_argument("--force-regen", action="store_true",
+                        help="Régénère W/M même s'ils existent déjà en DB")
+    parser.add_argument("--skip-scrape", action="store_true",
+                        help="Saute tout le scrape articles")
+    parser.add_argument("--skip-p1", action="store_true",
+                        help="Saute RSS + Yahoo + Finnhub (Phase 1 gratuite) mais garde Phase 2 payante")
+    parser.add_argument("--skip-rss-yahoo", action="store_true",
+                        help="Saute RSS + Yahoo mais exécute Finnhub (reprendre après interruption Finn)")
+    parser.add_argument("--retry-missed", action="store_true",
+                        help="Reprocess uniquement les (ticker, ym) du scrap_missed_checkpoint.json")
+    parser.add_argument("--retry-skipped", action="store_true",
+                        help="Re-scrape tickers avec W less_10_articles ou M absent (mois courant) puis chaîne W→M")
+    parser.add_argument("--gen-lesser", action="store_true",
+                        help="Génère done_less_10 pour les W less_10_articles dont tous les P2 actifs ont tourné (US: newsapi+marketaux+av · EU/ASIA: newsapi+marketaux) — sans scrape")
+    parser.add_argument("--w-rescue", action="store_true",
+                        help="Cascade P2 complète (newsapi→marketaux→AV) sur W bloqués <10 arts (6m) — idempotent via tried_sources")
+    args = parser.parse_args()
+
+    if args.region == "ALL":
+        for region in ["US", "EU", "ASIA"]:
+            args.region = region
+            _run_single_region(args)
+    else:
+        _run_single_region(args)
 
 
 

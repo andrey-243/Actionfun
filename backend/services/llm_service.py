@@ -2,8 +2,8 @@
 Cascade LLM : FreeTheAI (primary → secondary) → ZenithAI → Hapuppy → Groq
 
 Logique :
-  1. bbl/gpt-4.1 (FreeTheAI primary)
-  2. bbl/gpt-5.4-mini (FreeTheAI secondary) — si 502/503/timeout sur #1
+  1. bbl/grok-4.1-fast-non-reasoning (FreeTheAI primary)
+  2. bbl/gemini-3.5-flash (FreeTheAI secondary) — si 502/503/timeout sur #1
      → circuit breaker : 3 rounds échoués → freeze 30min → probe auto
   3. ZenithAI gpt-5.5 — freeze 1min après 3 erreurs, flag session sur 401
   4. Hapuppy gpt-4.1-mini — freeze 1min sur quota 403/429
@@ -91,11 +91,12 @@ GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 GEMINI_MODEL = "gemini-3.1-flash-lite"
 
-FREETHEAI_PRIMARY = "bbl/gpt-4.1"
-FREETHEAI_SECONDARY = "bbl/gpt-5.4-mini"
+FREETHEAI_PRIMARY = "bbl/grok-4.1-fast-non-reasoning"
+FREETHEAI_SECONDARY = "bbl/gemini-3.5-flash"
 OPENAI_MODEL = "openai/gpt-5.5"
 ZEN_MODELS = ["free/gpt-5.5", "free/claude-sonnet-4.6"]  # ZEN PROMO — modèles gratuits en waterfall
 ZEN_MIN_INTERVAL = float(os.environ.get("ZEN_MIN_INTERVAL", "10.0"))  # secondes entre calls zen
+ZEN_TIMEOUT_COOLDOWN = float(os.environ.get("ZEN_TIMEOUT_COOLDOWN", "50.0"))  # extra wait après timeout (slot serveur encore occupé)
 _zen_last_call: float = 0.0
 _zen_lock = threading.Lock()
 HAPUPPY_MODELS = ["hapuppy/gpt-5.5", "hapuppy/gpt-5.4"]
@@ -304,34 +305,46 @@ def _try_gemini(payload_base: dict, timeout: int, trail: list[str]) -> dict | No
 
     url = GEMINI_URL.format(model=GEMINI_MODEL)
 
-    for i, env_name in enumerate(GEMINI_KEYS_ENV):
-        gemini_key = os.environ.get(env_name, "")
-        if not gemini_key:
-            continue
-        if _gemini_bad_key[i]:
-            trail.append(f"Gemini k{i+1} : ⏭ clé invalide")
-            continue
-        if _gemini_daily_exhausted[i]:
-            trail.append(f"Gemini k{i+1} : ⏭ daily épuisé")
-            continue
-        # Freeze 3x429 : skip jusqu'à minuit UTC, probe toutes les 1h ensuite
-        if _gemini_freeze_until[i] is not None:
-            now_utc = datetime.now(timezone.utc)
-            if now_utc < _gemini_freeze_until[i]:
-                trail.append(f"Gemini k{i+1} : ⏭ frozen (reset {_gemini_freeze_until[i].strftime('%Hh%M UTC')})")
+    # Choisir la clé avec le wait minimum parmi les clés disponibles (hors skip)
+    def _pick_best_key(skip: set[int]) -> tuple[int, float]:
+        now_utc = datetime.now(timezone.utc)
+        now_mono = time.monotonic()
+        best_i, best_wait = -1, float("inf")
+        for idx in range(_N_GEMINI):
+            if idx in skip:
                 continue
-            else:
-                _gemini_freeze_until[i] = now_utc + timedelta(hours=1)
-
-        with _gemini_lock:
-            now = time.monotonic()
-            wait = max(
-                _gemini_ratelimit_until[i] - now,
-                GEMINI_MIN_INTERVAL - (now - _gemini_last_call[i]),
+            if not os.environ.get(GEMINI_KEYS_ENV[idx], ""):
+                continue
+            if _gemini_bad_key[idx] or _gemini_daily_exhausted[idx]:
+                continue
+            if _gemini_freeze_until[idx] is not None and now_utc < _gemini_freeze_until[idx]:
+                continue
+            w = max(
+                _gemini_ratelimit_until[idx] - now_mono,
+                GEMINI_MIN_INTERVAL - (now_mono - _gemini_last_call[idx]),
+                0.0,
             )
-            _gemini_last_call[i] = now + wait if wait > 0 else now
+            if w < best_wait:
+                best_wait, best_i = w, idx
+        return best_i, best_wait
+
+    tried: set[int] = set()
+    while True:
+        with _gemini_lock:
+            i, wait = _pick_best_key(tried)
+            if i == -1:
+                break  # toutes les clés épuisées/invalides/frozen
+            tried.add(i)
+            _gemini_last_call[i] = time.monotonic() + wait if wait > 0 else time.monotonic()
         if wait > 0:
             time.sleep(wait)
+
+        gemini_key = os.environ.get(GEMINI_KEYS_ENV[i], "")
+        # Probe freeze : laisse passer une tentative toutes les 1h
+        if _gemini_freeze_until[i] is not None:
+            now_utc = datetime.now(timezone.utc)
+            if now_utc >= _gemini_freeze_until[i]:
+                _gemini_freeze_until[i] = now_utc + timedelta(hours=1)
 
         try:
             r = httpx.post(url, params={"key": gemini_key}, json=body, timeout=timeout)
@@ -351,7 +364,7 @@ def _try_gemini(payload_base: dict, timeout: int, trail: list[str]) -> dict | No
                 }
             if r.status_code == 429:
                 err = str(r.json()).lower()
-                if any(k in err for k in ("daily", "per_day", "per_day_free_tier")):
+                if any(k in err for k in ("daily", "per_day", "per_day_free_tier", "exceeded your current quota")):
                     _gemini_daily_exhausted[i] = True
                     _gemini_consecutive_429[i] = 0
                     trail.append(f"Gemini k{i+1} : ✗ 429 daily épuisé → rotation")
@@ -359,9 +372,10 @@ def _try_gemini(payload_base: dict, timeout: int, trail: list[str]) -> dict | No
                 else:
                     _gemini_consecutive_429[i] += 1
                     if _gemini_consecutive_429[i] >= 3:
-                        _gemini_freeze_until[i] = _next_utc_midnight()
+                        # Rate-limit RPM : freeze 15min (pas midnight — le quota est intact)
+                        _gemini_freeze_until[i] = datetime.now(timezone.utc) + timedelta(minutes=15)
                         _gemini_consecutive_429[i] = 0
-                        trail.append(f"Gemini k{i+1} : ✗ 429 x3 → frozen → rotation")
+                        trail.append(f"Gemini k{i+1} : ✗ 429 x3 → frozen 15min → rotation")
                         continue  # essaie la clé suivante
                     else:
                         _gemini_ratelimit_until[i] = time.monotonic() + 90
@@ -371,12 +385,15 @@ def _try_gemini(payload_base: dict, timeout: int, trail: list[str]) -> dict | No
                 _gemini_bad_key[i] = True
                 trail.append(f"Gemini k{i+1} : ✗ {r.status_code} clé invalide → rotation")
                 continue
-            trail.append(f"Gemini k{i+1} : ✗ {r.status_code}")
-            return None
-        except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError):
-            trail.append(f"Gemini k{i+1} : ✗ timeout/connexion")
-            return None
+            trail.append(f"Gemini k{i+1} : ✗ {r.status_code} → rotation")
+            _logger.warning(f"Gemini k{i+1} : statut inattendu {r.status_code} — {r.text[:120]}")
+            continue
+        except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError) as e:
+            trail.append(f"Gemini k{i+1} : ✗ timeout/connexion → rotation")
+            _logger.warning(f"Gemini k{i+1} : timeout/connexion — {e}")
+            continue
 
+    _logger.warning(f"Gemini : toutes clés épuisées — trail: {trail}")
     return None
 
 
@@ -545,7 +562,6 @@ def llm_call(
                 wait = ZEN_MIN_INTERVAL - (time.monotonic() - _zen_last_call)
                 if wait > 0:
                     time.sleep(wait)
-                _zen_last_call = time.monotonic()
             for zen_model in ZEN_MODELS:
                 try:
                     r = httpx.post(
@@ -554,6 +570,8 @@ def llm_call(
                         json={**payload_base, "model": zen_model, "temperature": 1},
                         timeout=timeout,
                     )
+                    with _zen_lock:
+                        _zen_last_call = time.monotonic()
                     if r.status_code == 200:
                         result = r.json()
                         result["_llm_source"] = f"zenllm/{zen_model}"
@@ -564,7 +582,15 @@ def llm_call(
                         return result
                     _logger.warning(f"ZenLLM `{zen_model}` : {r.status_code} — {r.text[:80]}")
                     trail.append(f"ZenLLM `{zen_model}` : ✗ {r.status_code}")
-                except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError) as e:
+                except (httpx.TimeoutException, httpx.ReadError) as e:
+                    with _zen_lock:
+                        # Timeout : serveur traite encore la requête — bloquer le slot pour ZEN_TIMEOUT_COOLDOWN
+                        _zen_last_call = time.monotonic() + ZEN_TIMEOUT_COOLDOWN
+                    _logger.warning(f"ZenLLM `{zen_model}` : timeout/connexion — {e}")
+                    trail.append(f"ZenLLM `{zen_model}` : ✗ timeout")
+                except httpx.ConnectError as e:
+                    with _zen_lock:
+                        _zen_last_call = time.monotonic()
                     _logger.warning(f"ZenLLM `{zen_model}` : timeout/connexion — {e}")
                     trail.append(f"ZenLLM `{zen_model}` : ✗ timeout")
 

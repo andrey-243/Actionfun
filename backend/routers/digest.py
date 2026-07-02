@@ -42,7 +42,7 @@ def _articles_from_archive(supa, ticker: str, hours: int = 48) -> list[dict]:
         for a in raw
         if a.get("datetime", 0) > cutoff_ts
         and a.get("headline")
-        and (a.get("dumb_en") or "").strip().upper() != "SKIP"
+        and a.get("is_related") is not False
     ]
     articles.sort(key=lambda x: x["datetime"], reverse=True)
     return articles[:100]
@@ -66,7 +66,7 @@ def _week_articles_from_archive(supa, ticker: str, company_name: str = "") -> li
 
 
 @router.get("/weekly/{ticker}")
-async def weekly(ticker: str):
+def weekly(ticker: str):
     try:
         supa = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
         t = ticker.upper()

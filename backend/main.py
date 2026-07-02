@@ -3,12 +3,13 @@ Point d'entrée FastAPI.
 
 Enregistre tous les routers (/api/stock, /api/news, /api/search, /api/events,
 /api/articles, /api/weekly, /api/ticker) et démarre APScheduler avec les crons :
-  - yahoo */3h      : merge articles + trigger OW si nouveaux articles
-  - finnhub */6h    : idem côté Finnhub
-  - google_rss */3h : merge Google RSS (tous pinnés) + trigger OW
-  - marketaux */6h  : merge Marketaux EU+ASIA + trigger OW
-  - newsapi */6h    : merge NewsAPI EU+ASIA + trigger OW
-  - hourly :15      : refresh OW pour tickers no_24h_news
+  - yahoo */3h:00   : merge articles + flag needs_ow_regen si nouveaux articles
+  - finnhub */3h:05 : idem côté Finnhub
+  - google_rss */3h:10 : merge Google RSS (tous pinnés) + flag needs_ow_regen
+  - ow_regen :20    : gen_ow_both pour tickers flaggés needs_ow_regen + no_24h_news
+  - t1_p2 */6h:55   : enrichit tickers 0-article (EU/ASIA: NewsAPI+Marketaux, US: AV)
+  - t2_w dim 22h    : enrichit tickers < 10 arts/semaine (skip si dernier jour du mois)
+  - t3_m last 23h   : enrichit tickers < 25 arts/mois (dernier jour du mois)
   - email 19h15     : Daily digest Resend (1J)
   - email sam 7h00  : Weekly digest Resend (7J)
   - weekly lun 3h30 : condensation weekly summaries
@@ -103,35 +104,44 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(
         _finnhub_articles_scrap,
         trigger="cron",
-        hour="*/6",
-        minute=30,
+        hour="*/3",
+        minute=5,
         id="finnhub_articles_scrap",
     )
     scheduler.add_job(
         _google_rss_articles_scrap,
         trigger="cron",
         hour="*/3",
-        minute=45,
+        minute=10,
         id="google_rss_articles_scrap",
     )
     scheduler.add_job(
-        _marketaux_articles_scrap,
+        _t1_p2_scrap,
         trigger="cron",
         hour="*/6",
-        minute=15,
-        id="marketaux_articles_scrap",
+        minute=55,
+        id="t1_p2_scrap",
     )
     scheduler.add_job(
-        _newsapi_articles_scrap,
+        _t2_w_threshold_scrap,
         trigger="cron",
-        hour="*/6",
-        minute=20,
-        id="newsapi_articles_scrap",
+        day_of_week="sun",
+        hour=22,
+        minute=0,
+        id="t2_w_threshold_scrap",
+    )
+    scheduler.add_job(
+        _t3_m_threshold_scrap,
+        trigger="cron",
+        day="last",
+        hour=23,
+        minute=0,
+        id="t3_m_threshold_scrap",
     )
     scheduler.add_job(
         _hourly_ow_regen,
         trigger="cron",
-        minute=15,
+        minute=20,
         id="hourly_ow_regen",
     )
     scheduler.add_job(
@@ -155,7 +165,7 @@ async def lifespan(app: FastAPI):
         id="reenrich_retry",
     )
     scheduler.start()
-    logger.info("Crons démarrés — daily_digest 19h15, weekly_digest sam 7h, gen_breaks_weekly lun 3h30, gen_breaks_monthly 1er 4h, gen_breaks_yearly 1er jan 5h, yahoo_articles_scrap */3h, finnhub_articles_scrap */6h, google_rss_articles_scrap */3h:45, marketaux_articles_scrap */6h:15, newsapi_articles_scrap */6h:20, cold_start_translate_fr 19h, reenrich_groq_to_better 22h30, reenrich_retry :35 (pending), hourly_ow_regen :15")
+    logger.info("Crons démarrés — daily_digest 19h15, weekly_digest sam 7h, gen_breaks_weekly lun 3h30, gen_breaks_monthly 1er 4h, gen_breaks_yearly 1er jan 5h | yahoo */3h:00, finnhub */3h:05, google_rss */3h:10, ow_regen :20 | t1_p2 */6h:55, t2_w dim 22h, t3_m last_day 23h | cold_start 19h, reenrich 22h30, retry :35")
     yield
     scheduler.shutdown()
 
@@ -308,6 +318,48 @@ def _newsapi_articles_scrap():
         _tg(f"❌ *NewsAPI — scrap EU+ASIA* : `{e}`")
 
 
+def _t1_p2_scrap():
+    import time
+    from services.breakers_articles_service import t1_p2_scrap
+    _tg("▶ *T1 P2 — 0-article tickers* (*/6h :55)")
+    t = time.time()
+    try:
+        results = t1_p2_scrap()
+        detail = " · ".join(f"{tk} +{n}" for tk, n in sorted(results.items())) if results else "rien"
+        _tg(f"✅ *T1 P2* ({int(time.time()-t)}s)\n{len(results)} tickers enrichis\n{detail}")
+    except Exception as e:
+        logger.error(f"T1 p2 scrap failed: {e}")
+        _tg(f"❌ *T1 P2* : `{e}`")
+
+
+def _t2_w_threshold_scrap():
+    import time
+    from services.breakers_articles_service import t2_w_threshold_scrap
+    _tg("▶ *T2 — seuil W* (dim 22h)")
+    t = time.time()
+    try:
+        results = t2_w_threshold_scrap()
+        detail = " · ".join(f"{tk} +{n}" for tk, n in sorted(results.items())) if results else "rien"
+        _tg(f"✅ *T2 — seuil W* ({int(time.time()-t)}s)\n{len(results)} tickers enrichis\n{detail}")
+    except Exception as e:
+        logger.error(f"T2 w threshold scrap failed: {e}")
+        _tg(f"❌ *T2 — seuil W* : `{e}`")
+
+
+def _t3_m_threshold_scrap():
+    import time
+    from services.breakers_articles_service import t3_m_threshold_scrap
+    _tg("▶ *T3 — seuil M* (dernier jour 23h)")
+    t = time.time()
+    try:
+        results = t3_m_threshold_scrap()
+        detail = " · ".join(f"{tk} +{n}" for tk, n in sorted(results.items())) if results else "rien"
+        _tg(f"✅ *T3 — seuil M* ({int(time.time()-t)}s)\n{len(results)} tickers enrichis\n{detail}")
+    except Exception as e:
+        logger.error(f"T3 m threshold scrap failed: {e}")
+        _tg(f"❌ *T3 — seuil M* : `{e}`")
+
+
 _reenrich_pending: bool = False
 
 
@@ -368,10 +420,10 @@ def _hourly_ow_regen():
         if refreshed:
             from datetime import datetime, timezone
             now_utc = datetime.now(timezone.utc).strftime("%H:%M UTC")
-            _tg(f"✅ *News refresh* — {' · '.join(sorted(refreshed))} sortis du pool no\\_news · {now_utc} · 📍 cron `hourly_ow_regen` (:15)")
+            _tg(f"✅ *News refresh* — {' · '.join(sorted(refreshed))} sortis du pool no\\_news · {now_utc} · 📍 cron `hourly_ow_regen` (:20)")
     except Exception as e:
         logger.error(f"Hourly news refresh failed: {e}")
-        _tg(f"❌ *Hourly news refresh* (:15) : `{e}`")
+        _tg(f"❌ *Hourly news refresh* (:20) : `{e}`")
 
 
 def _run_cold_start_translate_fr():

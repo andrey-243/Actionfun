@@ -20,8 +20,6 @@ from services.breakers_articles_service import _is_ticker_related
 GROQ_HEAVY = "meta-llama/llama-4-scout-17b-16e-instruct"
 GROQ_LIGHT  = "llama-3.1-8b-instant"
 
-MIN_SUMMARY_CHARS = 80
-
 
 # ─── Prompts ──────────────────────────────────────────────────────────────────
 
@@ -290,8 +288,7 @@ def _fetch_news(ticker: str) -> tuple[list[dict], str | None]:
         ts = a.get("datetime", 0)
         if ts < cutoff_ts:
             continue
-        summary = a.get("summary", "").strip()
-        if len(summary) < MIN_SUMMARY_CHARS:
+        if not a.get("headline", "").strip():
             continue
         if not _is_ticker_related(a, ticker, company_name):
             continue
@@ -301,16 +298,17 @@ def _fetch_news(ticker: str) -> tuple[list[dict], str | None]:
             continue
         url = a.get("url", "")
         articles.append({
-            "id":        _hashlib.md5(url.encode()).hexdigest()[:16] if url else "",
-            "type":      "STORY",
-            "title":     a.get("headline", ""),
-            "summary":   summary,
-            "source":    a.get("source", ""),
-            "url":       url,
-            "thumbnail": a.get("image", ""),
-            "pub_date":  datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(),
-            "dumb_en":   a.get("dumb_en", ""),
-            "dumb_fr":   a.get("dumb_fr", ""),
+            "id":         _hashlib.md5(url.encode()).hexdigest()[:16] if url else "",
+            "type":       "STORY",
+            "title":      a.get("headline", ""),
+            "summary":    a.get("summary", ""),
+            "source":     a.get("source", ""),
+            "url":        url,
+            "thumbnail":  a.get("image", ""),
+            "pub_date":   datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(),
+            "dumb_en":    a.get("dumb_en", ""),
+            "dumb_fr":    a.get("dumb_fr", ""),
+            "is_related": a.get("is_related"),
         })
 
     articles.sort(key=lambda a: a["pub_date"], reverse=True)
@@ -357,7 +355,7 @@ def _ow7d_from_abrutis(ticker: str, articles: list[dict], stock_context: str = "
     articles_text = "\n".join(
         f"- {a.get(dumb_field) or ''}"
         for a in articles
-        if (a.get(dumb_field) or "").strip().upper() not in ("SKIP", "")
+        if a.get("is_related") is not False and (a.get(dumb_field) or "").strip()
     )
     if not articles_text:
         return {"summary": "", "sentiment": "NEUTRAL", "sentiment_reason": ""}
@@ -372,7 +370,11 @@ def _ow24h_from_abrutis(ticker: str, articles_24h: list[dict], stock_context: st
     if not articles_24h:
         return {"summary": "", "sentiment": "NEUTRAL", "sentiment_reason": ""}
     dumb_field = "dumb_en" if lang == "en" else "dumb_fr"
-    articles_text = "\n".join(f"- {a.get(dumb_field, '')}" for a in articles_24h if a.get(dumb_field))
+    articles_text = "\n".join(
+        f"- {a.get(dumb_field, '')}"
+        for a in articles_24h
+        if a.get("is_related") is not False and a.get(dumb_field)
+    )
     if not articles_text:
         return {"summary": "", "sentiment": "NEUTRAL", "sentiment_reason": ""}
     prompt = (SUMMARY_24H_PROMPT_EN if lang == "en" else SUMMARY_24H_PROMPT).format(
@@ -415,10 +417,16 @@ def _is_stale_6h(row: dict | None, now: datetime) -> bool:
 
 # ─── Write dumb back to articles ───────────────────────────
 
+def _url_hash(url: str) -> str:
+    import hashlib as _hl
+    return _hl.md5(url.encode()).hexdigest()[:12]
+
+
 def _write_dumb_to_archive(ticker: str, articles: list[dict], lang: str, supa) -> None:
-    """Écrit dumb_en/dumb_fr dans les objets article de articles."""
+    """Écrit dumb_en/dumb_fr + is_related dans les articles. Purge les is_related=False."""
     dumb_field = "dumb_en" if lang == "en" else "dumb_fr"
-    by_ym: dict[str, dict[str, str]] = {}
+    # url -> (dumb_value, is_related)
+    by_ym: dict[str, dict[str, tuple[str, bool]]] = {}
     for a in articles:
         dumb = a.get(dumb_field, "")
         if not dumb:
@@ -433,22 +441,36 @@ def _write_dumb_to_archive(ticker: str, articles: list[dict], lang: str, supa) -
             ym = datetime.fromisoformat(pub_date.replace("Z", "+00:00")).strftime("%Y-%m")
         except Exception:
             continue
-        by_ym.setdefault(ym, {})[url] = dumb
+        is_related = dumb.strip().upper() != "SKIP"
+        by_ym.setdefault(ym, {})[url] = (dumb, is_related)
 
-    for ym, url_dumb in by_ym.items():
+    blocklist_rows: list[dict] = []
+
+    for ym, url_data in by_ym.items():
         r = supa.table("articles").select("articles") \
             .eq("ticker", ticker).eq("year_month", ym).maybe_single().execute()
         if not r or not r.data:
             continue
         arts = r.data.get("articles") or []
         updated = False
+        kept: list[dict] = []
         for art in arts:
-            if art.get("url") in url_dumb and not art.get(dumb_field):
-                art[dumb_field] = url_dumb[art["url"]]
+            url = art.get("url", "")
+            if url in url_data and not art.get(dumb_field):
+                dumb_val, is_rel = url_data[url]
+                art[dumb_field] = dumb_val
+                art["is_related"] = is_rel
                 updated = True
+                if not is_rel:
+                    blocklist_rows.append({"ticker": ticker, "url_hash": _url_hash(url)})
+                    continue  # exclure du JSON final
+            kept.append(art)
         if updated:
-            supa.table("articles").update({"articles": arts}) \
+            supa.table("articles").update({"articles": kept}) \
                 .eq("ticker", ticker).eq("year_month", ym).execute()
+
+    if blocklist_rows:
+        supa.table("articles_blocklist").upsert(blocklist_rows, on_conflict="ticker,url_hash").execute()
 
 
 # ─── Brutalise standalone — appelé par les crons dès nouveaux articles ────────
@@ -673,16 +695,12 @@ def get_or_refresh_ow_both(ticker: str, lang: str = None) -> tuple[dict | None, 
     now = datetime.now(timezone.utc)
     needs_refresh = (_needs_24h_refresh(row) and not batch_mode) or _needs_7d_refresh(row) or _is_stale_6h(row, now)
 
-    if not row.get("exchange"):
-        try:
-            exchange = yf.Ticker(ticker).fast_info.exchange or ""
-            if exchange:
-                supa.table("ow_cache").update({"exchange": exchange}).eq("ticker", ticker).execute()
-                row["exchange"] = exchange
-        except Exception:
-            pass
-
     fresh_articles, _ = _fetch_news(ticker)
+
+    if row.get("no_24h_news") and not needs_refresh and not batch_mode:
+        if _filter_24h(fresh_articles):
+            needs_refresh = True
+
     result = _build_response(ticker, fresh_articles, row)
     result["is_refreshing"] = needs_refresh
     return result, needs_refresh
@@ -794,16 +812,20 @@ def hourly_ow_regen() -> list[str]:
         .select("ticker").eq("no_24h_news", True).in_("ticker", list(pinned)).execute()
     pinned_no_news_tickers = {r["ticker"] for r in (pinned_no_news.data or [])}
 
-    candidates = pinned_no_news_tickers | recent_tickers
+    regen_flagged = supa.table("ow_cache") \
+        .select("ticker").eq("needs_ow_regen", True).execute()
+    regen_tickers = {r["ticker"] for r in (regen_flagged.data or [])}
+
+    candidates = pinned_no_news_tickers | recent_tickers | regen_tickers
     if not candidates:
         return []
 
-    logger.info(f"[hourly_refresh] {len(candidates)} tickers no_24h_news à vérifier")
+    logger.info(f"[hourly_refresh] {len(candidates)} tickers à traiter ({len(regen_tickers)} needs_ow_regen, {len(pinned_no_news_tickers | recent_tickers)} no_24h_news)")
 
     refreshed: list[str] = []
     for ticker in candidates:
         try:
-            # Fetch Yahoo avant de lire la DB — sinon les tickers <3 users ne sont jamais mis à jour
+            # Fetch Yahoo avant de lire la DB
             try:
                 from services.breakers_articles_service import _yahoo_scrap_accumulate
                 current_ym = now.strftime("%Y-%m")
@@ -813,11 +835,18 @@ def hourly_ow_regen() -> list[str]:
 
             fresh_articles, _ = _fetch_news(ticker)
             articles_24h = _filter_24h(fresh_articles)
-            if len(articles_24h) == 0:
+
+            needs_gen = ticker in regen_tickers or len(articles_24h) > 0
+            if not needs_gen:
                 supa.table("ow_cache").update({"ow1d_cached_at_en": now.isoformat()}).eq("ticker", ticker).execute()
                 logger.info(f"[hourly_refresh] {ticker} — toujours 0 news 24h")
                 continue
+
             gen_ow_both(ticker, force_24h=True)
+
+            if ticker in regen_tickers:
+                supa.table("ow_cache").update({"needs_ow_regen": False}).eq("ticker", ticker).execute()
+
             logger.info(f"[hourly_refresh] ✓ {ticker} — {len(articles_24h)} articles 24h")
             _regen_break_weekly_if_missing(ticker, supa, logger)
             refreshed.append(ticker)

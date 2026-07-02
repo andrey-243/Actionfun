@@ -4,6 +4,7 @@ import { useState, useEffect, useRef, useMemo } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { useCurrencyPref } from "../../lib/useCurrencyPref";
 import { useExchangeRate } from "../../lib/useExchangeRate";
+import { useLangPref } from "../../lib/useLangPref";
 import { createClient } from "../../lib/supabase";
 import {
   Chart as ChartJS,
@@ -224,7 +225,7 @@ function CompactArticleRow({ article, onClick, directLink }: { article: Article;
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: "4px", flexShrink: 0 }}>
           <MiniSourceBadge name={article.source} />
-          {(article.extra_sources || []).slice(0, 2).map((s, i) => <MiniSourceBadge key={i} name={s.name} />)}
+          {(article.extra_sources || []).filter(s => s.name !== article.source).slice(0, 2).map((s, i) => <MiniSourceBadge key={i} name={s.name} />)}
           {ago && <span style={{ fontSize: "10px", color: "var(--color-text-muted)", marginLeft: "4px" }}>{ago}</span>}
           <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="var(--color-text-muted)" strokeWidth="2" style={{ marginLeft: "2px", flexShrink: 0 }}>
             <path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/>
@@ -255,7 +256,7 @@ function CompactArticleRow({ article, onClick, directLink }: { article: Article;
       </div>
       <div style={{ display: "flex", alignItems: "center", gap: "4px", flexShrink: 0 }}>
         <MiniSourceBadge name={article.source} />
-        {(article.extra_sources || []).slice(0, 2).map((s, i) => <MiniSourceBadge key={i} name={s.name} />)}
+        {(article.extra_sources || []).filter(s => s.name !== article.source).slice(0, 2).map((s, i) => <MiniSourceBadge key={i} name={s.name} />)}
         {ago && <span style={{ fontSize: "10px", color: "var(--color-text-muted)", marginLeft: "4px" }}>{ago}</span>}
       </div>
     </div>
@@ -314,7 +315,7 @@ function NewsCard({ article, onClick }: { article: Article; onClick: () => void 
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ display: "flex", alignItems: "center", gap: "5px", marginBottom: "4px" }}>
             <MiniSourceBadge name={article.source} />
-            {(article.extra_sources || []).slice(0, 2).map((s, i) => <MiniSourceBadge key={i} name={s.name} />)}
+            {(article.extra_sources || []).filter(s => s.name !== article.source).slice(0, 2).map((s, i) => <MiniSourceBadge key={i} name={s.name} />)}
             {ago && <span style={{ fontSize: "10px", color: "var(--color-text-muted)" }}>{ago}</span>}
             {isVideo && <span style={{ fontSize: "9px", fontWeight: 700, letterSpacing: "0.06em", padding: "1px 5px", borderRadius: "3px", background: "var(--color-surface-2)", color: "var(--color-text-muted)" }}>VIDEO</span>}
           </div>
@@ -365,6 +366,8 @@ export default function StockPage() {
 
   const { currency, setCurrency } = useCurrencyPref();
   const { rates } = useExchangeRate();
+  const { lang } = useLangPref();
+  const [bubDates, setBubDates] = useState<Set<string> | null>(null);
 
   function convert(value: number | null): number | null {
     if (value === null || !rates || !stock) return value;
@@ -462,6 +465,15 @@ export default function StockPage() {
     });
   }, [ticker]);
 
+  useEffect(() => {
+    if (!ticker) return;
+    setBubDates(null);
+    fetch(`${API}/api/bub-dates/${ticker.toUpperCase()}?lang=${lang}`)
+      .then((r) => r.json())
+      .then((d) => setBubDates(new Set<string>(d.dates ?? [])))
+      .catch(() => setBubDates(new Set<string>()));
+  }, [ticker, lang]);
+
   async function handlePin() {
     const supa = supaRef.current;
     if (!supa || !ticker || !userId) return;
@@ -524,6 +536,9 @@ export default function StockPage() {
     // Pas de dots sur 24H (5min candles = trop bruité) ni ALL (pas de news Finnhub)
     if (chartPeriod === "1d" || chartPeriod === "5y") return new Map<number, number>();
 
+    // En attente du chargement des bub-dates : pas de dots
+    if (bubDates === null) return new Map<number, number>();
+
     // Peaks & valleys pour toutes les périodes — les vrais points de retournement
     const WINDOW: Record<string, number> = { "5d": 3, "1mo": 2, "6mo": 4, "1y": 5 };
     const MAX_DOTS: Record<string, number> = { "5d": 5, "1mo": 8, "6mo": 10, "1y": 10 };
@@ -548,7 +563,11 @@ export default function StockPage() {
     }
 
     candidates.sort((a, b) => Math.abs(b.pct) - Math.abs(a.pct));
-    return new Map(candidates.slice(0, maxDots).map(({ idx, pct }) => [idx, pct]));
+    const result = new Map(candidates.slice(0, maxDots).map(({ idx, pct }) => [idx, pct]));
+    for (const [idx] of result) {
+      if (!bubDates.has(data[idx]?.date ?? "")) result.delete(idx);
+    }
+    return result;
   })();
 
   const chart = stock?.chart ?? [];
@@ -1116,6 +1135,7 @@ export default function StockPage() {
           changePct={eventPoint.changePct}
           onClose={() => setEventPoint(null)}
           apiUrl={API}
+          lang={lang}
         />
       )}
     </div>

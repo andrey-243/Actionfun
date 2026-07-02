@@ -16,6 +16,7 @@ interface BubData {
   date: string;
   articles: BubArticle[];
   cause: string | null;
+  is_fallback?: boolean;
 }
 
 interface Props {
@@ -24,20 +25,44 @@ interface Props {
   changePct: number;
   onClose: () => void;
   apiUrl: string;
+  lang?: string;
 }
 
-export default function EventDrawer({ ticker, date, changePct, onClose, apiUrl }: Props) {
+const LABELS = {
+  en: {
+    loading: "Analysing…",
+    noNews: "No news available for this period.",
+    disclaimer: "AI Analysis — not investment advice",
+    fallbackNote: "English version — French translation in progress…",
+  },
+  fr: {
+    loading: "Analyse en cours…",
+    noNews: "Pas de news disponible pour cette période.",
+    disclaimer: "Analyse IA — pas un conseil d'investissement",
+    fallbackNote: "Version anglaise — traduction française en cours…",
+  },
+};
+
+export default function EventDrawer({ ticker, date, changePct, onClose, apiUrl, lang = "en" }: Props) {
   const [data, setData] = useState<BubData | null>(null);
   const [loading, setLoading] = useState(true);
   const [isPinned, setIsPinned] = useState(false);
   const [pinLoading, setPinLoading] = useState(false);
   const [userId, setUserId] = useState<string | null>(null);
 
+  const labels = LABELS[lang === "fr" ? "fr" : "en"];
+
   useEffect(() => {
     setLoading(true);
-    fetch(`${apiUrl}/api/events/${ticker}?date=${date}&change_pct=${changePct}`)
+    fetch(`${apiUrl}/api/events/${ticker}?date=${date}&change_pct=${changePct}&lang=${lang}`)
       .then((r) => r.json())
-      .then((d) => { setData(d); setLoading(false); })
+      .then((d: BubData) => {
+        setData(d);
+        setLoading(false);
+        if (d.is_fallback) {
+          fetch(`${apiUrl}/api/translate-bub/${ticker}/${date}`, { method: "POST" }).catch(() => {});
+        }
+      })
       .catch(() => setLoading(false));
 
     // Check pin status
@@ -147,10 +172,10 @@ export default function EventDrawer({ ticker, date, changePct, onClose, apiUrl }
         {/* Content */}
         <div style={{ flex: 1, overflowY: "auto", padding: "16px 20px" }}>
           {loading ? (
-            <DogLoader text="Analyse en cours…" />
-          ) : !data || !data.articles || data.articles.length === 0 ? (
+            <DogLoader text={labels.loading} />
+          ) : !data || (!data.cause && (!data.articles || data.articles.length === 0)) ? (
             <div style={{ textAlign: "center", padding: "40px 0", color: "var(--color-text-muted)", fontSize: "13px" }}>
-              Pas de news disponible pour cette période.
+              {labels.noNews}
             </div>
           ) : (
             <>
@@ -163,18 +188,27 @@ export default function EventDrawer({ ticker, date, changePct, onClose, apiUrl }
                   <p style={{ fontSize: "13px", color: "var(--color-text-primary)", lineHeight: 1.6, margin: "0 0 10px" }}>
                     {data.cause}
                   </p>
-                  <span style={{ fontSize: "10px", color: "var(--color-text-muted)", fontStyle: "italic" }}>
-                    Analyse IA — pas un conseil d'investissement
-                  </span>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: "4px" }}>
+                    <span style={{ fontSize: "10px", color: "var(--color-text-muted)", fontStyle: "italic" }}>
+                      {labels.disclaimer}
+                    </span>
+                    {data.is_fallback && (
+                      <span style={{ fontSize: "10px", color: "var(--color-text-muted)", fontStyle: "italic" }}>
+                        {labels.fallbackNote}
+                      </span>
+                    )}
+                  </div>
                 </div>
               )}
 
               {/* Articles */}
+              {data.articles && data.articles.length > 0 && (
               <div style={{ fontSize: "11px", fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase", color: "var(--color-text-muted)", marginBottom: "10px" }}>
                 {data.articles.length} articles
               </div>
+              )}
               <div style={{ display: "flex", flexDirection: "column", gap: "1px" }}>
-                {data.articles.map((a, i) => (
+                {(data.articles || []).map((a, i) => (
                   <a
                     key={i}
                     href={a.url}

@@ -67,12 +67,8 @@ def get_company_name(ticker: str) -> str:
 
 
 def bulk_fetch_company_names(tickers: list[str]) -> dict[str, str]:
-    """Fetch les noms de société en parallèle pour les tickers EU/ASIA (avec '.').
-
-    Remplace _bulk_fetch_company_names depuis breakers_articles_service.
-    """
-    eu_asia = [t for t in tickers if "." in t]
-    if not eu_asia:
+    """Fetch les noms de société en parallèle pour tous les tickers."""
+    if not tickers:
         return {}
 
     names: dict[str, str] = {}
@@ -83,9 +79,9 @@ def bulk_fetch_company_names(tickers: list[str]) -> dict[str, str]:
             names[ticker] = name
 
     with ThreadPoolExecutor(max_workers=8) as ex:
-        list(ex.map(_fetch_one, eu_asia))
+        list(ex.map(_fetch_one, tickers))
 
-    logger.info(f"company names fetched: {len(names)}/{len(eu_asia)} tickers (dot-suffixed)")
+    logger.info(f"company names fetched: {len(names)}/{len(tickers)} tickers")
     return names
 
 

@@ -48,7 +48,7 @@ interface MyNews1WTicker {
 const SENTIMENT_STYLE: Record<string, { bg: string; color: string }> = {
   BULLISH: { bg: "var(--color-positive-bg)", color: "var(--color-positive)" },
   BEARISH: { bg: "var(--color-negative-bg)", color: "var(--color-negative)" },
-  NEUTRAL: { bg: "var(--color-surface-2)", color: "var(--color-text-muted)" },
+  NEUTRAL: { bg: "var(--color-surface-2)", color: "var(--color-text-secondary)" },
 };
 
 const LOGODEV_TOKEN = process.env.NEXT_PUBLIC_LOGODEV_TOKEN ?? "";
@@ -202,7 +202,8 @@ function DigestCard({ digest }: { digest: MyNews1DTicker }) {
   const hasArticles = articles24h.length > 0;
 
   const owAgeMs = digest.cached_at ? Date.now() - new Date(digest.cached_at).getTime() : Infinity;
-  const noNews = digest.no_24h_news ?? !hasArticles;
+  const noNews = !hasArticles;
+  const noNewsText = (digest.no_24h_news ?? false) || !hasArticles;
 
   const lastArticle = (digest.articles ?? [])[0];
   const lastNewsMs = lastArticle ? Date.now() - new Date(lastArticle.pub_date).getTime() : Infinity;
@@ -287,7 +288,7 @@ function DigestCard({ digest }: { digest: MyNews1DTicker }) {
 
           {/* Résumé */}
           <p style={{ fontSize: "13px", color: "var(--color-text-secondary)", lineHeight: 1.6, margin: 0 }}>
-            {noNews ? (digest.summary || "") : (digest.summary_24h || "Pas de résumé disponible.")}
+            {noNewsText ? (digest.summary || "") : (digest.summary_24h || "Pas de résumé disponible.")}
           </p>
         </div>
         {hasArticles && (
@@ -447,24 +448,47 @@ function WeeklyCard({ weekly }: { weekly: MyNews1WTicker }) {
 
 type Tab = "daily" | "weekly";
 
+function SkeletonCard() {
+  return (
+    <div style={{
+      background: "var(--color-surface)", border: "1px solid var(--color-border)",
+      borderRadius: "10px", padding: "16px 18px", marginBottom: "16px",
+    }}>
+      <div style={{ display: "flex", gap: "12px", alignItems: "flex-start" }}>
+        <div style={{ width: 40, height: 40, borderRadius: "10px", background: "var(--color-surface-2)", flexShrink: 0 }} />
+        <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: "9px" }}>
+          <div style={{ display: "flex", gap: "6px" }}>
+            <div style={{ width: 56, height: 13, borderRadius: "3px", background: "var(--color-surface-2)" }} />
+            <div style={{ width: 44, height: 13, borderRadius: "3px", background: "var(--color-surface-2)" }} />
+          </div>
+          <div style={{ width: "88%", height: 11, borderRadius: "3px", background: "var(--color-surface-2)" }} />
+          <div style={{ width: "72%", height: 11, borderRadius: "3px", background: "var(--color-surface-2)" }} />
+          <div style={{ width: "55%", height: 11, borderRadius: "3px", background: "var(--color-surface-2)" }} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function MyNewsPage() {
   const router = useRouter();
   const [pins, setPins] = useState<string[]>([]);
+  const [pinsLoaded, setPinsLoaded] = useState(false);
   const [tab, setTab] = useState<Tab>("daily");
   const [myNews1DTickers, setMyNews1DTickers] = useState<MyNews1DTicker[]>([]);
   const [myNews1WTickers, setMyNews1WTickers] = useState<MyNews1WTicker[]>([]);
-  const [loadingDaily, setLoadingDaily] = useState(true);
-  const [loadingWeekly, setLoadingWeekly] = useState(false);
+  const [dailyPending, setDailyPending] = useState(0);
+  const [weeklyPending, setWeeklyPending] = useState(0);
   const [weeklyFetched, setWeeklyFetched] = useState(false);
   const [authed, setAuthed] = useState<boolean | null>(null);
 
   useEffect(() => {
     const supa = createClient();
-    if (!supa) { setAuthed(false); setLoadingDaily(false); return; }
+    if (!supa) { setAuthed(false); setPinsLoaded(true); return; }
 
     supa.auth.getUser().then(async ({ data }) => {
       const u = data.user;
-      if (!u) { setAuthed(false); setLoadingDaily(false); return; }
+      if (!u) { setAuthed(false); setPinsLoaded(true); return; }
       setAuthed(true);
 
       const { data: pinData } = await supa
@@ -474,45 +498,56 @@ export default function MyNewsPage() {
 
       const tickers = (pinData ?? []).map((r: { ticker: string }) => r.ticker);
       setPins(tickers);
+      setPinsLoaded(true);
 
-      if (tickers.length === 0) { setLoadingDaily(false); return; }
+      if (tickers.length === 0) return;
 
-      let firstArrived = false;
+      const fetchWithTimeout = (url: string, ms: number) => {
+        const ctrl = new AbortController();
+        const id = setTimeout(() => ctrl.abort(), ms);
+        return fetch(url, { signal: ctrl.signal }).finally(() => clearTimeout(id));
+      };
+
+      setDailyPending(tickers.length);
       await Promise.all(
         tickers.map((t) =>
-          fetch(`${API}/api/news/${t}`)
+          fetchWithTimeout(`${API}/api/news/${t}`, 45000)
             .then((r) => r.json())
             .then((d) => {
               if (d && d.ticker && d.summary_24h) {
                 setMyNews1DTickers((prev) => [...prev, d]);
-                if (!firstArrived) { firstArrived = true; setLoadingDaily(false); }
               }
             })
             .catch(() => null)
+            .finally(() => setDailyPending((prev) => Math.max(0, prev - 1)))
         )
       );
-      setLoadingDaily(false);
     });
   }, []);
 
   async function fetchWeeklies() {
     if (weeklyFetched || pins.length === 0) return;
-    setLoadingWeekly(true);
-    let firstArrived = false;
+
+    const fetchWithTimeout = (url: string, ms: number) => {
+      const ctrl = new AbortController();
+      const id = setTimeout(() => ctrl.abort(), ms);
+      return fetch(url, { signal: ctrl.signal }).finally(() => clearTimeout(id));
+    };
+
+    setWeeklyPending(pins.length);
     await Promise.all(
       pins.map((t) =>
-        fetch(`${API}/api/weekly/${t}`)
+        fetchWithTimeout(`${API}/api/weekly/${t}`, 30000)
           .then((r) => r.json())
           .then((w) => {
             if (w && w.ticker) {
               setMyNews1WTickers((prev) => [...prev, w]);
-              if (!firstArrived) { firstArrived = true; setLoadingWeekly(false); }
             }
           })
           .catch(() => null)
+          .finally(() => setWeeklyPending((prev) => Math.max(0, prev - 1)))
       )
     );
-    setLoadingWeekly(false);
     setWeeklyFetched(true);
   }
 
@@ -520,8 +555,6 @@ export default function MyNewsPage() {
     setTab(t);
     if (t === "weekly") fetchWeeklies();
   }
-
-  const loading = tab === "daily" ? loadingDaily : loadingWeekly;
 
   const TAB_ITEM = (active: boolean): React.CSSProperties => ({
     padding: "5px 14px",
@@ -587,7 +620,7 @@ export default function MyNewsPage() {
               Retour à l'accueil
             </button>
           </div>
-        ) : loading ? (
+        ) : !pinsLoaded ? (
           <div style={{ textAlign: "center", padding: "60px 0", color: "var(--color-text-muted)", fontSize: "13px" }}>
             Chargement…
           </div>
@@ -598,61 +631,65 @@ export default function MyNewsPage() {
             </p>
           </div>
         ) : tab === "daily" ? (
-          myNews1DTickers.length === 0 ? (
-            <div style={{ textAlign: "center", padding: "60px 0", color: "var(--color-text-muted)", fontSize: "13px" }}>
-              Pas de news disponible aujourd'hui pour tes actions.
-            </div>
-          ) : (
-            <>
-              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "16px" }}>
-                <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-                  <span style={{ fontSize: "11px", fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase", color: "var(--color-text-muted)" }}>
-                    {new Set(myNews1DTickers.map(d => d.ticker)).size} action{new Set(myNews1DTickers.map(d => d.ticker)).size > 1 ? "s" : ""} · digest du jour
-                  </span>
-                  <span style={{
-                    padding: "1px 6px", borderRadius: "4px", fontSize: "9px", fontWeight: 700,
-                    fontFamily: "var(--font-mono)", letterSpacing: "0.06em", textTransform: "uppercase",
-                    background: "rgba(255,180,0,0.10)", color: "#C8960C",
-                  }}>Premium</span>
-                </div>
-                <span style={{ fontSize: "11px", color: "var(--color-text-muted)", fontFamily: "var(--font-mono)" }}>
-                  {new Date().toLocaleDateString("fr-FR", { weekday: "long", day: "numeric", month: "long" })}
-                </span>
-              </div>
-              {[...new Map(myNews1DTickers.map(d => [d.ticker, d])).values()]
-                .sort((a, b) => {
-                  const aMs = a.articles?.[0]?.pub_date ? new Date(a.articles[0].pub_date).getTime() : 0;
-                  const bMs = b.articles?.[0]?.pub_date ? new Date(b.articles[0].pub_date).getTime() : 0;
-                  return bMs - aMs;
-                })
-                .map((d, i) => <DigestCard key={d.ticker ?? i} digest={d} />)}
-            </>
-          )
-        ) : (
-          myNews1WTickers.length === 0 ? (
-            <div style={{ textAlign: "center", padding: "60px 0", color: "var(--color-text-muted)", fontSize: "13px" }}>
-              Pas de résumé hebdomadaire disponible pour tes actions.
-            </div>
-          ) : (
-            <>
-              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "16px" }}>
+          <>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "16px" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
                 <span style={{ fontSize: "11px", fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase", color: "var(--color-text-muted)" }}>
-                  {new Set(myNews1WTickers.map(w => w.ticker)).size} action{new Set(myNews1WTickers.map(w => w.ticker)).size > 1 ? "s" : ""} · recap de la semaine
+                  {myNews1DTickers.length > 0
+                    ? `${new Set(myNews1DTickers.map(d => d.ticker)).size} action${myNews1DTickers.length > 1 ? "s" : ""} · digest du jour`
+                    : dailyPending > 0 ? "digest du jour" : "digest du jour"}
                 </span>
-                <span style={{ fontSize: "11px", color: "var(--color-text-muted)", fontFamily: "var(--font-mono)" }}>
-                  {getCurrentWeekLabel()}
-                </span>
+                <span style={{
+                  padding: "1px 6px", borderRadius: "4px", fontSize: "9px", fontWeight: 700,
+                  fontFamily: "var(--font-mono)", letterSpacing: "0.06em", textTransform: "uppercase",
+                  background: "rgba(255,180,0,0.10)", color: "#C8960C",
+                }}>Premium</span>
               </div>
-              {[...new Map(myNews1WTickers.map(w => [w.ticker, w])).values()]
-                .filter(w => (w.top_articles?.length ?? 0) > 0)
-                .sort((a, b) => {
-                  const aMs = a.top_articles?.[0]?.pub_date ? new Date(a.top_articles[0].pub_date).getTime() : 0;
-                  const bMs = b.top_articles?.[0]?.pub_date ? new Date(b.top_articles[0].pub_date).getTime() : 0;
-                  return bMs - aMs;
-                })
-                .map((w, i) => <WeeklyCard key={w.ticker ?? i} weekly={w} />)}
-            </>
-          )
+              <span style={{ fontSize: "11px", color: "var(--color-text-muted)", fontFamily: "var(--font-mono)" }}>
+                {new Date().toLocaleDateString("fr-FR", { weekday: "long", day: "numeric", month: "long" })}
+              </span>
+            </div>
+            {[...new Map(myNews1DTickers.map(d => [d.ticker, d])).values()]
+              .sort((a, b) => {
+                const aMs = a.articles?.[0]?.pub_date ? new Date(a.articles[0].pub_date).getTime() : 0;
+                const bMs = b.articles?.[0]?.pub_date ? new Date(b.articles[0].pub_date).getTime() : 0;
+                return bMs - aMs;
+              })
+              .map((d, i) => <DigestCard key={d.ticker ?? i} digest={d} />)}
+            {Array.from({ length: dailyPending }).map((_, i) => <SkeletonCard key={`sk-d-${i}`} />)}
+            {dailyPending === 0 && myNews1DTickers.length === 0 && (
+              <div style={{ textAlign: "center", padding: "40px 0", color: "var(--color-text-muted)", fontSize: "13px" }}>
+                Pas de news disponible aujourd'hui pour tes actions.
+              </div>
+            )}
+          </>
+        ) : (
+          <>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "16px" }}>
+              <span style={{ fontSize: "11px", fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase", color: "var(--color-text-muted)" }}>
+                {myNews1WTickers.length > 0
+                  ? `${new Set(myNews1WTickers.map(w => w.ticker)).size} action${myNews1WTickers.length > 1 ? "s" : ""} · recap de la semaine`
+                  : "recap de la semaine"}
+              </span>
+              <span style={{ fontSize: "11px", color: "var(--color-text-muted)", fontFamily: "var(--font-mono)" }}>
+                {getCurrentWeekLabel()}
+              </span>
+            </div>
+            {[...new Map(myNews1WTickers.map(w => [w.ticker, w])).values()]
+              .filter(w => (w.top_articles?.length ?? 0) > 0)
+              .sort((a, b) => {
+                const aMs = a.top_articles?.[0]?.pub_date ? new Date(a.top_articles[0].pub_date).getTime() : 0;
+                const bMs = b.top_articles?.[0]?.pub_date ? new Date(b.top_articles[0].pub_date).getTime() : 0;
+                return bMs - aMs;
+              })
+              .map((w, i) => <WeeklyCard key={w.ticker ?? i} weekly={w} />)}
+            {Array.from({ length: weeklyPending }).map((_, i) => <SkeletonCard key={`sk-w-${i}`} />)}
+            {weeklyPending === 0 && myNews1WTickers.length === 0 && (
+              <div style={{ textAlign: "center", padding: "40px 0", color: "var(--color-text-muted)", fontSize: "13px" }}>
+                Pas de résumé hebdomadaire disponible pour tes actions.
+              </div>
+            )}
+          </>
         )}
       </main>
     </div>

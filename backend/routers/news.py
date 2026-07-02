@@ -12,7 +12,7 @@ router = APIRouter()
 
 
 @router.get("/news/{ticker}")
-async def news(ticker: str, background_tasks: BackgroundTasks):
+def news(ticker: str, background_tasks: BackgroundTasks):
     try:
         t = ticker.upper()
         cached, needs_refresh = get_or_refresh_ow_both(t)

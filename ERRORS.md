@@ -770,3 +770,209 @@ if not pub_date and a.get("datetime"):
 **Règle** : `pub_date` (ISO string) n'existe que dans les articles normalisés par `_fetch_news`. Les articles bruts DB ont `datetime` (unix int). Ne jamais requérir `pub_date` sans fallback `datetime`.
 
 **Fichier** : `services/overview_service.py` — `_write_dumb_to_archive()`.
+
+---
+
+## 2026-06-21 · tickers US — audit 8 tickers supprimés sans recherche (244 → 252 avec 2 ajouts)
+
+**Contexte** : 8 tickers US avaient été retirés de `tickers.py` sans vérification préalable (SPLK, SQ, K, REV, SPR, MKTS, PARA, X). Audit post-facto pour récupérer les cas récupérables.
+
+**Méthode** : `yf.download(t, period='5d')` + `yf.Ticker(t).info["longName"]` pour confirmer ou infirmer le délisting. Tester les successeurs (ADR, nouveau ticker, acquéreur).
+
+**Résultat par ticker :**
+| Ticker | Statut | Action |
+|--------|--------|--------|
+| `SQ` | Block Inc. a changé son ticker NYSE en `XYZ` (déc. 2023) | Remplacé : DB migré SQ→XYZ + ajouté à tickers.py |
+| `SPLK` | Cisco a acquis Splunk (mars 2024), delisted | `CSCO` ajouté comme ticker Cisco (large cap valide) · data SPLK conservée as-is |
+| `K` | Kellanova acquis par Mars (mars 2025). WK Kellogg (KLG) : 0 rows Yahoo, non utilisable | Supprimé · pas de successeur Yahoo Finance |
+| `REV` | Revlon : faillite, société privée | Supprimé confirmé |
+| `SPR` | Spirit AeroSystems : acquisition Boeing, delisted | Supprimé (BA déjà dans la liste) |
+| `MKTS` | Ticker inconnu, aucune donnée trouvée | Supprimé |
+| `PARA` | Paramount : fusion Skydance jan. 2025, delisted, pas de nouveau ticker public | Supprimé |
+| `X` | US Steel : deal Nippon Steel opaque, 404 sur Yahoo Finance | Supprimé |
+
+**Migration DB** : SQ uniquement (même entreprise, pure rename). UPDATE dans articles/ow_cache/breaks_weekly/breaks_monthly. Destination XYZ vérifiée vide avant migration.
+
+**Pas de migration pour SPLK** : articles Splunk concernent Splunk (pas Cisco) — mélanger les deux serait erroné. CSCO part de zéro.
+
+**Règle** : Avant de supprimer un ticker US, tester `yf.download` + chercher le ticker de succession sur Wikipedia/Yahoo. Un ticker à 0 rows peut être un simple rename (SQ→XYZ) ou une acquisition (SPLK→CSCO).
+
+---
+
+## 2026-06-21 · zen_watcher — boucle infinie BUB sur les tickers sans articles
+
+**Symptôme** : `zen_watcher.py` relance `batch_fill_db --phase bubbles --empty-only` toutes les 5 min. Le batch traite ~148 tickers US (et proportionnellement EU/ASIA) à chaque cycle, génère 0 événements (Fenêtres: 1w: 0 | 1m: 0 | 6m: 0 | 1y: 0), et recommence indéfiniment. LLM counter monte ("cache: 465 → 967 → ...") mais c'est uniquement des hits bub_cache sur les dots déjà remplis du même ticker — pas de vrais LLM calls.
+
+**Cause** : Double bug structurel.
+
+1. `zen_watcher.py:148` — `empty_only=not first_run` : après le premier run complet, tous les runs suivants utilisent `--empty-only`. Ce mode sélectionne les tickers ayant **au moins 1 `bub_en` NULL**.
+
+2. `bubble_service.get_or_gen_bub` (avant fix) upsertait `bub_en=NULL` quand `articles=[]` (ticker delisted, trop peu d'articles en DB, ticker sans couverture médiatique). Ces rows NULL persistent en DB.
+
+Combinaison : tickers avec dots sans articles → `bub_en=NULL` → dans `todo` chaque cycle → `get_or_gen_bub` appelé → `articles=[]` → LLM non appelé → upsert `bub_en=NULL` de nouveau → ticker reste dans `todo` → boucle infinie.
+
+Les dots avec cause remplie sur le même ticker apparaissent comme "cache" dans les notifications (d'où les compteurs croissants), masquant le fait que 0 événements sont générés.
+
+**Fix** : `services/bubble_service.py:198` — utiliser sentinel `""` (chaîne vide) au lieu de `None` quand pas d'articles :
+```python
+# Pas d'articles → sentinel "" (IS NOT NULL) pour ne pas reboucler en empty_only
+# Échec LLM avec articles → None (sera retenté au prochain cycle)
+cause = cause_result if articles else ""
+```
+
+Propriétés du sentinel `""` :
+- `IS NOT NULL` en SQL → exclu du filtre `is_(bub_en, "null")` de `empty_only` → ticker sort de `todo`
+- Falsy en Python et JS → `if cause:` dans `get_or_gen_bub` ne court-circuite pas → si des articles apparaissent plus tard pour ce dot, ils sont récupérés et le LLM est appelé normalement
+- Les dots avec échec LLM (articles trouvés mais LLM 503/timeout) restent `bub_en=NULL` → correctement retentés au cycle suivant
+
+**Règle** : Dans `get_or_gen_bub`, ne jamais upsert `NULL` quand `articles=[]`. Distinguer "pas d'articles" (permanent, sentinel `""`) de "LLM failed" (transitoire, `NULL`).
+
+**Fichier** : `services/bubble_service.py` — `get_or_gen_bub()`, ligne ~198.
+
+---
+
+## 2026-06-21 · batch scripts — PostgREST URL trop longue sur `in_()` avec liste région complète
+
+**Symptôme** : Phase bubbles mode normal : certains tickers (ISRG, ABT, ~28 US) systématiquement dans `todo` malgré des rows `bub_en IS NOT NULL` en DB. EU passait de 37 à 33 `todo` entre deux runs après le fix. Idem pour toutes les phases : skip `done` incomplet, tickers retentés inutilement à chaque cycle.
+
+**Cause** : `in_("ticker", liste_250_tickers)` génère une URL PostgREST dépassant ~2000 caractères. PostgREST tronque silencieusement, aucune erreur retournée — les tickers en fin de liste absents de la réponse.
+
+**Fix** : Helper `_in_chunks` / `_in_ticker_chunks` dans chaque script — chunke la liste en 100 max, N requêtes, merge. Pattern :
+```python
+def _in_chunks(supa, table, select, tickers, filter_fn, chunk_size=100):
+    result = []
+    for i in range(0, len(tickers), chunk_size):
+        chunk = tickers[i:i + chunk_size]
+        r = filter_fn(supa.table(table).select(select).in_("ticker", chunk)).execute()
+        result.extend(r.data or [])
+    return result
+```
+
+**Fix appliqué à tous les scripts** :
+- `batch_fill_db.py` : helper `_in_chunks()` + 5 appels (scrape, enrich, translate-fr bubbles, translate-fr breaks, translate-fr-dumb) + `_query_bub_cache()` phase bubbles
+- `translate_bulk.py` : `_fetch_all()` chunke la liste tickers avant la pagination
+- `refresh_breakers.py` : helper `_in_ticker_chunks()` + 8 appels (`_build_qty_gate`, `_fetch_p2_done`, `_build_targets`, 3x comptage W/M post-scrap, `_retry_skipped_phase`, main entry)
+
+**Règle** : Tout `in_("ticker", liste)` avec liste région (>100 éléments) doit être chunké en 100 max. `in_("year_month", ...)` avec ≤12 mois est safe. Symptôme unique : résultat silencieusement incomplet, aucune erreur.
+
+**Fichiers** : `scripts/batch_fill_db.py` · `scripts/translate_bulk.py` · `scripts/refresh_breakers.py`.
+
+---
+
+## 2026-06-21 · tickers EU — audit et migration (227 → 203 tickers)
+
+**Contexte** : 29 tickers EU systématiquement en `todo` BUB avec 0 dots sur tous les cycles. Cause : yfinance `history(period='5d')` retourne 0 rows pour ces tickers.
+
+**Diagnostic clé** : `rows=0` ne signifie pas toujours "délisted". Exemples piégeux :
+- `AXA.PA` → 0 rows. Cause : Yahoo Finance utilise `CS.PA` pour AXA SA (ancien code Euronext). `CS.PA` était déjà dans la liste et retournait rows=5.
+- `ROG.SW` → 0 rows. Roche fonctionne sous `RO.SW` sur Yahoo Finance. `ROG.SW` est le code Genussscheine (actions de jouissance), non reconnu.
+- `GBL.BR` → 0 rows. Yahoo utilise `GBLB.BR` (actions B) pour Groupe Bruxelles Lambert.
+
+**Méthode de détection** : `yf.Ticker(t).info.get("longName")` retourne `"?"` si Yahoo ne reconnaît pas le ticker — même pour des sociétés actives avec un mauvais code. Tester les variantes (sans suffixe, suffixe B, ADR US) avant de conclure à un délisting.
+
+**Actions appliquées** :
+- Supprimés (délisting confirmé) : WDI.DE, CSGN.SW, 1COV.DE, TKWY.AS, ATL.MI, FCA.MI, LUX.MI, DSM.AS, AHT.L
+- Supprimés (code mort — société dans la liste sous un autre ticker) : AXA.PA→CS.PA, SG.PA→GLE.PA, UG.PA→STLAM.MI, FP.PA→TTE.PA, AB-INBEV.BR→ABI.BR, KNEBV.DE→KNEBV.HE
+- Supprimés (wrong market / index / inconnu) : AEX.AS, BHVN.IR, CRH.IR, AIRP.IR, AIB.IR, MXCT.L, BCMB.DE, GFJ.DE, TCFP.PA, BALN.SW
+- Remplacés (bon code Yahoo) : ROG.SW→RO.SW, GBL.BR→GBLB.BR, URW.AS→URW.PA, RB.L→RKT.L
+- Ajouté : EL.PA (EssilorLuxottica, remplacement de LUX.MI)
+
+**Migration DB** : pour les 4 renommages, UPDATE dans articles/ow_cache/breaks_weekly/breaks_monthly avant de modifier tickers.py. Destinations vides vérifiées avant migration. Pas de conflit.
+
+**Règle** : Avant tout changement tickers.py, voir la procédure "Maintenance tickers — Process" dans RECAP.md.
+
+---
+
+## 2026-06-23 · translate_bulk / llm_service — Gemini faussement marqué daily_exhausted sur 429 RPM
+
+**Symptôme** : Gemini k3 reçoit un 429 RPM → toutes les clés marquées `daily_exhausted` → `promo` échoue instantanément pour tout le reste du run, même avec 461/500 RPD encore disponibles (visible sur dashboard Google). Les 19 workers Gemini spamment "toutes clés épuisées — trail: []" à chaque batch, puis Pass 2 bombarde FreeTheAI qui prend 3×429 RPM → frozen 3h. Les deux providers tombent ensemble.
+
+**Cause** : Le keyword `"quota"` ajouté pour détecter le daily exhaustion est trop générique. Les deux types de 429 Google contiennent "quota" dans leur body :
+- RPM 429 : `"Resource has been exhausted (e.g. check quota)."` → contient "quota"
+- Daily 429 : `"You exceeded your current quota, please see ..."` → contient aussi "quota"
+
+Résultat : tout 429 (même RPM) marquait la clé `daily_exhausted=True`.
+
+**Fix** : Remplacer `"quota"` par `"exceeded your current quota"` (phrase exacte unique au daily) :
+```python
+if any(k in err for k in ("daily", "per_day", "per_day_free_tier", "exceeded your current quota")):
+    _gemini_daily_exhausted[i] = True  # daily épuisé
+else:
+    _gemini_consecutive_429[i] += 1   # RPM → freeze 15min après ×3
+```
+
+**Fix connexe** : `_translate_batch` ne vérifiait pas `_gemini_daily_exhausted` avant de soumettre 19 futures `promo`. Ajout de `_gemini_available()` : si toutes clés daily-exhausted → route tous les items sur `bub_batch` directement, sans spam de failures.
+
+**Fichier** : `services/llm_service.py` ligne ~367 · `scripts/translate_bulk.py` — `_translate_batch()`.
+
+---
+
+## 2026-07-02 · my-news — dissonance daily/weekly (filtre summary >= 80 chars)
+
+**Symptôme** : vue weekly AMZN = 20 articles, vue daily = NO NEWS pour le même ticker. Incohérence visible en prod sur /my-news.
+
+**Cause** : `_fetch_news()` dans `overview_service.py` filtrait les articles avec `len(summary) < MIN_SUMMARY_CHARS` (80). `_week_articles_from_archive()` dans `routers/digest.py` n'avait pas ce filtre : seule une headline non vide était requise. Articles valides (headline présente, summary court ou absent) : exclus du daily, inclus dans le weekly.
+
+**Fix** : Suppression de `MIN_SUMMARY_CHARS`. `_fetch_news()` filtre désormais sur headline non vide uniquement, aligné avec `_week_articles_from_archive()`.
+
+**Fichier** : `services/overview_service.py` — `_fetch_news()`, constante `MIN_SUMMARY_CHARS`.
+
+---
+
+## 2026-07-02 · my-news — badge NO NEWS rouge absent + texte stale incohérent (noNews / noNewsText)
+
+**Symptôme** : NOK affichait un badge neutre au lieu de rouge malgré 0 articles 24h. BLK affichait "No news in the last 24 hours..." alors qu'il avait 41 articles présents. Les deux vus après fix filtre.
+
+**Causes** :
+1. Badge : `noNews = digest.no_24h_news ?? !hasArticles` — si `no_24h_news=false` en DB (cache stale) et `hasArticles=false` côté client, `noNews` valait `false` → badge neutre au lieu de rouge.
+2. Texte : même logique que `noNews` → montrait `summary_24h` alors que le badge disait NO NEWS.
+3. BLK spécifique : `no_24h_news=True` + `ow1d_en = "No news..."` cacqués avant le fix filtre. Cache pas encore rafraîchi.
+
+**Fix** :
+- `noNews = !hasArticles` (source de vérité : articles reçus ou non dans la réponse API, indépendant du cache DB).
+- `noNewsText = (digest.no_24h_news ?? false) || !hasArticles` — affiche résumé 7J si l'un ou l'autre est vrai, résumé 24H sinon.
+- Backend : `get_or_refresh_ow_both()` pose `needs_refresh=True` si `no_24h_news=True` en cache mais des articles 24h existent en DB.
+
+**Fichier** : `frontend/app/my-news/page.tsx` — `DigestCard` · `backend/services/overview_service.py` — `get_or_refresh_ow_both()`.
+
+---
+
+## 2026-07-02 · my-news — skeletons bloqués / chargement lent (async def + yfinance hot-path)
+
+**Symptôme** : /my-news bloqué sur "Chargement..." ou skeletons qui ne se résolvent jamais. Avec 3 tickers pinnés, chaque ticker prenait ~15s au lieu de ~5s en parallèle.
+
+**Causes** :
+1. Routes `async def news` et `async def weekly` avec appels Supabase-py et yfinance synchrones (bloquants) = toutes les requêtes sérialisées dans l'event loop asyncio. N requêtes frontend parallèles = N×T au lieu de T.
+2. `get_or_refresh_ow_both()` faisait un appel `yf.Ticker(ticker).fast_info.exchange` (réseau) à chaque visite de page pour peupler `ow_cache.exchange` — bloquant, non nécessaire en prod.
+
+**Fix** :
+- `async def news` → `def news` dans `routers/news.py`.
+- `async def weekly` → `def weekly` dans `routers/digest.py`.
+- Suppression du bloc exchange lookup dans `get_or_refresh_ow_both()`.
+- Frontend : `fetchWithTimeout(url, ms)` avec AbortController — évite les skeletons bloqués indéfiniment (45s daily, 30s weekly).
+
+**Règle** : FastAPI `async def` + appels bloquants (supabase-py sync, yfinance) = event loop monopolisé, requêtes sérialisées. Utiliser `def` pour les routes avec I/O synchrone : FastAPI les exécute dans un threadpool (40 threads default) = vraie parallélisation.
+
+**Fichier** : `backend/routers/news.py` · `backend/routers/digest.py` · `backend/services/overview_service.py` — `get_or_refresh_ow_both()` · `frontend/app/my-news/page.tsx`.
+
+---
+
+## 2026-06-21 · zen_watcher — 429 "Concurrency limit exceeded" en cascade après un timeout client
+
+**Symptôme** : Un call ZenLLM timeout après 25s → le bubble suivant (10s après via `ZEN_MIN_INTERVAL`) reçoit 429 "Concurrency limit exceeded for your plan (1 concurrent request)" sur les deux modèles → `consecutive_failures` monte rapidement → kill batch après 3 échecs.
+
+**Cause** : `ZEN_MIN_INTERVAL=10s` est mesuré depuis la fin du call précédent. Mais après un timeout CLIENT-SIDE, le serveur ZenLLM considère sa requête encore "active" et occupe le slot concurrent. 10s n'est pas suffisant pour que le serveur libère ce slot (son propre timeout est plus long).
+
+**Fix** : Après un `TimeoutException` ou `ReadError` (pas `ConnectError` — qui n'atteint jamais le serveur), avancer `_zen_last_call` dans le futur de `ZEN_TIMEOUT_COOLDOWN=50s` :
+```python
+except (httpx.TimeoutException, httpx.ReadError) as e:
+    with _zen_lock:
+        _zen_last_call = time.monotonic() + ZEN_TIMEOUT_COOLDOWN
+```
+Le prochain call attend `ZEN_MIN_INTERVAL - (now - _zen_last_call)` = `10 - (now - (now+50))` = 60s. Le slot serveur a le temps de se libérer.
+
+**Coût** : chaque timeout coûte 25s (timeout) + 60s (cooldown) = 85s d'inactivité. Inévitable.
+
+**Règle** : Après un timeout client-side vers un service avec limite de concurrence = 1, toujours attendre le cooldown serveur avant de retenter, pas seulement le rate-limit interval.
+
+**Fichier** : `services/llm_service.py` — bloc cascade `zen`, `except (httpx.TimeoutException, httpx.ReadError)`.

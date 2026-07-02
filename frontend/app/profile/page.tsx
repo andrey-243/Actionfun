@@ -4,6 +4,7 @@ import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { createClient } from "../lib/supabase";
 import { useCurrencyPref, type Currency } from "../lib/useCurrencyPref";
+import { useLangPref } from "../lib/useLangPref";
 import { NavBrand, BackButton, HEADER_STYLE, HEADER_INNER } from "../components/Navbar";
 import type { User } from "../lib/supabase";
 
@@ -37,8 +38,8 @@ export default function ProfilePage() {
   const [notifyWeekly, setNotifyWeeklyState] = useState(true);
   const [digestTickers, setDigestTickers] = useState<Set<string>>(new Set());
   const [saving, setSaving] = useState(false);
-  const [lang, setLangState] = useState<"en" | "fr">("en");
   const { currency, setCurrency } = useCurrencyPref();
+  const { lang, setLang } = useLangPref();
 
   useEffect(() => {
     const supa = createClient();
@@ -58,7 +59,6 @@ export default function ProfilePage() {
         setNotifyEmailState(prefs.notify_email ?? true);
         setNotifyWeeklyState(prefs.notify_weekly ?? true);
         setDigestTickers(new Set(prefs.digest_tickers ?? []));
-        setLangState((prefs.lang as "en" | "fr") ?? "en");
       } else {
         // Default: all tickers selected
         if (pinData) setDigestTickers(new Set(pinData.map((p: PinnedStock) => p.ticker)));
@@ -91,13 +91,8 @@ export default function ProfilePage() {
     await savePrefs({ notify_weekly: val });
   }
 
-  async function handleLang(val: "en" | "fr") {
-    setLangState(val);
-    const supa = createClient();
-    if (!supa || !user) return;
-    setSaving(true);
-    await supa.from("user_preferences").upsert({ user_id: user.id, lang: val, updated_at: new Date().toISOString() });
-    setSaving(false);
+  function handleLang(val: "en" | "fr") {
+    setLang(val);
   }
 
   async function toggleDigestTicker(ticker: string) {

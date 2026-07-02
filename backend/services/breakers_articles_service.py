@@ -31,6 +31,21 @@ logger = logging.getLogger(__name__)
 
 ACTIVE_MONTH_TTL_HOURS = 12
 
+_PAID_P2_SOURCES = {"newsapi", "marketaux", "av"}
+_DONE_STATUSES = ("done_more_10", "done_less_10")
+
+
+def _is_done(status: str | None) -> bool:
+    return status in _DONE_STATUSES
+
+
+def _is_p2_exhausted(ticker: str, year_month: str, supa) -> bool:
+    row = supa.table("articles").select("tried_sources").eq("ticker", ticker).eq("year_month", year_month).maybe_single().execute()
+    if not row or not row.data:
+        return False
+    sources = set(row.data.get("tried_sources") or [])
+    return _PAID_P2_SOURCES.issubset(sources)
+
 # Densité articles bruts (fallback quand pas encore de summaries)
 DENSITY_CONFIG = {
     "1mo": {"slot_days": 7,  "max_per_slot": 10},  # 10/semaine
@@ -128,9 +143,25 @@ def _company_keywords(company_name: str) -> list[str]:
     return [w for w in words if w not in _GENERIC_CORP_WORDS and len(w) > 2]
 
 
+def _count_related(articles: list[dict]) -> int:
+    return sum(1 for a in articles if a.get("is_related") is True)
+
+
 def _is_ticker_related(a: dict, ticker: str, company_name: str = "") -> bool:
-    """Passe si dumb présent, ou si ticker/mots-clés société dans headline+summary."""
-    if a.get("dumb_en") or a.get("dumb_fr"):
+    """is_related=False → exclu. is_related=True → inclus. null → heuristique texte (setter in-place)."""
+    is_rel = a.get("is_related")
+    if is_rel is False:
+        return False
+    if is_rel is True:
+        return True
+    # is_related absent/null : heuristique texte — exclut les dumb "SKIP" (fix bug ligne 133)
+    dumb_en = (a.get("dumb_en") or "").strip().upper()
+    dumb_fr = (a.get("dumb_fr") or "").strip().upper()
+    if dumb_en == "SKIP" or dumb_fr == "SKIP":
+        a["is_related"] = False
+        return False
+    if dumb_en or dumb_fr:
+        a["is_related"] = True
         return True
     text = " ".join(filter(None, [
         a.get("headline") or a.get("title") or "",
@@ -142,7 +173,10 @@ def _is_ticker_related(a: dict, ticker: str, company_name: str = "") -> bool:
     base = ticker.split(".")[0].lower()
     if base != ticker.lower() and len(base) >= 3:
         keywords.append(base)
-    return any(kw in text for kw in keywords)
+    result = any(kw in text for kw in keywords)
+    if result:
+        a["is_related"] = True
+    return result
 
 
 def _normalize_finnhub(a: dict) -> dict:
@@ -292,37 +326,51 @@ def _normalize_newsapi(a: dict) -> dict:
     }
 
 
+def _article_url_hash(url: str) -> str:
+    import hashlib as _hl
+    return _hl.md5(url.encode()).hexdigest()[:12]
+
+
 def _upsert_articles_merge(ticker: str, year_month: str, new_articles: list[dict],
                             source_tag: str, supa) -> tuple[int, str]:
     """Merge new_articles avec l'existant, dedup par headline, upsert.
 
     Retourne (nb_ajoutés, effective_source). effective_source vaut "" si rien ajouté.
     """
+    # Blocklist check : exclure les articles déjà marqués hors cible pour ce ticker
+    try:
+        bl = supa.table("articles_blocklist").select("url_hash").eq("ticker", ticker).execute()
+        blocked = {r["url_hash"] for r in (bl.data or [])}
+    except Exception:
+        blocked = set()
+    if blocked:
+        new_articles = [a for a in new_articles if _article_url_hash(a.get("url", "")) not in blocked]
+
     row = supa.table("articles") \
-        .select("articles, source") \
+        .select("articles, sources") \
         .eq("ticker", ticker) \
         .eq("year_month", year_month) \
         .limit(1) \
         .execute()
     row_data = (row.data[0] if row and row.data else {})
     existing = row_data.get("articles") or []
-    existing_source = row_data.get("source", "")
+    existing_sources = row_data.get("sources") or []
 
     merged = _dedup_by_headline(new_articles + existing)
     added = len(merged) - len(existing)
     if added <= 0:
         return 0, ""
 
-    new_source = "mixed" if existing_source and existing_source != source_tag else source_tag
+    new_sources = existing_sources if source_tag in existing_sources else existing_sources + [source_tag]
     supa.table("articles").upsert({
         "ticker":     ticker,
         "year_month": year_month,
         "articles":   merged,
-        "source":     new_source,
+        "sources":    new_sources,
         "cached_at":  datetime.now(timezone.utc).isoformat(),
     }).execute()
-    logger.info(f"  {source_tag} {ticker} {year_month}: +{added} articles ({len(merged)} total, source={new_source})")
-    return added, new_source
+    logger.info(f"  {source_tag} {ticker} {year_month}: +{added} articles ({len(merged)} total, sources={new_sources})")
+    return added, source_tag
 
 
 # ─── Nouvelles sources fetch ──────────────────────────────────────────────────
@@ -562,12 +610,11 @@ def _fetch_finnhub_month(ticker: str, year_month: str) -> list[dict] | None:
 
 def _get_or_fetch_month(ticker: str, year_month: str, supa) -> tuple[list[dict], str]:
     """
-    Retourne (articles_raw, source) depuis articles ou Finnhub.
+    Retourne (articles_raw, sources_str) depuis articles ou Finnhub.
     Merge les nouveaux articles Finnhub avec l'existant (Yahoo inclus), pas d'écrasement.
-    source = 'finnhub' | 'yahoo' | 'mixed'
     """
     row = supa.table("articles") \
-        .select("articles, source, cached_at") \
+        .select("articles, sources, cached_at") \
         .eq("ticker", ticker) \
         .eq("year_month", year_month) \
         .maybe_single() \
@@ -576,37 +623,50 @@ def _get_or_fetch_month(ticker: str, year_month: str, supa) -> tuple[list[dict],
     cached = row.data if row else None
 
     if cached:
+        sources_str = "+".join(cached.get("sources") or [])
         if not _is_active_month(year_month):
-            return cached["articles"], cached["source"]
+            return cached["articles"], sources_str
         cached_at = datetime.fromisoformat(cached["cached_at"].replace("Z", "+00:00"))
         if datetime.now(timezone.utc) - cached_at < timedelta(hours=ACTIVE_MONTH_TTL_HOURS):
-            return cached["articles"], cached["source"]
+            return cached["articles"], sources_str
 
     existing = (cached or {}).get("articles") or []
     raw = _fetch_finnhub_month(ticker, year_month)
 
     if not raw:
-        # Pas de données Finnhub : bump cached_at pour éviter des refetches constants
         if cached:
             supa.table("articles").update({
                 "cached_at": datetime.now(timezone.utc).isoformat()
             }).eq("ticker", ticker).eq("year_month", year_month).execute()
-            return existing, cached["source"]
-        return [], "yahoo"
+            return existing, "+".join(cached.get("sources") or [])
+        return [], ""
 
     # Merge Finnhub + existant (Yahoo ou Finnhub précédent), dedup par headline
     merged = _dedup_by_headline(raw + existing)
-    source = "mixed" if existing else "finnhub"
+    existing_sources = (cached or {}).get("sources") or []
+    new_sources = existing_sources if "finnhub" in existing_sources else existing_sources + ["finnhub"]
 
     supa.table("articles").upsert({
         "ticker":     ticker,
         "year_month": year_month,
         "articles":   merged,
-        "source":     source,
+        "sources":    new_sources,
         "cached_at":  datetime.now(timezone.utc).isoformat(),
     }).execute()
-    logger.info(f"Finnhub merged {len(raw)} new + {len(existing)} existing → {len(merged)} for {ticker} {year_month} (source={source})")
-    return merged, source
+    sources_str = "+".join(new_sources)
+    logger.info(f"Finnhub merged {len(raw)} new + {len(existing)} existing → {len(merged)} for {ticker} {year_month} (sources={sources_str})")
+    return merged, sources_str
+
+
+def _persist_is_related_writeback(ticker: str, year_month: str, articles: list[dict], supa) -> None:
+    """Persiste les champs is_related settés in-place par _is_ticker_related si au moins un est présent."""
+    if not any("is_related" in a for a in articles):
+        return
+    try:
+        supa.table("articles").update({"articles": articles}) \
+            .eq("ticker", ticker).eq("year_month", year_month).execute()
+    except Exception as e:
+        logger.warning(f"is_related writeback {ticker} {year_month}: {e}")
 
 
 # ─── Density ──────────────────────────────────────────────────────────────────
@@ -647,7 +707,7 @@ def read_breaks_by_period(ticker: str, period: str, company_name: str = "") -> d
 
     # 6mo / 1y : récupérer month summaries AI (optionnel)
     month_rows = supa.table("breaks_monthly") \
-        .select("year_month, ai_summary, bm_en, bm_fr, article_count") \
+        .select("year_month, bm_en, bm_fr, article_count") \
         .eq("ticker", ticker) \
         .in_("year_month", year_months) \
         .execute()
@@ -671,6 +731,7 @@ def read_breaks_by_period(ticker: str, period: str, company_name: str = "") -> d
         ym_start, ym_end = _ym_bounds(ym)
         raw = _dedup_by_headline(raw)
         filtered = [a for a in raw if a.get("datetime", 0) >= cutoff_ts and ym_start <= a.get("datetime", 0) <= ym_end and _is_ticker_related(a, ticker, company_name)]
+        _persist_is_related_writeback(ticker, ym, raw, supa)
         filtered.sort(key=lambda a: a.get("datetime", 0), reverse=True)
         top = [_normalize_finnhub(a) for a in filtered]
 
@@ -681,7 +742,7 @@ def read_breaks_by_period(ticker: str, period: str, company_name: str = "") -> d
             "type":          "month",
             "year_month":    ym,
             "label":         _month_label(ym),
-            "ai_summary":    (ai.get(_summary_col("breaks_monthly")) or ai.get("ai_summary")) if ai else None,
+            "ai_summary":    ai.get(_summary_col("breaks_monthly")) if ai else None,
             "article_count": len(filtered),
             "top_articles":  top,
         })
@@ -729,7 +790,7 @@ def _ym_bounds(year_month: str) -> tuple[float, float]:
 def _get_monthly_with_weeks(ticker: str, year_months: list[str], supa, company_name: str = "") -> dict:
     """Pour 1mo : sections par semaine si distribution ok, sinon section merged avec warning."""
     week_rows = supa.table("breaks_weekly") \
-        .select("year_month, week_num, ai_summary, article_count") \
+        .select("year_month, week_num, article_count") \
         .eq("ticker", ticker) \
         .in_("year_month", year_months) \
         .execute()
@@ -775,6 +836,7 @@ def _get_monthly_with_weeks(ticker: str, year_months: list[str], supa, company_n
                 all_articles.extend(by_week[w])
             all_articles.sort(key=lambda a: a.get("datetime", 0), reverse=True)
             top = [_normalize_finnhub(a) for a in all_articles if _is_ticker_related(a, ticker, company_name)]
+            _persist_is_related_writeback(ticker, ym, raw, supa)
             if top:
                 first_w = min(weeks_with_articles) if weeks_with_articles else 1
                 last_w = max(weeks_with_articles) if weeks_with_articles else 4
@@ -803,10 +865,11 @@ def _get_monthly_with_weeks(ticker: str, year_months: list[str], supa, company_n
                     "week_num":      wnum,
                     "label":         _week_label(ym, wnum),
                     "skewed":        False,
-                    "ai_summary":    (ai.get(_summary_col("breaks_weekly")) or ai.get("ai_summary")) if ai else None,
+                    "ai_summary":    ai.get(_summary_col("breaks_weekly")) if ai else None,
                     "article_count": len(articles),
                     "top_articles":  top,
                 })
+            _persist_is_related_writeback(ticker, ym, raw, supa)
 
     return {
         "ticker":    ticker,
@@ -837,14 +900,14 @@ def read_breaks_periods_available(ticker: str) -> dict:
     supa = _get_supabase()
 
     month_rows = supa.table("breaks_monthly") \
-        .select("year_month, ai_summary, bm_en, bm_fr, article_count") \
+        .select("year_month, bm_en, bm_fr, article_count") \
         .eq("ticker", ticker) \
         .order("year_month", desc=True) \
         .execute()
     month_summary_map = {r["year_month"]: r for r in (month_rows.data or [])}
 
     year_rows = supa.table("breaks_yearly") \
-        .select("year, ai_summary, by_en, by_fr") \
+        .select("year, by_en, by_fr") \
         .eq("ticker", ticker) \
         .order("year", desc=True) \
         .execute()
@@ -868,7 +931,7 @@ def read_breaks_periods_available(ticker: str) -> dict:
                 "type":         "year",
                 "year":         year,
                 "label":        year,
-                "ai_summary":   (yr.get(_summary_col("breaks_yearly")) or yr.get("ai_summary")) if yr else None,
+                "ai_summary":   yr.get(_summary_col("breaks_yearly")) if yr else None,
                 "top_articles": [],
             })
 
@@ -877,7 +940,7 @@ def read_breaks_periods_available(ticker: str) -> dict:
             "type":          "month",
             "year_month":    ym,
             "label":         _month_label(ym),
-            "ai_summary":    r.get(_summary_col("breaks_monthly")) or r.get("ai_summary"),
+            "ai_summary":    r.get(_summary_col("breaks_monthly")),
             "article_count": r.get("article_count", 0),
             "top_articles":  [],
         })
@@ -1029,7 +1092,7 @@ def gen_breaks_weekly() -> dict:
             .eq("week_num", target_wnum) \
             .maybe_single() \
             .execute()
-        if exists.data and exists.data.get("status") is None:
+        if exists.data and _is_done(exists.data.get("status")):
             skipped += 1
             continue
 
@@ -1044,7 +1107,7 @@ def gen_breaks_weekly() -> dict:
             skipped += 1
             supa.table("breaks_weekly").upsert({
                 "ticker": ticker, "year_month": target_ym, "week_num": target_wnum,
-                "status": "no_processed", "article_count": 0,
+                "status": "no_articles_row", "article_count": 0,
             }).execute()
             continue
 
@@ -1072,14 +1135,16 @@ def gen_breaks_weekly() -> dict:
             ), item_id=ticker, cascade="weekly_prod")
             top_articles = [_normalize_finnhub(a) for a in sorted(week_articles, key=lambda x: x.get("pub_date", ""), reverse=True)[:10]]
             supa.table("breaks_weekly").upsert({
-                "ticker":        ticker,
-                "year_month":    target_ym,
-                "week_num":      target_wnum,
-                _summary_col("breaks_weekly"):  summary,
-                "top_articles":  top_articles,
-                "article_count": len(week_articles),
+                "ticker":           ticker,
+                "year_month":       target_ym,
+                "week_num":         target_wnum,
+                _summary_col("breaks_weekly"): summary,
+                "top_articles":     top_articles,
+                "article_count":    len(week_articles),
+                "articles_used":    len(week_articles),
+                "articles_related": _count_related(week_articles),
                 _llm_source_col(): _llm_call._last_source,
-                "condensed_at":  datetime.now(timezone.utc).isoformat(),
+                "condensed_at":     datetime.now(timezone.utc).isoformat(),
             }).execute()
             src = _llm_call._last_source or "unknown"
             llm_counts[src] = llm_counts.get(src, 0) + 1
@@ -1112,7 +1177,7 @@ def gen_breaks_weekly() -> dict:
                 .eq("week_num", current_wnum) \
                 .maybe_single() \
                 .execute()
-            if exists.data and exists.data.get("status") is None:
+            if exists.data and _is_done(exists.data.get("status")):
                 continue
             result = get_weekly_ondemand(ticker)
             if result:
@@ -1166,7 +1231,7 @@ def gen_breaks_monthly() -> dict:
             .eq("year_month", target_ym) \
             .maybe_single() \
             .execute()
-        if exists.data and exists.data.get("status") is None:
+        if exists.data and _is_done(exists.data.get("status")):
             skipped += 1
             continue
 
@@ -1174,7 +1239,7 @@ def gen_breaks_monthly() -> dict:
         try:
             # Essayer depuis les weekly summaries d'abord
             week_rows = supa.table("breaks_weekly") \
-                .select("week_num, ai_summary, bw_en, bw_fr, article_count, status") \
+                .select("week_num, bw_en, bw_fr, article_count, articles_related, status") \
                 .eq("ticker", ticker) \
                 .eq("year_month", target_ym) \
                 .order("week_num") \
@@ -1182,14 +1247,16 @@ def gen_breaks_monthly() -> dict:
 
             month_prompt = _pick(MONTH_CONDENSE_PROMPT, MONTH_CONDENSE_PROMPT_EN)
             sc = _summary_col("breaks_monthly")
-            ok_weeks = [r for r in (week_rows.data or []) if r.get("status") is None]
+            ok_weeks = [r for r in (week_rows.data or []) if _is_done(r.get("status"))]
+            articles_related_count = 0
             if ok_weeks and len(ok_weeks) >= 3:
                 src_col = "bw_en" if _lang() == "en" else "bw_fr"
                 weeks_text = "\n".join(
-                    f"W{r['week_num']}: {r.get(src_col) or r.get('bw_fr') or r.get('ai_summary', '')}"
+                    f"W{r['week_num']}: {r.get(src_col) or r.get('bw_fr', '')}"
                     for r in ok_weeks
                 )
                 article_count = sum(r["article_count"] for r in ok_weeks)
+                articles_related_count = sum(r.get("articles_related") or 0 for r in ok_weeks)
                 summary = _llm_call(month_prompt.format(
                     ticker=ticker,
                     label=_month_label(target_ym),
@@ -1206,7 +1273,7 @@ def gen_breaks_monthly() -> dict:
                     skipped += 1
                     supa.table("breaks_monthly").upsert({
                         "ticker": ticker, "year_month": target_ym,
-                        "status": "no_processed", "article_count": 0,
+                        "status": "no_articles_row", "article_count": 0,
                     }).execute()
                     continue
                 if not row.data["articles"]:
@@ -1218,6 +1285,7 @@ def gen_breaks_monthly() -> dict:
                     continue
                 raw = row.data["articles"]
                 article_count = len(raw)
+                articles_related_count = _count_related(raw)
                 articles_text = "\n".join(_article_text(a) for a in raw[:40])
                 summary = _llm_call(month_prompt.format(
                     ticker=ticker,
@@ -1226,12 +1294,14 @@ def gen_breaks_monthly() -> dict:
                 ), max_tokens=500, item_id=ticker, cascade="monthly_prod")
 
             supa.table("breaks_monthly").upsert({
-                "ticker":        ticker,
-                "year_month":    target_ym,
-                sc:              summary,
-                "article_count": article_count,
-                _llm_source_col(): _llm_call._last_source,
-                "condensed_at":  datetime.now(timezone.utc).isoformat(),
+                "ticker":            ticker,
+                "year_month":        target_ym,
+                sc:                  summary,
+                "article_count":     article_count,
+                "articles_used":     article_count,
+                "articles_related":  articles_related_count,
+                _llm_source_col():   _llm_call._last_source,
+                "condensed_at":      datetime.now(timezone.utc).isoformat(),
             }).execute()
             src = _llm_call._last_source or "unknown"
             llm_counts[src] = llm_counts.get(src, 0) + 1
@@ -1279,7 +1349,7 @@ def gen_breaks_yearly() -> dict:
             continue
 
         month_rows = supa.table("breaks_monthly") \
-            .select("year_month, ai_summary, bm_en, bm_fr") \
+            .select("year_month, bm_en, bm_fr") \
             .eq("ticker", ticker) \
             .like("year_month", f"{target_year}-%") \
             .order("year_month") \
@@ -1292,7 +1362,7 @@ def gen_breaks_yearly() -> dict:
         try:
             src_col = "bm_en" if _lang() == "en" else "bm_fr"
             months_text = "\n".join(
-                f"{_month_label(r['year_month'])}: {r.get(src_col) or r.get('bm_fr') or r.get('ai_summary', '')}"
+                f"{_month_label(r['year_month'])}: {r.get(src_col) or r.get('bm_fr', '')}"
                 for r in month_rows.data
             )
             summary = _llm_call(_pick(YEAR_CONDENSE_PROMPT, YEAR_CONDENSE_PROMPT_EN).format(
@@ -1336,7 +1406,7 @@ def yahoo_articles_scrap() -> dict[str, int]:
     """
     supa = _get_supabase()
 
-    eligible = _get_eligible_tickers(supa, min_users=3)
+    eligible = _get_eligible_tickers(supa, min_users=1)
     if not eligible:
         return {}
 
@@ -1352,13 +1422,13 @@ def yahoo_articles_scrap() -> dict[str, int]:
             if added > 0:
                 results[ticker] = added
                 try:
-                    from services.overview_service import gen_dumb, gen_ow_both
+                    from services.overview_service import gen_dumb
                     n = gen_dumb(ticker, cascade="dumb_prod")
                     logger.info(f"  DUMB gen {ticker} ({n} articles brutalised)")
-                    gen_ow_both(ticker, force_24h=True)
-                    logger.info(f"  OW refresh triggered {ticker} (+{added} articles)")
+                    supa.table("ow_cache").update({"needs_ow_regen": True}).eq("ticker", ticker).execute()
+                    logger.info(f"  needs_ow_regen flagged {ticker} (+{added} articles)")
                 except Exception as ow_err:
-                    logger.warning(f"  DUMB+OW refresh failed {ticker}: {ow_err}")
+                    logger.warning(f"  DUMB+flag failed {ticker}: {ow_err}")
         except Exception as e:
             logger.error(f"  ✗ Yahoo accumulation {ticker}: {e}")
 
@@ -1426,14 +1496,14 @@ def _yahoo_scrap_accumulate(ticker: str, year_month: str, supa) -> int:
         return 0
 
     row = supa.table("articles") \
-        .select("articles, source") \
+        .select("articles, sources") \
         .eq("ticker", ticker) \
         .eq("year_month", year_month) \
         .maybe_single() \
         .execute()
 
     existing = (row.data or {}).get("articles") or []
-    existing_source = (row.data or {}).get("source", "yahoo")
+    existing_sources = (row.data or {}).get("sources") or []
 
     # Merge + dedup par headline (Yahoo en tête pour avoir les résumés Yahoo)
     merged = _dedup_by_headline(new_articles + existing)
@@ -1441,16 +1511,16 @@ def _yahoo_scrap_accumulate(ticker: str, year_month: str, supa) -> int:
         logger.info(f"  Yahoo {ticker} {year_month}: 0 nouveaux articles")
         return 0
 
-    new_source = "mixed" if existing_source == "finnhub" else "yahoo"
+    new_sources = existing_sources if "yahoo" in existing_sources else existing_sources + ["yahoo"]
     added = len(merged) - len(existing)
     supa.table("articles").upsert({
         "ticker":     ticker,
         "year_month": year_month,
         "articles":   merged,
-        "source":     new_source,
+        "sources":    new_sources,
         "cached_at":  datetime.now(timezone.utc).isoformat(),
     }).execute()
-    logger.info(f"  Yahoo {ticker} {year_month}: +{added} articles ({len(merged)} total, source={new_source})")
+    logger.info(f"  Yahoo {ticker} {year_month}: +{added} articles ({len(merged)} total, sources={new_sources})")
     return added
 
 
@@ -1464,7 +1534,7 @@ def finnhub_articles_scrap() -> dict[str, int]:
     today = date.today()
     current_ym = f"{today.year:04d}-{today.month:02d}"
 
-    eligible = _get_eligible_tickers(supa, min_users=3)
+    eligible = _get_eligible_tickers(supa, min_users=1)
     if not eligible:
         return {}
 
@@ -1481,13 +1551,13 @@ def finnhub_articles_scrap() -> dict[str, int]:
                 results[ticker] = len(articles)
             if added > 0:
                 try:
-                    from services.overview_service import gen_dumb, gen_ow_both
+                    from services.overview_service import gen_dumb
                     n = gen_dumb(ticker, cascade="dumb_prod")
                     logger.info(f"  DUMB gen {ticker} ({n} articles brutalised)")
-                    gen_ow_both(ticker, force_24h=True)
-                    logger.info(f"  OW refresh triggered {ticker} (+{added} articles)")
+                    supa.table("ow_cache").update({"needs_ow_regen": True}).eq("ticker", ticker).execute()
+                    logger.info(f"  needs_ow_regen flagged {ticker} (+{added} articles)")
                 except Exception as ow_err:
-                    logger.warning(f"  DUMB+OW refresh failed {ticker}: {ow_err}")
+                    logger.warning(f"  DUMB+flag failed {ticker}: {ow_err}")
         except Exception as e:
             logger.error(f"  ✗ Finnhub refresh {ticker}: {e}")
 
@@ -1546,11 +1616,11 @@ def google_rss_articles_scrap() -> dict[str, int]:
             if added > 0:
                 results[ticker] = added
                 try:
-                    from services.overview_service import gen_dumb, gen_ow_both
+                    from services.overview_service import gen_dumb
                     gen_dumb(ticker, cascade="dumb_prod")
-                    gen_ow_both(ticker, force_24h=True)
+                    supa.table("ow_cache").update({"needs_ow_regen": True}).eq("ticker", ticker).execute()
                 except Exception as ow_err:
-                    logger.warning(f"  DUMB+OW failed {ticker}: {ow_err}")
+                    logger.warning(f"  DUMB+flag failed {ticker}: {ow_err}")
             logger.info(f"  Google RSS {ticker}: +{added}")
         except Exception as e:
             logger.error(f"  ✗ Google RSS {ticker}: {e}")
@@ -1610,11 +1680,11 @@ def marketaux_articles_scrap() -> dict[str, int]:
             if added > 0:
                 results[ticker] = added
                 try:
-                    from services.overview_service import gen_dumb, gen_ow_both
+                    from services.overview_service import gen_dumb
                     gen_dumb(ticker, cascade="dumb_prod")
-                    gen_ow_both(ticker, force_24h=True)
+                    supa.table("ow_cache").update({"needs_ow_regen": True}).eq("ticker", ticker).execute()
                 except Exception as ow_err:
-                    logger.warning(f"  DUMB+OW failed {ticker}: {ow_err}")
+                    logger.warning(f"  DUMB+flag failed {ticker}: {ow_err}")
             logger.info(f"  Marketaux {ticker}: +{added}")
         except Exception as e:
             logger.error(f"  ✗ Marketaux {ticker}: {e}")
@@ -1679,11 +1749,11 @@ def newsapi_articles_scrap() -> dict[str, int]:
             if added > 0:
                 results[ticker] = added
                 try:
-                    from services.overview_service import gen_dumb, gen_ow_both
+                    from services.overview_service import gen_dumb
                     gen_dumb(ticker, cascade="dumb_prod")
-                    gen_ow_both(ticker, force_24h=True)
+                    supa.table("ow_cache").update({"needs_ow_regen": True}).eq("ticker", ticker).execute()
                 except Exception as ow_err:
-                    logger.warning(f"  DUMB+OW failed {ticker}: {ow_err}")
+                    logger.warning(f"  DUMB+flag failed {ticker}: {ow_err}")
             logger.info(f"  NewsAPI {ticker}: +{added}")
         except Exception as e:
             logger.error(f"  ✗ NewsAPI {ticker}: {e}")
@@ -1733,7 +1803,7 @@ def _purge_excess_weeklies(ticker: str, supa, max_weeks: int = 5) -> None:
         .order("week_num", desc=True) \
         .execute()
 
-    all_weeks = [w for w in (rows.data or []) if w.get("status") is None]
+    all_weeks = [w for w in (rows.data or []) if _is_done(w.get("status"))]
     if len(all_weeks) <= max_weeks:
         return
 
@@ -1780,28 +1850,29 @@ def run_monthly_calendaire(tickers: list[str] | None = None):
             .eq("year_month", target_ym) \
             .maybe_single() \
             .execute()
-        if exists.data and exists.data.get("status") is None:
+        if exists.data and _is_done(exists.data.get("status")):
             # Purge weeklies même si déjà généré
             _purge_weeklies_for_month(ticker, target_ym, supa)
             continue
 
         week_rows = supa.table("breaks_weekly") \
-            .select("week_num, ai_summary, bw_en, bw_fr, article_count, status") \
+            .select("week_num, bw_en, bw_fr, article_count, articles_related, status") \
             .eq("ticker", ticker) \
             .eq("year_month", target_ym) \
             .order("week_num") \
             .execute()
 
-        ok_weeks = [r for r in (week_rows.data or []) if r.get("status") is None]
+        ok_weeks = [r for r in (week_rows.data or []) if _is_done(r.get("status"))]
         if len(ok_weeks) < 2:
             continue
 
         try:
             src_col = "bw_en" if _lang() == "en" else "bw_fr"
             weeks_text = "\n".join(
-                f"S{r['week_num']}: {r.get(src_col) or r.get('bw_fr') or r.get('ai_summary', '')}" for r in ok_weeks
+                f"S{r['week_num']}: {r.get(src_col) or r.get('bw_fr', '')}" for r in ok_weeks
             )
             article_count = sum(r["article_count"] for r in ok_weeks)
+            articles_related_count = sum(r.get("articles_related") or 0 for r in ok_weeks)
             summary = _llm_call(_pick(MONTH_CONDENSE_PROMPT, MONTH_CONDENSE_PROMPT_EN).format(
                 ticker=ticker,
                 label=_month_label(target_ym),
@@ -1809,11 +1880,13 @@ def run_monthly_calendaire(tickers: list[str] | None = None):
             ), max_tokens=500, item_id=ticker, cascade="monthly_prod")
 
             supa.table("breaks_monthly").upsert({
-                "ticker":        ticker,
-                "year_month":    target_ym,
-                _summary_col("breaks_monthly"):  summary,
-                "article_count": article_count,
-                "condensed_at":  datetime.now(timezone.utc).isoformat(),
+                "ticker":            ticker,
+                "year_month":        target_ym,
+                _summary_col("breaks_monthly"): summary,
+                "article_count":     article_count,
+                "articles_used":     article_count,
+                "articles_related":  articles_related_count,
+                "condensed_at":      datetime.now(timezone.utc).isoformat(),
             }).execute()
             logger.info(f"  ✓ Monthly calendaire {ticker} {target_ym}")
 
@@ -1889,7 +1962,7 @@ def get_or_gen_breaks_monthly_ondemand(ticker: str) -> str | None:
     supa = _get_supabase()
 
     rows = supa.table("breaks_weekly") \
-        .select("year_month, week_num, ai_summary, bw_en, bw_fr") \
+        .select("year_month, week_num, bw_en, bw_fr") \
         .eq("ticker", ticker) \
         .order("year_month", desc=True) \
         .order("week_num", desc=True) \
@@ -1903,7 +1976,7 @@ def get_or_gen_breaks_monthly_ondemand(ticker: str) -> str | None:
     src_col = "bw_en" if _lang() == "en" else "bw_fr"
     label = "the last 4 weeks" if _lang() == "en" else "ces 4 dernières semaines"
     weeks_text = "\n".join(
-        f"S{w['week_num']} {w['year_month']}: {w.get(src_col) or w.get('bw_fr') or w.get('ai_summary', '')}"
+        f"S{w['week_num']} {w['year_month']}: {w.get(src_col) or w.get('bw_fr', '')}"
         for w in reversed(weeks)
     )
 
@@ -1927,7 +2000,7 @@ MIN_M_SCRAP = 25   # seuil min articles par mois pour générer un M summary
 def scrap_gen_weekly(ticker: str, year_month: str, supa, caller: str = "scrap", cascade: str = "weekly_scrap") -> bool:
     """Génère le W breaker de la semaine courante si ≥ MIN_W_SCRAP articles.
 
-    N'écrase pas un summary existant (status=None = déjà généré → skip).
+    N'écrase pas un summary existant (done_more_10/done_less_10 → skip).
     Retourne True si généré.
     """
     today = date.today()
@@ -1940,7 +2013,7 @@ def scrap_gen_weekly(ticker: str, year_month: str, supa, caller: str = "scrap", 
         .eq("week_num", w) \
         .limit(1) \
         .execute()
-    if exists and exists.data and exists.data[0].get("status") is None:
+    if exists and exists.data and _is_done(exists.data[0].get("status")):
         return False
 
     row = supa.table("articles").select("articles").eq("ticker", ticker).eq("year_month", year_month).limit(1).execute()
@@ -1961,6 +2034,7 @@ def scrap_gen_weekly(ticker: str, year_month: str, supa, caller: str = "scrap", 
         }).execute()
         return False
 
+    status_val = "done_more_10"
     label = _week_label(year_month, w)
     articles_text = "\n".join(_article_text(a) for a in week_arts)
     try:
@@ -1968,13 +2042,16 @@ def scrap_gen_weekly(ticker: str, year_month: str, supa, caller: str = "scrap", 
             ticker=ticker, label=label, articles_text=articles_text,
         ), max_tokens=400, item_id=ticker, cascade=cascade)
         supa.table("breaks_weekly").upsert({
-            "ticker":        ticker,
-            "year_month":    year_month,
-            "week_num":      w,
+            "ticker":            ticker,
+            "year_month":        year_month,
+            "week_num":          w,
             _summary_col("breaks_weekly"): summary,
-            "article_count": len(week_arts),
-            _llm_source_col(): _llm_call._last_source,
-            "condensed_at":  datetime.now(timezone.utc).isoformat(),
+            "article_count":     len(week_arts),
+            "articles_used":     len(week_arts),
+            "articles_related":  _count_related(week_arts),
+            _llm_source_col():   _llm_call._last_source,
+            "condensed_at":      datetime.now(timezone.utc).isoformat(),
+            "status":            status_val,
         }).execute()
         src_counts: dict[str, int] = {}
         for a in week_arts:
@@ -1993,10 +2070,11 @@ def _gen_monthly_from_weeklies(ticker: str, year_month: str, week_rows: list[dic
     sc = _summary_col("breaks_monthly")
     src_col = "bw_en" if _lang() == "en" else "bw_fr"
     weeks_text = "\n".join(
-        f"W{r['week_num']}: {r.get(src_col) or r.get('bw_fr') or r.get('ai_summary', '')}"
+        f"W{r['week_num']}: {r.get(src_col) or r.get('bw_fr', '')}"
         for r in week_rows
     )
     article_count = sum(r.get("article_count", 0) for r in week_rows)
+    articles_related_count = sum(r.get("articles_related") or 0 for r in week_rows)
     label = _month_label(year_month)
     try:
         summary = _llm_call(
@@ -2006,13 +2084,15 @@ def _gen_monthly_from_weeklies(ticker: str, year_month: str, week_rows: list[dic
             max_tokens=500, item_id=ticker, cascade=cascade
         )
         supa.table("breaks_monthly").upsert({
-            "ticker":        ticker,
-            "year_month":    year_month,
-            sc:              summary,
-            "article_count": article_count,
-            _llm_source_col(): _llm_call._last_source,
-            "condensed_at":  datetime.now(timezone.utc).isoformat(),
-            "status":        None,
+            "ticker":            ticker,
+            "year_month":        year_month,
+            sc:                  summary,
+            "article_count":     article_count,
+            "articles_used":     article_count,
+            "articles_related":  articles_related_count,
+            _llm_source_col():   _llm_call._last_source,
+            "condensed_at":      datetime.now(timezone.utc).isoformat(),
+            "status":            "done_more_10",
         }).execute()
         src = _llm_call._last_source or "unknown"
         logger.info(f"  ✓ M weeklies {ticker} {year_month} ({len(week_rows)} W) [{src}]")
@@ -2026,7 +2106,7 @@ def scrap_gen_monthly(ticker: str, year_month: str, supa, caller: str = "scrap",
     """Génère le M breaker si ≥ MIN_M_SCRAP articles pour ce mois.
 
     Cascade : si fournie, utilisée directement. Sinon : monthly_scrap si is_fresh, sinon monthly_scrap_ext.
-    N'écrase pas un summary existant (status=None = déjà généré → skip).
+    N'écrase pas un summary existant (done_more_10/done_less_10 → skip).
     Retourne str=source LLM si généré, False sinon.
     """
     exists = supa.table("breaks_monthly") \
@@ -2035,17 +2115,17 @@ def scrap_gen_monthly(ticker: str, year_month: str, supa, caller: str = "scrap",
         .eq("year_month", year_month) \
         .limit(1) \
         .execute()
-    if exists and exists.data and exists.data[0].get("status") is None:
+    if exists and exists.data and _is_done(exists.data[0].get("status")):
         return False
 
-    # Chemin weeklies : >= 3 W status=null pour ce mois
+    # Chemin weeklies : >= 3 W done pour ce mois
     week_rows = supa.table("breaks_weekly") \
-        .select("week_num, bw_en, bw_fr, ai_summary, article_count, status") \
+        .select("week_num, bw_en, bw_fr, article_count, articles_related, status") \
         .eq("ticker", ticker) \
         .eq("year_month", year_month) \
         .order("week_num") \
         .execute()
-    ok_weeks = [r for r in (week_rows.data or []) if r.get("status") is None]
+    ok_weeks = [r for r in (week_rows.data or []) if _is_done(r.get("status"))]
     if len(ok_weeks) >= 3:
         return _gen_monthly_from_weeklies(ticker, year_month, ok_weeks, supa, cascade=cascade or "monthly_scrap")
 
@@ -2067,13 +2147,15 @@ def scrap_gen_monthly(ticker: str, year_month: str, supa, caller: str = "scrap",
             ticker=ticker, label=_month_label(year_month), weeks_text=articles_text,
         ), max_tokens=500, item_id=ticker, cascade=cascade)
         supa.table("breaks_monthly").upsert({
-            "ticker":        ticker,
-            "year_month":    year_month,
+            "ticker":            ticker,
+            "year_month":        year_month,
             _summary_col("breaks_monthly"): summary,
-            "article_count": len(all_arts),
-            _llm_source_col(): _llm_call._last_source,
-            "condensed_at":  datetime.now(timezone.utc).isoformat(),
-            "status":        None,
+            "article_count":     len(all_arts),
+            "articles_used":     len(all_arts),
+            "articles_related":  _count_related(all_arts),
+            _llm_source_col():   _llm_call._last_source,
+            "condensed_at":      datetime.now(timezone.utc).isoformat(),
+            "status":            "done_more_10",
         }).execute()
         src_counts: dict[str, int] = {}
         for a in all_arts:
@@ -2086,3 +2168,247 @@ def scrap_gen_monthly(ticker: str, year_month: str, supa, caller: str = "scrap",
     except Exception as e:
         logger.warning(f"  M scrap {ticker} {year_month}: {e}")
         return False
+
+
+# ─── T1 / T2 / T3 — scrapers P2 tiers ───────────────────────────────────────
+
+AV_DAILY_LIMIT = 25
+_av_daily_count: int = 0
+_av_last_reset_date: date | None = None
+
+
+def _is_t3_day() -> bool:
+    """True si aujourd'hui est le dernier jour du mois."""
+    today = date.today()
+    return today.day == monthrange(today.year, today.month)[1]
+
+
+def _article_count_this_week(ticker: str, supa) -> int:
+    """Compte les articles dans la semaine intra-mois courante (découpage W1-W4)."""
+    now = datetime.now(timezone.utc)
+    current_ym = now.strftime("%Y-%m")
+    current_wnum = _week_num(now.day)
+    row = supa.table("articles").select("articles") \
+        .eq("ticker", ticker).eq("year_month", current_ym).maybe_single().execute()
+    if not row or not row.data:
+        return 0
+    articles = row.data.get("articles") or []
+    return sum(
+        1 for a in articles
+        if _week_num(datetime.fromtimestamp(a.get("datetime", 0), tz=timezone.utc).day) == current_wnum
+    )
+
+
+def _mark_tried_source(ticker: str, ym: str, source: str, supa) -> None:
+    """Ajoute source dans tried_sources pour (ticker, ym). Crée la row si absente."""
+    resp = supa.table("articles").select("tried_sources") \
+        .eq("ticker", ticker).eq("year_month", ym).maybe_single().execute()
+    current = set((resp.data or {}).get("tried_sources") or []) if resp else set()
+    current.add(source)
+    ordered = sorted(current)
+    up = supa.table("articles").update({"tried_sources": ordered}) \
+        .eq("ticker", ticker).eq("year_month", ym).execute()
+    if not up.data:
+        supa.table("articles").insert({
+            "ticker": ticker, "year_month": ym,
+            "articles": [], "sources": [], "tried_sources": ordered,
+        }).execute()
+
+
+def _t1_enrich_ticker(ticker: str, current_ym: str, cname: str, supa,
+                      mx_token: str, newsapi_key: str, av_key: str,
+                      mx_budget: list, newsapi_budget: list) -> int:
+    """Tente d'enrichir un ticker 0-article. Retourne le nb d'articles ajoutés."""
+    global _av_daily_count
+
+    region = _detect_region(ticker)
+    query = _build_rss_query(ticker, cname)
+
+    tried_resp = supa.table("articles").select("tried_sources") \
+        .eq("ticker", ticker).eq("year_month", current_ym).maybe_single().execute()
+    tried = set((tried_resp.data or {}).get("tried_sources") or []) if tried_resp else set()
+
+    total_added = 0
+
+    if region in ("EU", "ASIA"):
+        if newsapi_key and newsapi_budget[0] > 0 and "newsapi" not in tried:
+            raw = _fetch_newsapi_month(query, current_ym, newsapi_key)
+            newsapi_budget[0] -= 1
+            _mark_tried_source(ticker, current_ym, "newsapi", supa)
+            if raw:
+                normalized = [_normalize_newsapi(a) for a in raw if a.get("title") and a.get("url")]
+                n, _ = _upsert_articles_merge(ticker, current_ym, normalized, "newsapi", supa)
+                total_added += n
+
+        if mx_token and mx_budget[0] > 0 and "marketaux" not in tried:
+            raw = _fetch_marketaux_month(query, current_ym, mx_token)
+            mx_budget[0] -= 1
+            _mark_tried_source(ticker, current_ym, "marketaux", supa)
+            if raw:
+                normalized = [_normalize_marketaux(a) for a in raw if a.get("title") and a.get("url")]
+                n, _ = _upsert_articles_merge(ticker, current_ym, normalized, "marketaux", supa)
+                total_added += n
+
+    elif region == "US":
+        if av_key and _av_daily_count < AV_DAILY_LIMIT and "av" not in tried:
+            raw = _fetch_av_month(ticker, current_ym, av_key)
+            _av_daily_count += 1
+            _mark_tried_source(ticker, current_ym, "av", supa)
+            if raw:
+                normalized = [_normalize_av(a) for a in raw if a.get("title") and a.get("url")]
+                n, _ = _upsert_articles_merge(ticker, current_ym, normalized, "alphavantage", supa)
+                total_added += n
+
+    return total_added
+
+
+def t1_p2_scrap() -> dict[str, int]:
+    """
+    Cron */6h :55 — enrichit les tickers pinnés avec 0 articles ce mois.
+    EU+ASIA : NewsAPI + Marketaux. US : Alpha Vantage (budget 25 req/j).
+    Idempotent via tried_sources. Budget cap : 20 NewsAPI + 20 Marketaux par run.
+    """
+    global _av_daily_count, _av_last_reset_date
+
+    today = date.today()
+    if _av_last_reset_date != today:
+        _av_daily_count = 0
+        _av_last_reset_date = today
+
+    supa = _get_supabase()
+    current_ym = today.strftime("%Y-%m")
+
+    eligible = _get_eligible_tickers(supa, min_users=1)
+    if not eligible:
+        return {}
+
+    zero_art = [t for t in eligible if _current_article_count(t, current_ym, supa) == 0]
+    if not zero_art:
+        logger.info("T1: aucun ticker à 0 articles")
+        return {}
+
+    logger.info(f"T1: {len(zero_art)} tickers à 0 articles")
+
+    mx_token = os.environ.get("MARKETAUX_API_TOKEN", "")
+    newsapi_key = os.environ.get("NEWSAPI_API_KEY", "")
+    av_key = os.environ.get("ALPHAVANTAGE_API_KEY", "")
+    company_names = _bulk_fetch_company_names(zero_art)
+
+    mx_budget = [20]
+    newsapi_budget = [20]
+    results: dict[str, int] = {}
+
+    for ticker in zero_art:
+        if mx_budget[0] <= 0 and newsapi_budget[0] <= 0 and _av_daily_count >= AV_DAILY_LIMIT:
+            logger.info("T1: tous les budgets épuisés")
+            break
+        try:
+            added = _t1_enrich_ticker(ticker, current_ym, company_names.get(ticker, ""),
+                                       supa, mx_token, newsapi_key, av_key, mx_budget, newsapi_budget)
+            if added > 0:
+                results[ticker] = added
+                try:
+                    from services.overview_service import gen_dumb
+                    gen_dumb(ticker, cascade="dumb_prod")
+                    supa.table("ow_cache").update({"needs_ow_regen": True}).eq("ticker", ticker).execute()
+                except Exception as e:
+                    logger.warning(f"  T1 DUMB+flag {ticker}: {e}")
+            logger.info(f"  T1 {ticker} ({_detect_region(ticker)}): +{added}")
+        except Exception as e:
+            logger.error(f"  ✗ T1 {ticker}: {e}")
+
+    logger.info(f"T1: {len(results)} tickers enrichis | AV {_av_daily_count}/{AV_DAILY_LIMIT} | mx_budget={mx_budget[0]} newsapi_budget={newsapi_budget[0]}")
+    return results
+
+
+def t2_w_threshold_scrap() -> dict[str, int]:
+    """
+    Cron dim 22h — enrichit les tickers pinnés avec < 10 articles cette semaine.
+    Skip si c'est le dernier jour du mois (T3 prend le relais).
+    Cascade : RSS → NewsAPI → Marketaux → AV. Idempotent via tried_sources.
+    """
+    if _is_t3_day():
+        logger.info("T2: dernier jour du mois — skip (T3 couvre)")
+        return {}
+
+    supa = _get_supabase()
+    eligible = _get_eligible_tickers(supa, min_users=1)
+    if not eligible:
+        return {}
+
+    W_THRESHOLD = 10
+    targets = [t for t in eligible if _article_count_this_week(t, supa) < W_THRESHOLD]
+    if not targets:
+        logger.info("T2: tous les tickers au-dessus du seuil W")
+        return {}
+
+    logger.info(f"T2: {len(targets)} tickers sous seuil W ({W_THRESHOLD})")
+
+    today = date.today()
+    current_ym = today.strftime("%Y-%m")
+    company_names = _bulk_fetch_company_names(targets)
+    mx_token = os.environ.get("MARKETAUX_API_TOKEN", "")
+    newsapi_key = os.environ.get("NEWSAPI_API_KEY", "")
+    av_key = os.environ.get("ALPHAVANTAGE_API_KEY", "")
+
+    results: dict[str, int] = {}
+    for ticker in targets:
+        try:
+            added = scrap_ext_sources(ticker, current_ym, supa, company_names.get(ticker, ""))
+            if added > 0:
+                results[ticker] = added
+                try:
+                    from services.overview_service import gen_dumb
+                    gen_dumb(ticker, cascade="dumb_prod")
+                    supa.table("ow_cache").update({"needs_ow_regen": True}).eq("ticker", ticker).execute()
+                except Exception as e:
+                    logger.warning(f"  T2 DUMB+flag {ticker}: {e}")
+            logger.info(f"  T2 {ticker}: +{added}")
+        except Exception as e:
+            logger.error(f"  ✗ T2 {ticker}: {e}")
+
+    logger.info(f"T2: {len(results)} tickers enrichis")
+    return results
+
+
+def t3_m_threshold_scrap() -> dict[str, int]:
+    """
+    Cron dernier jour du mois 23h — enrichit les tickers pinnés avec < 25 articles ce mois.
+    Cascade : RSS → NewsAPI → Marketaux → AV. Idempotent via tried_sources.
+    """
+    supa = _get_supabase()
+    eligible = _get_eligible_tickers(supa, min_users=1)
+    if not eligible:
+        return {}
+
+    M_THRESHOLD = 25
+    today = date.today()
+    current_ym = today.strftime("%Y-%m")
+
+    targets = [t for t in eligible if _current_article_count(t, current_ym, supa) < M_THRESHOLD]
+    if not targets:
+        logger.info("T3: tous les tickers au-dessus du seuil M")
+        return {}
+
+    logger.info(f"T3: {len(targets)} tickers sous seuil M ({M_THRESHOLD})")
+
+    company_names = _bulk_fetch_company_names(targets)
+    results: dict[str, int] = {}
+
+    for ticker in targets:
+        try:
+            added = scrap_ext_sources(ticker, current_ym, supa, company_names.get(ticker, ""))
+            if added > 0:
+                results[ticker] = added
+                try:
+                    from services.overview_service import gen_dumb
+                    gen_dumb(ticker, cascade="dumb_prod")
+                    supa.table("ow_cache").update({"needs_ow_regen": True}).eq("ticker", ticker).execute()
+                except Exception as e:
+                    logger.warning(f"  T3 DUMB+flag {ticker}: {e}")
+            logger.info(f"  T3 {ticker}: +{added}")
+        except Exception as e:
+            logger.error(f"  ✗ T3 {ticker}: {e}")
+
+    logger.info(f"T3: {len(results)} tickers enrichis")
+    return results

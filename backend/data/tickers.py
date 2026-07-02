@@ -7,11 +7,11 @@ US = [
     # Mega cap tech
     "AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA","AVGO","ORCL","AMD",
     "QCOM","TXN","AMAT","LRCX","KLAC","MCHP","SNPS","CDNS","ADI","MU",
-    "INTC","ARM","PANW","CRWD","FTNT","ZS","NET","OKTA","DDOG","SNOW",
-    "NOW","CRM","INTU","ADBE","WDAY","TEAM","MDB","HUBS","SPLK","VEEV",
+    "INTC","ARM","CSCO","PANW","CRWD","FTNT","ZS","NET","OKTA","DDOG","SNOW",
+    "NOW","CRM","INTU","ADBE","WDAY","TEAM","MDB","HUBS","VEEV",
     # Finance
     "JPM","BAC","WFC","GS","MS","C","USB","PNC","TFC","COF",
-    "AXP","V","MA","PYPL","SQ","COIN","SCHW","BLK","BX","KKR",
+    "AXP","V","MA","PYPL","XYZ","COIN","SCHW","BLK","BX","KKR",
     "APO","ARES","ICE","CME","NDAQ","SPGI","MCO","MSCI","FDS","BR",
     # Santé
     "LLY","UNH","JNJ","ABBV","MRK","PFE","BMY","AMGN","GILD","REGN",
@@ -20,54 +20,54 @@ US = [
     # Conso
     "WMT","COST","TGT","AMZN","HD","LOW","TJX","ROST","DLTR","DG",
     "MCD","SBUX","CMG","YUM","DPZ","QSR","DNUT","SHAK","TXRH","CAKE",
-    "PG","KO","PEP","PM","MO","MDLZ","GIS","K","CPB","SJM",
-    "CL","CHD","EL","COTY","REV","SPB","HRL","TSN","CAG","LW",
+    "PG","KO","PEP","PM","MO","MDLZ","GIS","CPB","SJM",
+    "CL","CHD","EL","COTY","SPB","HRL","TSN","CAG","LW",
     # Energie
     "XOM","CVX","COP","EOG","DVN","HAL","SLB","BKR",
     "OXY","MPC","PSX","VLO","FANG","CTRA","APA","AR","EQT","RRC",
     # Industriels
-    "GE","BA","RTX","LMT","NOC","GD","HII","TDG","HWM","SPR",
+    "GE","BA","RTX","LMT","NOC","GD","HII","TDG","HWM",
     "CAT","DE","HON","ETN","EMR","ROK","PH","ITW","CARR","OTIS",
     "UPS","FDX","CHRW","EXPD","JBHT","XPO","ODFL","SAIA","NSC","UNP",
     # Immobilier/Utilities
     "NEE","DUK","SO","AEP","EXC","SRE","D","PCG","XEL","ES",
     "AMT","PLD","EQIX","DLR","SPG","O","WY","PSA","AVB","EQR",
     # Divers
-    "BKNG","ABNB","UBER","LYFT","DASH","EXPE","TRIP","MKTS","MGM","LVS",
-    "NFLX","DIS","CMCSA","PARA","WBD","FOXA","NYT","IAC","MTCH","PINS",
+    "BKNG","ABNB","UBER","LYFT","DASH","EXPE","TRIP","MGM","LVS",
+    "NFLX","DIS","CMCSA","WBD","FOXA","NYT","IAC","MTCH","PINS",
     "SPOT","RBLX","U","DKNG","PENN","CHTR","TMUS","VZ","T","LUMN",
-    "NEM","FCX","AA","CLF","NUE","STLD","X","RS","CMC","MP",
+    "NEM","FCX","AA","CLF","NUE","STLD","RS","CMC","MP",
     "LIN","APD","DD","DOW","PPG","SHW","ECL","IFF","RPM","FMC",
 ]
 
 EU = [
     # France — Euronext Paris (.PA)
     "MC.PA","TTE.PA","SAN.PA","AIR.PA","OR.PA","BNP.PA","DG.PA","SU.PA",
-    "AI.PA","RI.PA","CAP.PA","DSY.PA","VIE.PA","KER.PA","GLE.PA","AXA.PA",
+    "AI.PA","RI.PA","CAP.PA","DSY.PA","VIE.PA","KER.PA","GLE.PA",
     "ORA.PA","SAF.PA","HO.PA","LR.PA","CS.PA","EN.PA","ML.PA","SGO.PA",
-    "SG.PA","CA.PA","UG.PA","AC.PA","RNO.PA","PUB.PA","TEP.PA","EDEN.PA",
-    "FP.PA","ENGI.PA","DBV.PA","STMPA.PA","VK.PA","ERF.PA","BON.PA","TCFP.PA",
+    "CA.PA","AC.PA","RNO.PA","PUB.PA","TEP.PA","EDEN.PA",
+    "ENGI.PA","DBV.PA","STMPA.PA","VK.PA","ERF.PA","BON.PA","EL.PA","URW.PA",
     # Allemagne — Xetra (.DE)
     "SAP.DE","SIE.DE","ALV.DE","DTE.DE","BAYN.DE","BMW.DE","MBG.DE","BAS.DE",
     "MUV2.DE","VOW3.DE","IFX.DE","ADS.DE","RWE.DE","DBK.DE","CON.DE","EOAN.DE",
     "FME.DE","FRE.DE","MTX.DE","HEI.DE","MRK.DE","HEN3.DE","VNA.DE","DHL.DE",
-    "ENR.DE","BOSS.DE","WDI.DE","SHL.DE","AIR.DE","1COV.DE","DHER.DE","PSM.DE",
-    "SY1.DE","NDX1.DE","BCMB.DE","EVD.DE","DWS.DE","GFJ.DE","KNEBV.DE","RAA.DE",
+    "ENR.DE","BOSS.DE","SHL.DE","AIR.DE","DHER.DE","PSM.DE",
+    "SY1.DE","NDX1.DE","EVD.DE","DWS.DE","RAA.DE",
     # Royaume-Uni — LSE (.L)
     "SHEL.L","AZN.L","HSBA.L","ULVR.L","BP.L","GSK.L","RIO.L","DGE.L",
     "BATS.L","REL.L","BHP.L","PRU.L","LSEG.L","AAL.L","GLEN.L","NXT.L",
-    "III.L","SSE.L","BARC.L","LLOY.L","RB.L","IMB.L","AHT.L","CRH.L",
-    "ANTO.L","EXPN.L","FLTR.L","MXCT.L","SGRO.L","KGF.L","WTB.L","AUTO.L",
+    "III.L","SSE.L","BARC.L","LLOY.L","RKT.L","IMB.L","CRH.L",
+    "ANTO.L","EXPN.L","FLTR.L","SGRO.L","KGF.L","WTB.L","AUTO.L",
     "OCDO.L","MNG.L","NWG.L","STAN.L","VOD.L","BT-A.L","SKG.L","MNDI.L",
     # Pays-Bas — Euronext Amsterdam (.AS)
-    "ASML.AS","HEIA.AS","RAND.AS","NN.AS","PHIA.AS","URW.AS","ABN.AS","INGA.AS",
-    "MT.AS","AEX.AS","DSM.AS","AKZA.AS","WKL.AS","AGN.AS","TKWY.AS","BESI.AS",
+    "ASML.AS","HEIA.AS","RAND.AS","NN.AS","PHIA.AS","ABN.AS","INGA.AS",
+    "MT.AS","AKZA.AS","WKL.AS","AGN.AS","BESI.AS",
     # Suisse — SIX (.SW)
-    "NESN.SW","ROG.SW","NOVN.SW","CFR.SW","UBSG.SW","ZURN.SW","CSGN.SW","SREN.SW",
-    "ABBN.SW","GIVN.SW","GEBN.SW","BALN.SW","LONN.SW","SIKA.SW","SLHN.SW","SCMN.SW",
+    "NESN.SW","RO.SW","NOVN.SW","CFR.SW","UBSG.SW","ZURN.SW","SREN.SW",
+    "ABBN.SW","GIVN.SW","GEBN.SW","LONN.SW","SIKA.SW","SLHN.SW","SCMN.SW",
     # Italie — Borsa Italiana (.MI)
-    "ENI.MI","ENEL.MI","ISP.MI","UCG.MI","TIT.MI","LUX.MI","MB.MI","ATL.MI",
-    "PRY.MI","PST.MI","AMP.MI","BAMI.MI","SRG.MI","FCA.MI","IF.MI","RACE.MI",
+    "ENI.MI","ENEL.MI","ISP.MI","UCG.MI","TIT.MI","MB.MI",
+    "PRY.MI","PST.MI","AMP.MI","BAMI.MI","SRG.MI","IF.MI","RACE.MI",
     # Espagne — BME (.MC)
     "SAN.MC","BBVA.MC","IBE.MC","TEF.MC","ITX.MC","REP.MC","AMS.MC","CLNX.MC",
     "ENG.MC","FER.MC","ACS.MC","MEL.MC","GRF.MC","ACX.MC","COL.MC","VIS.MC",
@@ -79,11 +79,11 @@ EU = [
     # Finlande — Nasdaq Helsinki (.HE)
     "NOKIA.HE","FORTUM.HE","NESTE.HE","KNEBV.HE","STERV.HE","UPM.HE","WRT1V.HE",
     # Belgique (.BR)
-    "AB-INBEV.BR","UCB.BR","KBC.BR","SOLB.BR","GBL.BR","ACKB.BR","ABI.BR",
+    "ABI.BR","UCB.BR","KBC.BR","SOLB.BR","GBLB.BR","ACKB.BR",
     # Portugal (.LS)
     "EDP.LS","GALP.LS","BCP.LS","EGL.LS","SEM.LS",
     # Irlande (.IR)
-    "CRH.IR","AIRP.IR","BHVN.IR","KRZ.IR","AIB.IR",
+    "KRZ.IR",
 ]
 
 ASIA = [

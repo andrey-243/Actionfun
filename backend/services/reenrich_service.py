@@ -169,7 +169,7 @@ def _reenrich_break_monthly_groq_to_better(supa) -> tuple[bool, int]:
                 .order("week_num")
                 .execute()
             )
-            ok_weeks = [r for r in (week_rows.data or []) if r.get("status") is None]
+            ok_weeks = [r for r in (week_rows.data or []) if r.get("status") in ("done_more_10", "done_less_10")]
             if len(ok_weeks) < 2:
                 continue
             weeks_text = "\n".join(
