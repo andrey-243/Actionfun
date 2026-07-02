@@ -125,6 +125,17 @@ def _supa():
     return create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
+def _in_chunks(supa, table: str, select: str, tickers: list[str], filter_fn, chunk_size: int = 100) -> list[dict]:
+    """Query chunked by ticker to avoid PostgREST URL limit (>2000 chars with 250 tickers)."""
+    result: list[dict] = []
+    for i in range(0, len(tickers), chunk_size):
+        chunk = tickers[i:i + chunk_size]
+        q = supa.table(table).select(select).in_("ticker", chunk)
+        r = filter_fn(q).execute()
+        result.extend(r.data or [])
+    return result
+
+
 # ─── Finnhub fetch ────────────────────────────────────────────────────────────
 
 def fetch_finnhub_12months(ticker: str) -> tuple[list[dict], bool]:
@@ -147,8 +158,10 @@ def fetch_finnhub_12months(ticker: str) -> tuple[list[dict], bool]:
         if not isinstance(raw, list):
             return [], False
 
+        from services.articles_store import _article_id
         articles = [
             {
+                "id":       _article_id(a["url"]),
                 "headline": a["headline"],
                 "source":   a["source"],
                 "url":      a["url"],
@@ -167,6 +180,7 @@ def fetch_finnhub_12months(ticker: str) -> tuple[list[dict], bool]:
 
 def fetch_yahoo_news(ticker: str) -> list[dict]:
     """Récupère les articles récents Yahoo Finance."""
+    from services.articles_store import _article_id
     try:
         t = yf.Ticker(ticker)
         raw = t.get_news(count=100)
@@ -182,6 +196,7 @@ def fetch_yahoo_news(ticker: str) -> list[dict]:
             if not url or not c.get("title"):
                 continue
             articles.append({
+                "id":       _article_id(url),
                 "headline": c.get("title", ""),
                 "source":   c.get("provider", {}).get("displayName", "Yahoo Finance"),
                 "url":      url,
@@ -249,8 +264,8 @@ def phase_scrape(tickers: list[str], region: str = "all"):
     current_ym = date.today().strftime("%Y-%m")
 
     # Skip tickers qui ont déjà des articles pour le mois courant
-    r = supa.table("articles").select("ticker").in_("ticker", tickers).eq("year_month", current_ym).execute()
-    done = {row["ticker"] for row in (r.data or [])}
+    rows = _in_chunks(supa, "articles", "ticker", tickers, lambda q: q.eq("year_month", current_ym))
+    done = {row["ticker"] for row in rows}
     todo = [t for t in tickers if t not in done]
     total = len(todo)
     logger.info(f"SCRAPE: {total} tickers à traiter ({len(done)} déjà en DB pour {current_ym})")
@@ -323,8 +338,8 @@ def phase_enrich(tickers: list[str], region: str = "all"):
 
     supa = _supa()
     # Skip tickers qui ont déjà un OW EN en cache
-    r = supa.table("ow_cache").select("ticker").in_("ticker", tickers).not_.is_("ow7d_en", "null").execute()
-    done = {row["ticker"] for row in (r.data or [])}
+    rows = _in_chunks(supa, "ow_cache", "ticker", tickers, lambda q: q.not_.is_("ow7d_en", "null"))
+    done = {row["ticker"] for row in rows}
     todo = [t for t in tickers if t not in done]
     total = len(todo)
 
@@ -428,7 +443,7 @@ def _detect_peaks_valleys(closes: list[float], window: int, max_dots: int) -> li
 
 
 def phase_bubbles(tickers: list[str], region: str = "all", empty_only: bool = False,
-                  cleanup: bool = False, force: bool = False):
+                  cleanup: bool = False, force: bool = False, cascade: str = "zen"):
     """
     Pré-génère event_causes pour les dots 6M+1Y de chaque ticker.
     empty_only : tickers ayant ≥1 bub_en NULL en DB.
@@ -439,21 +454,26 @@ def phase_bubbles(tickers: list[str], region: str = "all", empty_only: bool = Fa
     supa = _supa()
     lang_col = "bub_en" if os.environ.get("LLM_LANG", "en") == "en" else "bub_fr"
 
+    def _query_bub_cache(ticker_list: list[str], extra_filter) -> set[str]:
+        """Requête bub_cache en chunks de 100 pour éviter la limite URL PostgREST."""
+        result: set[str] = set()
+        for i in range(0, len(ticker_list), 100):
+            chunk = ticker_list[i:i + 100]
+            q = supa.table("bub_cache").select("ticker").in_("ticker", chunk)
+            r = extra_filter(q).limit(10000).execute()
+            result.update(row["ticker"] for row in (r.data or []))
+        return result
+
     if force:
-        # Tickers qui ont au moins un dot en bub_cache
-        r = supa.table("bub_cache").select("ticker").in_("ticker", tickers).execute()
-        tickers_with_dots = list({row["ticker"] for row in (r.data or [])})
+        tickers_with_dots = _query_bub_cache(tickers, lambda q: q)
         todo = [t for t in tickers if t in tickers_with_dots]
         logger.info(f"BUBBLES force: {len(todo)} tickers avec dots en bub_cache")
     elif empty_only:
-        r = supa.table("bub_cache").select("ticker").in_("ticker", tickers).is_(lang_col, "null").execute()
-        tickers_with_empty = list({row["ticker"] for row in (r.data or [])})
+        tickers_with_empty = _query_bub_cache(tickers, lambda q: q.is_(lang_col, "null"))
         todo = [t for t in tickers if t in tickers_with_empty]
         logger.info(f"BUBBLES empty-only: {len(todo)} tickers avec ≥1 {lang_col} NULL")
     else:
-        # Skip tickers dont tous les dots ont déjà une cause en DB
-        r = supa.table("bub_cache").select("ticker").in_("ticker", tickers).not_.is_(lang_col, "null").execute()
-        done = {row["ticker"] for row in (r.data or [])}
+        done = _query_bub_cache(tickers, lambda q: q.not_.is_(lang_col, "null"))
         todo = [t for t in tickers if t not in done]
         logger.info(f"BUBBLES: {len(todo)} tickers à traiter ({len(done)} déjà complets en DB)")
     total = len(todo)
@@ -550,6 +570,9 @@ def phase_bubbles(tickers: list[str], region: str = "all", empty_only: bool = Fa
             n_already_cached = sum(1 for dt, _, _ in all_dots if cache_by_date.get(dt, {}).get(lang_col))
             logger.info(f"  {ticker} — {len(all_dots)} dots · {n_already_cached}/{len(all_dots)} cached")
 
+            if n_already_cached == len(all_dots) and all_dots and not force:
+                return {"ticker": ticker, "events": 0, "total": 0, "skipped": [], "cached": len(all_dots), "llm_sources": {}, "detected_dates": set(), "win_counts": {}}
+
         n_dots = len(all_dots)
         for dot_idx, (dt, change_pct, windows) in enumerate(all_dots, 1):
             sign = "+" if change_pct >= 0 else ""
@@ -557,7 +580,7 @@ def phase_bubbles(tickers: list[str], region: str = "all", empty_only: bool = Fa
             win_tag = ",".join(sorted(windows)) if windows else "?"
             cached_row = cache_by_date.get(dt)
             try:
-                res = get_or_gen_bub(ticker, dt, change_pct, cascade="zen",
+                res = get_or_gen_bub(ticker, dt, change_pct, cascade=cascade,
                                      prefetched_cache=cached_row, force_regen=force, **win_flags)
                 if not res.get("articles") and not res.get("cause"):
                     t_skipped.append(dt)
@@ -577,8 +600,12 @@ def phase_bubbles(tickers: list[str], region: str = "all", empty_only: bool = Fa
                     logger.warning(f"  {ticker} [bub {dot_idx}/{n_dots}] {dt} {sign}{change_pct:.1f}% → ✗ LLM failed ({llm})")
                 if llm:
                     time.sleep(0.5)
+                elif cascade == "zen" and not res.get("cause"):
+                    time.sleep(8)
             except Exception as e:
                 logger.warning(f"  {ticker} [bub {dot_idx}/{n_dots}] {dt} {sign}{change_pct:.1f}% → ✗ {e}")
+                if cascade == "zen":
+                    time.sleep(8)
 
         return {
             "ticker": ticker, "events": t_events, "total": t_total, "skipped": t_skipped,
@@ -685,15 +712,13 @@ def phase_translate_fr(tickers: list[str], region: str = "all"):
     supa = _supa()
 
     # ── BUBBLES (event_causes) ─────────────────────────────────────────────────
-    cause_rows = supa.table("bub_cache") \
-        .select("ticker, date, bub_en") \
-        .in_("ticker", tickers) \
-        .not_.is_("bub_en", "null") \
-        .is_("bub_fr", "null") \
-        .execute()
+    from services.bubble_service import BUB_NO_ARTICLES as _BUB_NO_ARTICLES
+    cause_rows_data = _in_chunks(supa, "bub_cache", "ticker, date, bub_en", tickers,
+                                  lambda q: q.not_.is_("bub_en", "null").is_("bub_fr", "null"))
+    cause_rows_data = [r for r in cause_rows_data if r.get("bub_en") not in ("", _BUB_NO_ARTICLES)]
 
     causes_by_ticker: dict[str, list[dict]] = {}
-    for r in (cause_rows.data or []):
+    for r in cause_rows_data:
         causes_by_ticker.setdefault(r["ticker"], []).append(r)
 
     total_bub = sum(len(v) for v in causes_by_ticker.values())
@@ -738,13 +763,8 @@ def phase_translate_fr(tickers: list[str], region: str = "all"):
         ("breaks_monthly", ["year_month"],             "ai_summary", "bm_fr"),
         ("breaks_yearly",  ["year"],                   "ai_summary", "by_fr"),
     ]:
-        rows = supa.table(table) \
-            .select(", ".join(["ticker"] + pk_fields + [en_field])) \
-            .in_("ticker", tickers) \
-            .not_.is_(en_field, "null") \
-            .is_(fr_field, "null") \
-            .execute()
-        todo_breaks = rows.data or []
+        todo_breaks = _in_chunks(supa, table, ", ".join(["ticker"] + pk_fields + [en_field]), tickers,
+                                  lambda q, ef=en_field, ff=fr_field: q.not_.is_(ef, "null").is_(ff, "null"))
         logger.info(f"TRANSLATE-FR {table}: {len(todo_breaks)} lignes à traduire")
         if not todo_breaks:
             continue
@@ -780,13 +800,10 @@ def phase_translate_fr_dumb(tickers: list[str], region: str = "all"):
 
     supa = _supa()
 
-    rows = supa.table("ow_cache") \
-        .select("ticker, news_raw") \
-        .in_("ticker", tickers) \
-        .not_.is_("news_raw", "null") \
-        .execute()
+    rows_data = _in_chunks(supa, "ow_cache", "ticker, news_raw", tickers,
+                            lambda q: q.not_.is_("news_raw", "null"))
 
-    todo = [r for r in (rows.data or []) if r.get("news_raw")]
+    todo = [r for r in rows_data if r.get("news_raw")]
     total = len(todo)
     logger.info(f"TRANSLATE-FR DUMB: {total} tickers à traiter")
 
@@ -863,6 +880,8 @@ def main():
                         help="Bubbles : régénère toutes les causes existantes dans bub_cache")
     parser.add_argument("--cleanup", action="store_true",
                         help="Bubbles : supprime les rows bub_cache orphelines après le run")
+    parser.add_argument("--cascade", type=str, default=None,
+                        help="Cascade LLM à utiliser (zen, promo, bub_batch…). Override le défaut hardcodé.")
     args = parser.parse_args()
 
     if args.lang:
@@ -896,7 +915,7 @@ def main():
 
     if args.phase == "bubbles":
         phase_bubbles(tickers, region=args.region, empty_only=args.empty_only,
-                      cleanup=args.cleanup, force=args.force)
+                      cleanup=args.cleanup, force=args.force, cascade=args.cascade)
 
 
 if __name__ == "__main__":

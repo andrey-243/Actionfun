@@ -171,14 +171,16 @@ def _fetch_finnhub(ticker: str, days: int) -> list[dict]:
     if not isinstance(raw, list):
         return []
 
+    from services.articles_store import _article_id
     return [
         {
+            "id":       _article_id(a["url"]),
             "headline": a["headline"],
-            "source": a["source"],
-            "url": a["url"],
+            "source":   a["source"],
+            "url":      a["url"],
             "datetime": a["datetime"],
-            "summary": a.get("summary", ""),
-            "image": a.get("image", ""),
+            "summary":  a.get("summary", ""),
+            "image":    a.get("image", ""),
         }
         for a in raw
         if a.get("headline") and a.get("url")
@@ -208,7 +210,7 @@ def _store_articles(ticker: str, articles: list[dict]):
             "ticker": ticker,
             "year_month": ym,
             "articles": merged,
-            "source": "finnhub",
+            "sources": ["finnhub"],
             "cached_at": datetime.now(timezone.utc).isoformat(),
         }).execute()
 
@@ -253,7 +255,7 @@ def _condense(ticker: str, phase: str):
 
         for wnum, week_articles in by_week.items():
             exists = supa.table("breaks_weekly").select("week_num, status").eq("ticker", ticker).eq("year_month", ym).eq("week_num", wnum).maybe_single().execute()
-            if exists and exists.data and exists.data.get("status") is None:
+            if exists and exists.data and exists.data.get("status") in ("done_more_10", "done_less_10"):
                 continue
             articles_text = "\n".join(f"- {a['headline']}" for a in week_articles[:30])
             label = _week_label(ym, wnum)
@@ -262,7 +264,7 @@ def _condense(ticker: str, phase: str):
                 top_articles = sorted(week_articles, key=lambda a: len(a.get("summary", "")), reverse=True)[:10]
                 supa.table("breaks_weekly").upsert({
                     "ticker": ticker, "year_month": ym, "week_num": wnum,
-                    "ai_summary": summary, "bw_en": summary,
+                    "bw_en": summary,
                     "top_articles": top_articles, "article_count": len(week_articles),
                     "condensed_at": datetime.now(timezone.utc).isoformat(),
                 }).execute()
@@ -277,19 +279,19 @@ def _condense(ticker: str, phase: str):
     if phase in ("6m", "1y"):
         for ym in months_to_condense:
             exists = supa.table("breaks_monthly").select("year_month, status").eq("ticker", ticker).eq("year_month", ym).maybe_single().execute()
-            if exists and exists.data and exists.data.get("status") is None:
+            if exists and exists.data and exists.data.get("status") in ("done_more_10", "done_less_10"):
                 continue
-            week_rows = supa.table("breaks_weekly").select("week_num, bw_en, ai_summary, article_count, status").eq("ticker", ticker).eq("year_month", ym).order("week_num").execute()
-            ok_weeks = [r for r in (week_rows.data or []) if r.get("status") is None]
+            week_rows = supa.table("breaks_weekly").select("week_num, bw_en, article_count, status").eq("ticker", ticker).eq("year_month", ym).order("week_num").execute()
+            ok_weeks = [r for r in (week_rows.data or []) if r.get("status") in ("done_more_10", "done_less_10")]
             if len(ok_weeks) < 2:
                 continue
-            weeks_text = "\n".join(f"W{r['week_num']}: {r.get('bw_en') or r.get('ai_summary', '')}" for r in ok_weeks)
+            weeks_text = "\n".join(f"W{r['week_num']}: {r.get('bw_en', '')}" for r in ok_weeks)
             article_count = sum(r.get("article_count", 0) for r in ok_weeks)
             try:
                 summary = _llm_call(MONTH_CONDENSE_PROMPT_EN.format(ticker=ticker, label=_month_label(ym), weeks_text=weeks_text), max_tokens=500, cascade="monthly_prod")
                 supa.table("breaks_monthly").upsert({
                     "ticker": ticker, "year_month": ym,
-                    "ai_summary": summary, "bm_en": summary,
+                    "bm_en": summary,
                     "article_count": article_count,
                     "condensed_at": datetime.now(timezone.utc).isoformat(),
                 }).execute()

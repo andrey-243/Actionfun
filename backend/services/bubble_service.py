@@ -13,6 +13,10 @@ from datetime import datetime, timedelta, timezone
 from supabase import create_client
 from services.llm_service import llm_text
 
+# Sentinel écrit dans bub_en/bub_fr quand aucun article n'existe pour ce dot.
+# Empêche les retry infinis. Effacé automatiquement si P2 passe sur ce ticker/mois.
+BUB_NO_ARTICLES = "NO_ARTICLES"
+
 GROQ_LIGHT = "llama-3.1-8b-instant"
 
 BENCHMARK_BY_EXCHANGE = {
@@ -93,11 +97,11 @@ def get_or_gen_bub(ticker: str, date: str, change_pct: float = 0.0, cascade: str
                    prefetched_cache: dict | None = None,
                    in_1w: bool | None = None, in_1m: bool | None = None,
                    in_6m: bool | None = None, in_1y: bool | None = None,
-                   force_regen: bool = False) -> dict:
+                   force_regen: bool = False, lang: str | None = None) -> dict:
     ticker = ticker.upper()
     supa = _get_supabase()
 
-    lang = os.environ.get("LLM_LANG", "en")
+    lang = lang or os.environ.get("LLM_LANG", "en")
     cause_field = "bub_en" if lang == "en" else "bub_fr"
 
     # Cache : pre-fetché par le batch ou SELECT individuel
@@ -111,6 +115,26 @@ def get_or_gen_bub(ticker: str, date: str, change_pct: float = 0.0, cascade: str
             .maybe_single() \
             .execute()
         cached = row.data if row else None
+
+    # Court-circuit : si cause déjà en cache, pas besoin de fetcher les articles
+    if cached and not force_regen:
+        cause = cached.get(cause_field)
+        is_fallback = False
+        if cause == BUB_NO_ARTICLES:
+            return {"date": date, "articles": [], "cause": None, "llm_source": None, "is_fallback": False}
+        if not cause and lang == "fr":
+            fallback = cached.get("bub_en")
+            if fallback and fallback != BUB_NO_ARTICLES:
+                cause = fallback
+                is_fallback = True
+        if cause:
+            needs_update: dict = {}
+            for col, val in [("in_1w", in_1w), ("in_1m", in_1m), ("in_6m", in_6m), ("in_1y", in_1y)]:
+                if val is not None and cached.get(col) != val:
+                    needs_update[col] = val
+            if needs_update:
+                supa.table("bub_cache").update(needs_update).eq("ticker", ticker).eq("date", date).execute()
+            return {"date": date, "articles": [], "cause": cause, "llm_source": None, "is_fallback": is_fallback}
 
     # Toujours fetcher les articles depuis articles table (bub_cache.articles supprimé)
     dt = datetime.fromisoformat(date[:10])
@@ -137,7 +161,10 @@ def get_or_gen_bub(ticker: str, date: str, change_pct: float = 0.0, cascade: str
             .execute()
         if r and r.data and r.data.get("articles"):
             ym_articles = r.data["articles"]
-            if _turso_enabled and ym_articles and not ym_articles[0].get("summary"):
+            # Gate Turso : déclenché si summary OU url absent (Phase 1 ou Phase 2 migrés)
+            first = ym_articles[0] if ym_articles else {}
+            needs_turso = _turso_enabled and (not first.get("summary") or not first.get("url"))
+            if needs_turso:
                 try:
                     from services.articles_store import fetch_heavy, merge_heavy_into_articles
                     heavy = fetch_heavy(ticker, ym)
@@ -161,17 +188,6 @@ def get_or_gen_bub(ticker: str, date: str, change_pct: float = 0.0, cascade: str
     event_ts = int(dt.replace(tzinfo=timezone.utc).timestamp())
     articles.sort(key=lambda a: abs(a["datetime"] - event_ts))
 
-    if cached and not force_regen:
-        cause = cached.get(cause_field)
-        if cause:
-            needs_update: dict = {}
-            for col, val in [("in_1w", in_1w), ("in_1m", in_1m), ("in_6m", in_6m), ("in_1y", in_1y)]:
-                if val is not None and cached.get(col) != val:
-                    needs_update[col] = val
-            if needs_update:
-                supa.table("bub_cache").update(needs_update).eq("ticker", ticker).eq("date", date).execute()
-            return {"date": date, "articles": articles, "cause": cause, "llm_source": None}
-
     # Contexte prix + benchmark
     benchmark_name, benchmark_ticker = _get_benchmark(ticker)
     price_context = _get_price_context(ticker, date, benchmark_ticker, benchmark_name)
@@ -184,19 +200,28 @@ def get_or_gen_bub(ticker: str, date: str, change_pct: float = 0.0, cascade: str
     if articles:
         try:
             from services.llm_service import llm_call as _llm_call
-            cause_result, llm_source = _groq_cause_with_source(ticker, date, change_pct, articles, price_context, lang, weekly_breaker, cascade=cascade)
+            cause_result, llm_source = _call_llm_for_bub(ticker, date, change_pct, articles, price_context, lang, weekly_breaker, cascade=cascade)
         except Exception:
             cause_result = None
 
-    cause = cause_result
-    result = {"date": date, "articles": articles, "cause": cause, "llm_source": llm_source}
+    # Pas d'articles → sentinel BUB_NO_ARTICLES (IS NOT NULL) pour ne pas reboucler
+    # Échec LLM avec articles → None (sera retenté au prochain cycle)
+    cause = cause_result if articles else BUB_NO_ARTICLES
+    result = {"date": date, "articles": articles, "cause": cause, "llm_source": llm_source, "is_fallback": False}
 
+    bub_used = len(articles)
+    bub_related = sum(
+        1 for a in raw_articles
+        if a.get("is_related") is True and from_ts <= a.get("datetime", 0) <= to_ts
+    )
     upsert_data: dict = {
-        "ticker":    ticker,
-        "date":      date,
-        cause_field: cause,
+        "ticker":           ticker,
+        "date":             date,
+        cause_field:        cause,
         ("llm_source_en" if lang == "en" else "llm_source_fr"): llm_source,
         "bub_cached_at_en": datetime.now(timezone.utc).isoformat(),
+        "articles_used":    bub_used,
+        "articles_related": bub_related,
     }
     for col, val in [("in_1w", in_1w), ("in_1m", in_1m), ("in_6m", in_6m), ("in_1y", in_1y)]:
         if val is not None:
@@ -228,7 +253,7 @@ def _get_weekly_breaker(supa, ticker: str, date: str, lang: str) -> str | None:
     return None
 
 
-def _groq_cause_with_source(
+def _call_llm_for_bub(
     ticker: str, date: str, change_pct: float, articles: list[dict],
     price_context: str, lang: str, weekly_breaker: str | None = None,
     cascade: str = "bub_prod",
